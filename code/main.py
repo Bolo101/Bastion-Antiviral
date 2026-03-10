@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-main.py  –  Point d'entrée du scanner antiviral USB / disque dur.
-Nécessite les droits root (lancez avec sudo ou en tant que root).
+main.py – Point d'entrée du scanner antiviral USB.
+Nécessite les droits root (sudo).
 """
 
 import os
@@ -9,60 +9,63 @@ import sys
 import tkinter as tk
 from tkinter import messagebox
 
-from gui import VirusScannerGUI
-from log_handler import log_info, log_error
-from antivirus_manager import AntivirusManager
+from log_handler import log_error, log_info
+from scanner import ScanEngine
 
 
 def main() -> None:
-    # ── root check ────────────────────────────────────────────────────────────
+
+    # ── Vérification root ─────────────────────────────────────────────────────
     if os.geteuid() != 0:
-        print("Ce programme doit être lancé avec les droits root (sudo).",
-              file=sys.stderr)
+        print("Ce programme doit être lancé avec sudo.", file=sys.stderr)
         sys.exit(1)
 
-    # ── at least one engine must be available ─────────────────────────────────
-    av = AntivirusManager()
-    clamav_ok = av.is_clamav_installed()
-    avast_ok  = av.is_avast_installed()
-
-    if not clamav_ok and not avast_ok:
-        # Try to show a Tk error dialog first
+    # ── Vérification ClamAV ───────────────────────────────────────────────────
+    eng = ScanEngine()
+    if not eng.is_clamav_installed():
         try:
             _root = tk.Tk()
             _root.withdraw()
             messagebox.showerror(
-                "Aucun antivirus installé",
-                "Ni ClamAV ni Avast n'est installé sur ce système.\n\n"
-                "• Pour ClamAV :\n"
+                "ClamAV manquant",
+                "ClamAV n'est pas installé sur ce système.\n\n"
+                "Installez-le avec :\n"
                 "  sudo apt install clamav clamav-daemon clamav-freshclam\n\n"
-                "• Pour Avast (Business / Core Security) :\n"
-                "  Téléchargez le paquet depuis https://www.avast.com/\n"
-                "  puis : sudo dpkg -i avast_*.deb"
+                "Puis mettez à jour la base :\n"
+                "  sudo freshclam"
             )
             _root.destroy()
         except Exception:
             pass
-        print("Erreur : aucun moteur antiviral disponible.", file=sys.stderr)
+        print("Erreur : ClamAV introuvable.", file=sys.stderr)
         sys.exit(1)
 
-    log_info("Démarrage du scanner antiviral USB/disque dur")
-    if clamav_ok:
-        log_info("ClamAV détecté")
-    if avast_ok:
-        log_info("Avast détecté")
+    # ── Informations YARA ────────────────────────────────────────────────────
+    yara_ok, yara_method = eng.detect_yara()
+    log_info("Démarrage du scanner antiviral USB")
+    log_info(f"ClamAV : installé ({eng.is_clamav_installed()})")
+    log_info(f"YARA   : {'disponible (' + yara_method + ')' if yara_ok else 'non disponible'}")
+    if not yara_ok:
+        print(
+            "Info : YARA non disponible. "
+            "Installez-le avec : sudo apt install python3-yara  "
+            "ou  sudo pip3 install yara-python",
+            file=sys.stderr
+        )
 
-    # ── launch GUI ────────────────────────────────────────────────────────────
+    # ── Lancement de l'interface ──────────────────────────────────────────────
+    from gui import VirusScannerGUI
+
     root = tk.Tk()
     try:
-        app = VirusScannerGUI(root)
+        app = VirusScannerGUI(root)   # noqa: F841
         root.mainloop()
     except Exception as e:
-        error_msg = f"Erreur fatale au démarrage : {e}"
-        log_error(error_msg)
-        print(error_msg, file=sys.stderr)
+        msg = f"Erreur fatale : {e}"
+        log_error(msg)
+        print(msg, file=sys.stderr)
         try:
-            messagebox.showerror("Erreur fatale", error_msg)
+            messagebox.showerror("Erreur fatale", msg)
         except Exception:
             pass
         sys.exit(1)

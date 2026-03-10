@@ -178,12 +178,31 @@ class AntivirusManager:
 
     def update_clamav_online(self,
                              progress_cb: ProgressCB = None) -> Tuple[bool, str]:
-        """Run freshclam and stream output to progress_cb."""
+        """
+        Run freshclam and stream output to progress_cb.
+
+        freshclam renvoie le code 2 lorsque le service clamav-freshclam tourne
+        déjà en arrière-plan et verrouille le fichier PID/base.
+        On l'arrête avant, on lance la mise à jour, puis on le redémarre.
+        """
         if not self.is_freshclam_available():
             return False, "freshclam introuvable. Installez clamav-freshclam."
+
+        # ── Arrêt temporaire du service pour libérer le verrou ────────────────
+        service_name    = "clamav-freshclam"
+        service_active  = False
+        rc_chk, out_chk, _ = _run(
+            ["systemctl", "is-active", service_name], timeout=5
+        )
+        if rc_chk == 0 and out_chk.strip() == "active":
+            service_active = True
+            if progress_cb:
+                progress_cb(f"Arrêt temporaire du service {service_name}…")
+            _run(["systemctl", "stop", service_name], timeout=20)
+
         try:
             proc = subprocess.Popen(
-                ["freshclam", "--stdout"],
+                ["freshclam", "--stdout", "--datadir=/var/lib/clamav"],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, bufsize=1
             )
@@ -197,11 +216,25 @@ class AntivirusManager:
                         progress_cb(line)
             proc.wait()
 
-            if proc.returncode in (0, 1):   # 1 = already up-to-date
+            # Code 0 = mis à jour, 1 = déjà à jour, les deux sont des succès.
+            # Code 2 ne devrait plus survenir après l'arrêt du service,
+            # mais on le gère explicitement pour afficher un message clair.
+            if proc.returncode in (0, 1):
                 return True, "Base ClamAV mise à jour avec succès."
+            if proc.returncode == 2:
+                return False, (
+                    "freshclam a échoué (code 2) : conflit de verrou PID ou "
+                    "erreur réseau. Vérifiez /var/log/clamav/freshclam.log."
+                )
             return False, f"freshclam a quitté avec le code {proc.returncode}."
         except Exception as e:
             return False, f"Échec de la mise à jour : {e}"
+        finally:
+            # ── Redémarrage du service ────────────────────────────────────────
+            if service_active:
+                if progress_cb:
+                    progress_cb(f"Redémarrage du service {service_name}…")
+                _run(["systemctl", "start", service_name], timeout=20)
 
     def update_avast_online(self,
                             progress_cb: ProgressCB = None) -> Tuple[bool, str]:
@@ -522,16 +555,48 @@ class UsbMountManager:
 
     # ── montage ───────────────────────────────────────────────────────────────
 
+    def _is_mounted_readonly(self, device: str, mountpoint: str) -> bool:
+        """Retourne True si le périphérique est monté en lecture seule."""
+        try:
+            with open("/proc/mounts") as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) >= 4 and parts[0] == device and parts[1] == mountpoint:
+                        options = parts[3].split(",")
+                        return "ro" in options
+        except Exception:
+            pass
+        return False
+
     def mount(self, device: str,
               progress_cb: ProgressCB = None) -> Tuple[bool, str]:
         """
         Monte le périphérique en lecture seule dans MOUNT_BASE/<device_name>.
+        Si le périphérique est déjà monté par le système (udev/udisks) en
+        lecture/écriture, il est remonté en lecture seule (remount,ro).
         Retourne (succès, message).
         """
-        # Déjà monté ?
         current_mp = self._get_current_mountpoint(device)
         if current_mp:
-            return True, f"Déjà monté sur {current_mp}"
+            # Vérifier si c'est déjà en lecture seule
+            if self._is_mounted_readonly(device, current_mp):
+                self._managed[device] = current_mp
+                return True, f"Déjà monté en lecture seule sur {current_mp}"
+
+            # Remonter en lecture seule
+            if progress_cb:
+                progress_cb(f"Remontage de {device} en lecture seule…")
+            rc, _, err = _run(
+                ["mount", "-o", "remount,ro", current_mp], timeout=20
+            )
+            if rc == 0:
+                self._managed[device] = current_mp
+                log_info(f"USB remonté en lecture seule : {device} → {current_mp}")
+                return True, f"{device} remonté en lecture seule sur {current_mp}"
+            err_clean = err.strip()
+            log_error(f"Échec remontage RO {device} : {err_clean}")
+            return False, (f"Impossible de remonter {device} en lecture seule : "
+                           f"{err_clean}")
 
         dev_name = device.replace("/dev/", "").replace("/", "_")
         mount_point = os.path.join(self.MOUNT_BASE, dev_name)

@@ -1,1231 +1,786 @@
 #!/usr/bin/env python3
 """
-gui.py  –  Interface graphique du scanner antiviral USB/disque dur.
-Supporte ClamAV et Avast avec :
-  • sélection du moteur
-  • import de licence Avast depuis clé USB (license.avastlic)
-  • mise à jour de la base virale en ligne (freshclam / avast update)
-  • import hors-ligne de la base depuis une clé USB
+gui.py – Interface principale du scanner antiviral USB.
+Conçue pour des utilisateurs non-techniques :
+  • La zone centrale est dédiée au scan (sélection + bouton unique)
+  • Toutes les actions d'administration sont regroupées dans un panneau
+    protégé par code (mise à jour bases, import hors-ligne, planification,
+    changement du code, quitter)
 """
 
 import os
 import sys
-import time
-import subprocess
 import threading
+import time
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
-from typing import Dict, List, Optional, Set
+from tkinter import messagebox, ttk
+from typing import Dict, List, Optional
 
-from utils import get_disk_list, get_base_disk, get_active_disk, get_disk_serial, is_ssd
-from log_handler import log_info, log_error, log_warning
-from antivirus_manager import AntivirusManager, UsbMountManager
+from admin_auth import AdminAuthManager, AdminPanel
+from config import YARA_RULES_DIR
+from db_manager import DBManager
+from log_handler import generate_session_pdf, log_error, log_info, log_warning
+from scanner import ScanEngine, ScanResult
+from usb_manager import UsbManager, UsbPartition
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 class VirusScannerGUI:
-    """Fenêtre principale du scanner antiviral."""
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("USB & Disk Antivirus Scanner")
+        self.root.title("🛡  USB Antivirus Scanner")
         self.root.attributes("-fullscreen", True)
+        self.root.configure(bg="#1a1a2e")
 
-        # ── state ──
-        self.av  = AntivirusManager()
-        self.usb = UsbMountManager()
-        self.selected_disk_var    = tk.StringVar()
-        self.scan_mode_var        = tk.StringVar(value="quick")
-        self.remove_infected_var  = tk.BooleanVar(value=False)
-        self.engine_var           = tk.StringVar(value="clamav")
+        # ── Composants métier ──
+        self.usb     = UsbManager()
+        self.db      = DBManager(usb_manager=self.usb)
+        self.engine  = ScanEngine()
+        self.auth    = AdminAuthManager()
 
-        self.disks:        List[Dict]  = []
-        self.active_disks: Set[str]    = set()
-        self.is_scanning               = False
-        self.session_logs:  List[str]  = []
-        self.scan_results = {"scanned": 0, "infected": 0, "threats": []}
+        # ── État ──────────────────────────────────────────────────────────────
+        self.is_scanning    = False
+        self.session_logs:  List[str] = []
+        self._usb_partitions: List[UsbPartition] = []
 
-        # root check
+        # ── Check root ────────────────────────────────────────────────────────
         if os.geteuid() != 0:
-            messagebox.showerror("Erreur", "Ce programme doit être lancé en root !")
+            messagebox.showerror("Droits insuffisants",
+                                 "Ce programme doit être lancé avec sudo.")
             root.destroy()
             sys.exit(1)
 
         self._build_ui()
-        self.refresh_disks()
-        self._refresh_engine_status()
+        self._refresh_status()
+        self._refresh_usb()
+        self.root.protocol("WM_DELETE_WINDOW", self._request_admin)
 
     # ══════════════════════════════════════════════════════════════════════════
-    # UI construction
+    # Construction de l'interface
     # ══════════════════════════════════════════════════════════════════════════
 
     def _build_ui(self) -> None:
-        main = ttk.Frame(self.root, padding=8)
-        main.pack(fill=tk.BOTH, expand=True)
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure("Title.TLabel",
+                         background="#1a1a2e", foreground="#e0e0e0",
+                         font=("Arial", 16, "bold"))
+        style.configure("Status.TLabel",
+                         background="#0f3460", foreground="#e0e0e0",
+                         font=("Courier", 9), padding=4)
+        style.configure("BigScan.TButton",
+                         font=("Arial", 14, "bold"), padding=14)
+        style.configure("Admin.TButton",
+                         font=("Arial", 9), padding=4)
 
-        # Title bar
-        title_bar = ttk.Frame(main)
-        title_bar.pack(fill=tk.X)
-        ttk.Label(title_bar, text="USB & Disk Antivirus Scanner",
-                  font=("Arial", 15, "bold")).pack(side=tk.LEFT)
-        ttk.Button(title_bar, text="⛶ Plein écran",
-                   command=self._toggle_fullscreen).pack(side=tk.RIGHT, padx=4)
-        ttk.Button(title_bar, text="✕ Quitter",
-                   command=self._exit_application).pack(side=tk.RIGHT, padx=4)
+        # ── Barre de titre ────────────────────────────────────────────────────
+        topbar = tk.Frame(self.root, bg="#0f3460", pady=6)
+        topbar.pack(fill=tk.X)
 
-        ttk.Separator(main, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=4)
+        tk.Label(topbar, text="🛡  USB Antivirus Scanner",
+                 font=("Arial", 15, "bold"),
+                 bg="#0f3460", fg="#e0e0e0").pack(side=tk.LEFT, padx=12)
 
-        # Two-column layout: left=config, right=log
-        body = ttk.Frame(main)
-        body.pack(fill=tk.BOTH, expand=True)
+        tk.Button(topbar, text="⛶  Plein écran",
+                  command=self._toggle_fullscreen,
+                  bg="#16213e", fg="#aaa", relief=tk.FLAT,
+                  font=("Arial", 9), padx=8).pack(side=tk.RIGHT, padx=4)
+        tk.Button(topbar, text="⚙  Administration",
+                  command=self._request_admin,
+                  bg="#e94560", fg="white", relief=tk.FLAT,
+                  font=("Arial", 9, "bold"), padx=10).pack(side=tk.RIGHT, padx=8)
 
-        left  = ttk.Frame(body)
-        right = ttk.Frame(body)
-        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(8, 0))
+        # ── Bandeau état des moteurs ──────────────────────────────────────────
+        status_bar = tk.Frame(self.root, bg="#0f3460", pady=2)
+        status_bar.pack(fill=tk.X)
 
-        # ── Left column ───────────────────────────────────────────────────────
-        self._build_engine_frame(left)
-        self._build_license_frame(left)
-        self._build_db_frame(left)
-        self._build_usb_manager_frame(left)
-        self._build_disk_frame(left)
+        self.clamav_status_var = tk.StringVar(value="ClamAV : vérification…")
+        self.yara_status_var   = tk.StringVar(value="YARA : vérification…")
+
+        tk.Label(status_bar, textvariable=self.clamav_status_var,
+                 bg="#0f3460", fg="#90ee90",
+                 font=("Courier", 9), padx=12).pack(side=tk.LEFT)
+        tk.Label(status_bar, textvariable=self.yara_status_var,
+                 bg="#0f3460", fg="#90ee90",
+                 font=("Courier", 9), padx=12).pack(side=tk.LEFT)
+
+        # ── Corps principal ───────────────────────────────────────────────────
+        body = tk.Frame(self.root, bg="#1a1a2e")
+        body.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
+
+        left  = tk.Frame(body, bg="#1a1a2e")
+        right = tk.Frame(body, bg="#1a1a2e")
+        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=False, padx=(0, 6))
+        right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+
+        self._build_usb_panel(left)
         self._build_scan_options(left)
-        self._build_control_buttons(left)
-        self._build_progress_frame(left)
+        self._build_scan_controls(left)
+        self._build_progress_panel(left)
+        self._build_log_panel(right)
 
-        # ── Right column ──────────────────────────────────────────────────────
-        self._build_log_frame(right)
+    # ── Panneau USB ───────────────────────────────────────────────────────────
 
-        self.root.protocol("WM_DELETE_WINDOW", self._exit_application)
+    def _build_usb_panel(self, parent: tk.Frame) -> None:
+        frm = self._lframe(parent, "Clés USB / Disques amovibles")
+        frm.pack(fill=tk.X, pady=4)
 
-    # ── Engine selection ──────────────────────────────────────────────────────
-
-    def _build_engine_frame(self, parent: ttk.Frame) -> None:
-        lf = ttk.LabelFrame(parent, text="Moteur antiviral", padding=6)
-        lf.pack(fill=tk.X, pady=4)
-
-        row = ttk.Frame(lf)
-        row.pack(fill=tk.X)
-
-        ttk.Radiobutton(row, text="ClamAV",
-                        variable=self.engine_var, value="clamav",
-                        command=self._on_engine_change).pack(side=tk.LEFT, padx=8)
-        ttk.Radiobutton(row, text="Avast",
-                        variable=self.engine_var, value="avast",
-                        command=self._on_engine_change).pack(side=tk.LEFT, padx=8)
-
-        self.engine_status_var = tk.StringVar(value="Vérification…")
-        ttk.Label(lf, textvariable=self.engine_status_var,
-                  font=("Arial", 9), foreground="navy").pack(anchor=tk.W, pady=2)
-
-    # ── Avast license ─────────────────────────────────────────────────────────
-
-    def _build_license_frame(self, parent: ttk.Frame) -> None:
-        self.license_frame = ttk.LabelFrame(parent, text="Licence Avast", padding=6)
-        # Packed/forgotten dynamically by _on_engine_change
-
-        row = ttk.Frame(self.license_frame)
-        row.pack(fill=tk.X)
-
-        ttk.Button(row, text="📂 Importer depuis clé USB",
-                   command=self._import_avast_license_usb).pack(side=tk.LEFT, padx=4)
-        ttk.Button(row, text="📁 Choisir un fichier…",
-                   command=self._import_avast_license_file).pack(side=tk.LEFT, padx=4)
-
-        self.license_status_var = tk.StringVar(value="—")
-        ttk.Label(self.license_frame, textvariable=self.license_status_var,
-                  font=("Arial", 9)).pack(anchor=tk.W, pady=2)
-
-    # ── Database management ───────────────────────────────────────────────────
-
-    def _build_db_frame(self, parent: ttk.Frame) -> None:
-        lf = ttk.LabelFrame(parent, text="Base virale", padding=6)
-        lf.pack(fill=tk.X, pady=4)
-
-        self.db_status_var = tk.StringVar(value="Vérification…")
-        ttk.Label(lf, textvariable=self.db_status_var,
-                  font=("Arial", 9)).pack(anchor=tk.W)
-
-        btn_row = ttk.Frame(lf)
-        btn_row.pack(fill=tk.X, pady=4)
-
-        self.btn_update_online = ttk.Button(
-            btn_row, text="🌐 Mettre à jour (Internet)",
-            command=self._update_db_online)
-        self.btn_update_online.pack(side=tk.LEFT, padx=4)
-
-        self.btn_import_usb = ttk.Button(
-            btn_row, text="🔌 Importer depuis clé USB",
-            command=self._import_db_from_usb)
-        self.btn_import_usb.pack(side=tk.LEFT, padx=4)
-
-        ttk.Button(btn_row, text="↺ Actualiser",
-                   command=self._refresh_db_status).pack(side=tk.LEFT, padx=4)
-
-    # ── USB manager panel ─────────────────────────────────────────────────────
-
-    def _build_usb_manager_frame(self, parent: ttk.Frame) -> None:
-        lf = ttk.LabelFrame(parent, text="Gestion des clés USB", padding=6)
-        lf.pack(fill=tk.X, pady=4)
-
-        # ── Treeview ──────────────────────────────────────────────────────────
         cols = ("device", "label", "size", "fstype", "status")
-        self.usb_tree = ttk.Treeview(lf, columns=cols, show="headings",
-                                      height=4, selectmode="browse")
-
-        col_cfg = [
-            ("device", "Périphérique",  120),
-            ("label",  "Étiquette",      90),
-            ("size",   "Taille",         60),
-            ("fstype", "FS",             60),
-            ("status", "État",          200),
-        ]
-        for cid, heading, width in col_cfg:
+        self.usb_tree = ttk.Treeview(frm, columns=cols, show="headings",
+                                      height=5, selectmode="browse")
+        for cid, heading, width in [
+            ("device", "Périphérique", 100),
+            ("label",  "Étiquette",     90),
+            ("size",   "Taille",        60),
+            ("fstype", "FS",            60),
+            ("status", "État",         180),
+        ]:
             self.usb_tree.heading(cid, text=heading)
-            self.usb_tree.column(cid, width=width, minwidth=40, anchor=tk.W)
+            self.usb_tree.column(cid, width=width, minwidth=30, anchor=tk.W)
 
-        # Couleurs par état
-        self.usb_tree.tag_configure("mounted",   background="#d4edda")
-        self.usb_tree.tag_configure("unmounted", background="#f8f9fa")
-        self.usb_tree.tag_configure("managed",   background="#cce5ff")
+        self.usb_tree.tag_configure("ro",      background="#d4edda")
+        self.usb_tree.tag_configure("rw",      background="#fff3cd")
+        self.usb_tree.tag_configure("unmount", background="#f8f9fa")
 
-        usb_sb = ttk.Scrollbar(lf, orient=tk.VERTICAL,
-                                command=self.usb_tree.yview)
+        usb_sb = ttk.Scrollbar(frm, orient=tk.VERTICAL, command=self.usb_tree.yview)
         self.usb_tree.configure(yscrollcommand=usb_sb.set)
         self.usb_tree.pack(side=tk.LEFT, fill=tk.X, expand=True)
         usb_sb.pack(side=tk.LEFT, fill=tk.Y)
 
-        # ── Boutons ───────────────────────────────────────────────────────────
-        btn_col = ttk.Frame(lf)
-        btn_col.pack(side=tk.LEFT, fill=tk.Y, padx=(6, 0))
+        btn_col = tk.Frame(frm, bg="#1a1a2e")
+        btn_col.pack(side=tk.LEFT, padx=(6, 0))
+        for txt, cmd in [
+            ("↺ Actualiser",  self._refresh_usb),
+            ("▲ Monter RO",   self._mount_usb),
+            ("▼ Démonter",    self._umount_usb),
+        ]:
+            tk.Button(btn_col, text=txt, command=cmd, width=13,
+                      bg="#16213e", fg="#e0e0e0", relief=tk.FLAT,
+                      font=("Arial", 9), pady=4).pack(fill=tk.X, pady=2)
 
-        ttk.Button(btn_col, text="↺ Actualiser",
-                   command=self._refresh_usb_list).pack(fill=tk.X, pady=2)
-
-        self.btn_usb_mount = ttk.Button(
-            btn_col, text="▲ Monter",
-            command=self._mount_selected_usb)
-        self.btn_usb_mount.pack(fill=tk.X, pady=2)
-
-        self.btn_usb_umount = ttk.Button(
-            btn_col, text="▼ Démonter",
-            command=self._umount_selected_usb)
-        self.btn_usb_umount.pack(fill=tk.X, pady=2)
-
-        ttk.Button(btn_col, text="▼▼ Tout démonter",
-                   command=self._umount_all_usb).pack(fill=tk.X, pady=2)
-
-        # Info ligne sélectionnée
         self.usb_info_var = tk.StringVar(value="")
-        ttk.Label(lf, textvariable=self.usb_info_var,
-                  font=("Arial", 8), foreground="navy").pack(
-            anchor=tk.W, pady=2, side=tk.BOTTOM)
+        tk.Label(frm, textvariable=self.usb_info_var,
+                 bg="#1a1a2e", fg="#aaa",
+                 font=("Arial", 8)).pack(side=tk.BOTTOM, anchor=tk.W, pady=2)
 
         self.usb_tree.bind("<<TreeviewSelect>>", self._on_usb_select)
 
-        # Premier chargement
-        self._refresh_usb_list()
+    # ── Options de scan ───────────────────────────────────────────────────────
 
-    # ── USB list actions ──────────────────────────────────────────────────────
+    def _build_scan_options(self, parent: tk.Frame) -> None:
+        frm = self._lframe(parent, "Options d'analyse")
+        frm.pack(fill=tk.X, pady=4)
 
-    def _refresh_usb_list(self) -> None:
-        """Recharge la liste des partitions USB dans le Treeview."""
-        # Mémorise la sélection actuelle
-        selected_dev = self._get_selected_usb_device()
+        # Mode
+        self.scan_mode_var = tk.StringVar(value="quick")
+        row1 = tk.Frame(frm, bg="#16213e"); row1.pack(fill=tk.X, pady=2)
+        tk.Label(row1, text="Mode :", bg="#16213e", fg="#e0e0e0",
+                 width=10, anchor=tk.E).pack(side=tk.LEFT)
+        for txt, val in [("Rapide", "quick"), ("Complet", "deep")]:
+            tk.Radiobutton(row1, text=txt, variable=self.scan_mode_var,
+                           value=val, bg="#16213e", fg="#e0e0e0",
+                           selectcolor="#0f3460",
+                           activebackground="#16213e",
+                           font=("Arial", 9)).pack(side=tk.LEFT, padx=8)
 
-        for row in self.usb_tree.get_children():
-            self.usb_tree.delete(row)
+        # YARA
+        self.use_yara_var = tk.BooleanVar(value=True)
+        row2 = tk.Frame(frm, bg="#16213e"); row2.pack(fill=tk.X, pady=2)
+        tk.Checkbutton(row2, text="Activer l'analyse YARA",
+                       variable=self.use_yara_var,
+                       bg="#16213e", fg="#e0e0e0",
+                       selectcolor="#0f3460",
+                       activebackground="#16213e",
+                       font=("Arial", 9)).pack(side=tk.LEFT, padx=(80, 0))
 
-        partitions = self.usb.list_usb_partitions()
+        # Suppression
+        self.remove_var = tk.BooleanVar(value=False)
+        row3 = tk.Frame(frm, bg="#16213e"); row3.pack(fill=tk.X, pady=2)
+        tk.Checkbutton(row3,
+                       text="⚠  Supprimer les fichiers infectés (DANGER)",
+                       variable=self.remove_var,
+                       bg="#16213e", fg="#ffaa00",
+                       selectcolor="#0f3460",
+                       activebackground="#16213e",
+                       font=("Arial", 9)).pack(side=tk.LEFT, padx=(10, 0))
 
-        if not partitions:
-            self.usb_tree.insert("", tk.END, values=(
-                "—", "—", "—", "—", "Aucune clé USB détectée"
-            ))
-            self.usb_info_var.set("")
-            return
+    # ── Boutons de contrôle ───────────────────────────────────────────────────
 
-        reselect_iid = None
-        for p in partitions:
-            dev = p["device"]
-            mp  = p.get("mountpoint")
-            if mp:
-                status = f"✅ Monté sur {mp}"
-                tag    = "managed" if p["managed"] else "mounted"
-            else:
-                status = "⏏  Non monté"
-                tag    = "unmounted"
+    def _build_scan_controls(self, parent: tk.Frame) -> None:
+        frm = tk.Frame(parent, bg="#1a1a2e")
+        frm.pack(fill=tk.X, pady=8)
 
-            iid = self.usb_tree.insert("", tk.END, iid=dev, values=(
-                dev,
-                p["label"] or "—",
-                p["size"],
-                p["fstype"],
-                status,
-            ), tags=(tag,))
+        self.scan_btn = tk.Button(
+            frm, text="▶  LANCER L'ANALYSE",
+            command=self._start_scan,
+            bg="#e94560", fg="white", relief=tk.FLAT,
+            font=("Arial", 13, "bold"), pady=10, padx=20
+        )
+        self.scan_btn.pack(fill=tk.X, padx=4, pady=2)
 
-            if dev == selected_dev:
-                reselect_iid = iid
+        self.stop_btn = tk.Button(
+            frm, text="⏹  Arrêter",
+            command=self._stop_scan,
+            bg="#555", fg="white", relief=tk.FLAT,
+            font=("Arial", 10), pady=6, state=tk.DISABLED
+        )
+        self.stop_btn.pack(fill=tk.X, padx=4, pady=2)
 
-        if reselect_iid:
-            self.usb_tree.selection_set(reselect_iid)
-            self.usb_tree.see(reselect_iid)
+        tk.Button(
+            frm, text="📄  Exporter rapport PDF",
+            command=self._export_pdf,
+            bg="#16213e", fg="#aaa", relief=tk.FLAT,
+            font=("Arial", 9), pady=4
+        ).pack(fill=tk.X, padx=4, pady=2)
 
-        self._update_usb_buttons()
+    # ── Progression ───────────────────────────────────────────────────────────
 
-    def _on_usb_select(self, _event=None) -> None:
-        dev = self._get_selected_usb_device()
-        if not dev:
-            self.usb_info_var.set("")
-            return
-        mp = self.usb.get_mountpoint(dev)
-        if mp:
-            self.usb_info_var.set(f"Point de montage : {mp}")
-        else:
-            self.usb_info_var.set(f"{dev} — non monté")
-        self._update_usb_buttons()
+    def _build_progress_panel(self, parent: tk.Frame) -> None:
+        frm = self._lframe(parent, "Progression")
+        frm.pack(fill=tk.X, pady=4)
 
-    def _update_usb_buttons(self) -> None:
-        dev = self._get_selected_usb_device()
-        if not dev or dev == "—":
-            self.btn_usb_mount.configure(state=tk.DISABLED)
-            self.btn_usb_umount.configure(state=tk.DISABLED)
-            return
-        mp = self.usb.get_mountpoint(dev)
-        self.btn_usb_mount.configure(
-            state=tk.DISABLED if mp else tk.NORMAL)
-        self.btn_usb_umount.configure(
-            state=tk.NORMAL if mp else tk.DISABLED)
-
-    def _get_selected_usb_device(self) -> Optional[str]:
-        sel = self.usb_tree.selection()
-        if not sel:
-            return None
-        values = self.usb_tree.item(sel[0], "values")
-        if not values or values[0] == "—":
-            return None
-        return values[0]
-
-    def _mount_selected_usb(self) -> None:
-        dev = self._get_selected_usb_device()
-        if not dev:
-            messagebox.showwarning("Aucune sélection",
-                                   "Veuillez sélectionner une clé USB.")
-            return
-        self._update_log(f"Montage de {dev} …")
-        self.btn_usb_mount.configure(state=tk.DISABLED)
-
-        def _worker():
-            ok, msg = self.usb.mount(
-                dev,
-                progress_cb=lambda l: self.root.after(0, self._update_log, l)
-            )
-            def _done():
-                if ok:
-                    self._update_log(f"✅ {msg}")
-                    # Propose de lancer l'import de base si mode hors-ligne
-                    mp = self.usb.get_mountpoint(dev)
-                    if mp:
-                        self._propose_db_import_from(mp)
-                else:
-                    messagebox.showerror("Erreur de montage", msg)
-                    self._update_log(f"❌ {msg}", tag="threat")
-                self._refresh_usb_list()
-            self.root.after(0, _done)
-
-        threading.Thread(target=_worker, daemon=True).start()
-
-    def _umount_selected_usb(self) -> None:
-        dev = self._get_selected_usb_device()
-        if not dev:
-            messagebox.showwarning("Aucune sélection",
-                                   "Veuillez sélectionner une clé USB.")
-            return
-        self._update_log(f"Démontage de {dev} …")
-        self.btn_usb_umount.configure(state=tk.DISABLED)
-
-        def _worker():
-            ok, msg = self.usb.umount(
-                dev,
-                progress_cb=lambda l: self.root.after(0, self._update_log, l)
-            )
-            def _done():
-                if ok:
-                    self._update_log(f"✅ {msg}")
-                else:
-                    messagebox.showerror("Erreur de démontage", msg)
-                    self._update_log(f"❌ {msg}", tag="threat")
-                self._refresh_usb_list()
-            self.root.after(0, _done)
-
-        threading.Thread(target=_worker, daemon=True).start()
-
-    def _umount_all_usb(self) -> None:
-        if not messagebox.askyesno("Démonter tout",
-                                    "Démonter toutes les clés USB montées ?"):
-            return
-        self._update_log("Démontage de toutes les clés USB gérées…")
-
-        def _worker():
-            self.usb.umount_all_managed()
-            self.root.after(0, self._refresh_usb_list)
-            self.root.after(0, self._update_log,
-                            "✅ Démontage terminé.")
-
-        threading.Thread(target=_worker, daemon=True).start()
-
-    def _propose_db_import_from(self, mount_point: str) -> None:
-        """
-        Après un montage réussi, propose automatiquement d'importer
-        la base virale si des fichiers de base sont trouvés.
-        """
-        engine = self.engine_var.get()
-        if engine == "clamav":
-            import glob as _glob
-            files = (_glob.glob(os.path.join(mount_point, "*.cvd")) +
-                     _glob.glob(os.path.join(mount_point, "*.cld")))
-            if files:
-                names = ", ".join(os.path.basename(f) for f in files)
-                if messagebox.askyesno(
-                    "Fichiers de base ClamAV détectés",
-                    f"Fichiers trouvés sur la clé :\n{names}\n\n"
-                    "Importer la base ClamAV maintenant ?"
-                ):
-                    self._import_db_from_usb()
-        else:
-            import glob as _glob
-            files = (_glob.glob(os.path.join(mount_point, "*.vps")) +
-                     _glob.glob(os.path.join(mount_point, "*.vpz")))
-            lic = os.path.join(mount_point, "license.avastlic")
-            if os.path.exists(lic):
-                if messagebox.askyesno(
-                    "Licence Avast détectée",
-                    "Un fichier license.avastlic a été trouvé.\n"
-                    "Importer la licence Avast maintenant ?"
-                ):
-                    self._import_avast_license_usb()
-            elif files:
-                if messagebox.askyesno(
-                    "Fichiers VPS Avast détectés",
-                    "Des fichiers VPS Avast ont été trouvés.\n"
-                    "Importer la base Avast maintenant ?"
-                ):
-                    self._import_db_from_usb()
-
-    # ── Disk selection ────────────────────────────────────────────────────────
-
-    def _build_disk_frame(self, parent: ttk.Frame) -> None:
-        lf = ttk.LabelFrame(parent, text="Disque / clé USB à analyser", padding=6)
-        lf.pack(fill=tk.BOTH, expand=True, pady=4)
-
-        inner = ttk.Frame(lf)
-        inner.pack(fill=tk.BOTH, expand=True)
-
-        self.disk_listbox = tk.Listbox(inner, selectmode=tk.SINGLE, height=5,
-                                       font=("Courier", 9))
-        sb = ttk.Scrollbar(inner, orient=tk.VERTICAL,
-                            command=self.disk_listbox.yview)
-        self.disk_listbox.configure(yscrollcommand=sb.set)
-        self.disk_listbox.bind("<<ListboxSelect>>", self._on_disk_select)
-        self.disk_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        sb.pack(side=tk.RIGHT, fill=tk.Y)
-
-        self.disk_info_var = tk.StringVar(value="Aucun disque sélectionné")
-        ttk.Label(lf, textvariable=self.disk_info_var,
-                  wraplength=480, justify=tk.LEFT,
-                  font=("Arial", 9)).pack(anchor=tk.W, pady=2)
-
-        self.disk_warning_var = tk.StringVar()
-        ttk.Label(lf, textvariable=self.disk_warning_var,
-                  foreground="red", wraplength=480).pack(anchor=tk.W)
-
-    # ── Scan options ──────────────────────────────────────────────────────────
-
-    def _build_scan_options(self, parent: ttk.Frame) -> None:
-        lf = ttk.LabelFrame(parent, text="Options d'analyse", padding=6)
-        lf.pack(fill=tk.X, pady=4)
-
-        mode_row = ttk.Frame(lf)
-        mode_row.pack(fill=tk.X)
-        ttk.Label(mode_row, text="Mode :").pack(side=tk.LEFT, padx=4)
-        ttk.Radiobutton(mode_row, text="Rapide (partitions montées)",
-                        variable=self.scan_mode_var,
-                        value="quick").pack(side=tk.LEFT, padx=8)
-        ttk.Radiobutton(mode_row, text="Complet (toutes partitions)",
-                        variable=self.scan_mode_var,
-                        value="deep").pack(side=tk.LEFT, padx=8)
-
-        ttk.Checkbutton(lf, text="⚠ Supprimer les fichiers infectés (DANGER !)",
-                        variable=self.remove_infected_var).pack(anchor=tk.W, pady=4)
-
-    # ── Control buttons ───────────────────────────────────────────────────────
-
-    def _build_control_buttons(self, parent: ttk.Frame) -> None:
-        row = ttk.Frame(parent)
-        row.pack(fill=tk.X, pady=4)
-
-        ttk.Button(row, text="↺ Rafraîchir disques",
-                   command=self.refresh_disks).pack(side=tk.LEFT, padx=4)
-
-        self.start_btn = ttk.Button(row, text="▶ Lancer l'analyse",
-                                    command=self._start_scan)
-        self.start_btn.pack(side=tk.LEFT, padx=4)
-
-        self.stop_btn = ttk.Button(row, text="⏹ Arrêter",
-                                   command=self._stop_scan, state=tk.DISABLED)
-        self.stop_btn.pack(side=tk.LEFT, padx=4)
-
-        ttk.Button(row, text="📄 Exporter PDF",
-                   command=self._export_pdf).pack(side=tk.LEFT, padx=4)
-
-    # ── Progress ──────────────────────────────────────────────────────────────
-
-    def _build_progress_frame(self, parent: ttk.Frame) -> None:
-        lf = ttk.LabelFrame(parent, text="Progression", padding=6)
-        lf.pack(fill=tk.X, pady=4)
-
-        self.progress_var = tk.DoubleVar()
-        self.progress = ttk.Progressbar(lf, variable=self.progress_var,
-                                        maximum=100, mode="indeterminate")
-        self.progress.pack(fill=tk.X, padx=4, pady=2)
+        self.progress = ttk.Progressbar(frm, mode="indeterminate",
+                                         length=300)
+        self.progress.pack(fill=tk.X, padx=4, pady=4)
 
         self.status_var = tk.StringVar(value="Prêt")
-        ttk.Label(lf, textvariable=self.status_var).pack(anchor=tk.W)
+        tk.Label(frm, textvariable=self.status_var,
+                 bg="#16213e", fg="#e0e0e0",
+                 font=("Arial", 9)).pack(anchor=tk.W)
 
-        row = ttk.Frame(lf)
-        row.pack(fill=tk.X)
-        self.scanned_var  = tk.StringVar(value="Fichiers analysés : 0")
+        counters = tk.Frame(frm, bg="#16213e")
+        counters.pack(fill=tk.X)
+        self.scanned_var  = tk.StringVar(value="Analysés : 0")
         self.infected_var = tk.StringVar(value="Menaces : 0")
-        ttk.Label(row, textvariable=self.scanned_var).pack(side=tk.LEFT, padx=10)
-        ttk.Label(row, textvariable=self.infected_var,
-                  foreground="red").pack(side=tk.LEFT, padx=10)
+        tk.Label(counters, textvariable=self.scanned_var,
+                 bg="#16213e", fg="#90ee90",
+                 font=("Courier", 9)).pack(side=tk.LEFT, padx=8)
+        tk.Label(counters, textvariable=self.infected_var,
+                 bg="#16213e", fg="#ff6b6b",
+                 font=("Courier", 9, "bold")).pack(side=tk.LEFT, padx=8)
 
-    # ── Log ───────────────────────────────────────────────────────────────────
+    # ── Journal ───────────────────────────────────────────────────────────────
 
-    def _build_log_frame(self, parent: ttk.Frame) -> None:
-        lf = ttk.LabelFrame(parent, text="Journal d'activité", padding=6)
-        lf.pack(fill=tk.BOTH, expand=True)
+    def _build_log_panel(self, parent: tk.Frame) -> None:
+        header = tk.Frame(parent, bg="#1a1a2e")
+        header.pack(fill=tk.X, pady=(4, 2))
+        tk.Label(header, text="Journal d'activité",
+                 bg="#1a1a2e", fg="#aaa",
+                 font=("Arial", 9, "bold")).pack(side=tk.LEFT)
+        tk.Button(header, text="🧹 Vider",
+                  command=self._clear_log,
+                  bg="#16213e", fg="#aaa", relief=tk.FLAT,
+                  font=("Arial", 8)).pack(side=tk.RIGHT)
 
-        self.log_text = tk.Text(lf, wrap=tk.WORD,
-                                font=("Courier", 8), bg="#1e1e1e", fg="#d4d4d4",
-                                insertbackground="white")
-        sb = ttk.Scrollbar(lf, command=self.log_text.yview)
+        self.log_text = tk.Text(parent, bg="#0d0d0d", fg="#d4d4d4",
+                                font=("Courier", 8), wrap=tk.WORD,
+                                state=tk.NORMAL, insertbackground="white")
+        sb = ttk.Scrollbar(parent, command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=sb.set)
-        # colour tags
+
         self.log_text.tag_config("threat",  foreground="#ff4444")
         self.log_text.tag_config("ok",      foreground="#4ec94e")
         self.log_text.tag_config("warning", foreground="#ffaa00")
-        self.log_text.tag_config("info",    foreground="#d4d4d4")
+        self.log_text.tag_config("info",    foreground="#888888")
+        self.log_text.tag_config("normal",  foreground="#d4d4d4")
 
         self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
 
-        btn_row = ttk.Frame(parent)
-        btn_row.pack(fill=tk.X, pady=2)
-        ttk.Button(btn_row, text="🧹 Vider le journal",
-                   command=self._clear_log).pack(side=tk.LEFT, padx=4)
-
     # ══════════════════════════════════════════════════════════════════════════
-    # Engine logic
+    # Helpers UI
     # ══════════════════════════════════════════════════════════════════════════
 
-    def _on_engine_change(self) -> None:
-        engine = self.engine_var.get()
-        self.av.current_engine = engine
+    def _lframe(self, parent: tk.Frame, title: str) -> tk.Frame:
+        """Crée un cadre avec bordure et titre stylisé."""
+        outer = tk.Frame(parent, bg="#16213e", bd=1, relief=tk.SOLID)
+        outer.pack_propagate(True)
+        tk.Label(outer, text=f"  {title}  ",
+                 bg="#16213e", fg="#aaa",
+                 font=("Arial", 8, "bold")).pack(anchor=tk.W, padx=4, pady=(4, 0))
+        inner = tk.Frame(outer, bg="#16213e", padx=6, pady=4)
+        inner.pack(fill=tk.BOTH, expand=True)
+        return inner
 
-        if engine == "avast":
-            self.license_frame.pack(fill=tk.X, pady=4,
-                                    after=self.license_frame.master.children.get(
-                                        list(self.license_frame.master.children)[0],
-                                        self.license_frame))
-            # Re-pack in correct order
-            self.license_frame.pack_forget()
-            # Find engine frame and pack license after it
-            widgets = list(self.license_frame.master.children.values())
-            self.license_frame.pack(fill=tk.X, pady=4)
+    def _log(self, msg: str, tag: str = "normal") -> None:
+        ts  = time.strftime("%H:%M:%S")
+        line = f"[{ts}]  {msg}\n"
+        self.log_text.insert(tk.END, line, tag)
+        self.log_text.see(tk.END)
+        self.root.update_idletasks()
+        self.session_logs.append(line.strip())
+        log_info(msg)
+
+    def _clear_log(self) -> None:
+        self.log_text.delete("1.0", tk.END)
+
+    def _toggle_fullscreen(self) -> None:
+        self.root.attributes("-fullscreen",
+                              not self.root.attributes("-fullscreen"))
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Statut des moteurs
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _refresh_status(self) -> None:
+        # ClamAV
+        if not self.engine.is_clamav_installed():
+            self.clamav_status_var.set("❌  ClamAV : non installé")
         else:
-            self.license_frame.pack_forget()
-
-        self._refresh_engine_status()
-        self._refresh_db_status()
-
-    def _refresh_engine_status(self) -> None:
-        engine = self.engine_var.get()
-        self.av.current_engine = engine
-        status = self.av.engine_status_summary(engine)
-        self.engine_status_var.set(status)
-
-        if engine == "avast":
-            lic_status = self.av.get_avast_license_status()
-            self.license_status_var.set(f"État licence : {lic_status}")
-        self._refresh_db_status()
-
-    def _refresh_db_status(self) -> None:
-        engine = self.engine_var.get()
-        if engine == "clamav":
-            info = self.av.get_clamav_db_info()
-            s = info["status"]
-            lu = info.get("last_update", "inconnue")
-            if s == "OK":
-                self.db_status_var.set(f"✅ ClamAV – Base OK  (màj : {lu})")
-            elif s == "OUTDATED":
-                self.db_status_var.set(f"⚠️  ClamAV – Base obsolète  (màj : {lu})")
+            info = self.db.get_clamav_status()
+            st   = info["status"]
+            lu   = info.get("last_update", "?")
+            if st == "OK":
+                self.clamav_status_var.set(f"✅  ClamAV : base OK  (màj : {lu})")
+            elif st == "OUTDATED":
+                self.clamav_status_var.set(f"⚠   ClamAV : base obsolète  ({lu})")
             else:
-                self.db_status_var.set("❌ ClamAV – Base manquante ou incomplète")
+                self.clamav_status_var.set("❌  ClamAV : base manquante")
+
+        # YARA
+        ok, method = self.engine.detect_yara()
+        if not ok:
+            self.yara_status_var.set("❌  YARA : non installé")
         else:
-            if self.av.is_avast_installed():
-                self.db_status_var.set("ℹ️  Avast – état de la base géré par le service Avast")
+            info = self.db.get_yara_status()
+            n    = info["count"]
+            lu   = info.get("last_update", "?")
+            if n > 0:
+                self.yara_status_var.set(f"✅  YARA ({method}) : {n} règle(s)  (màj : {lu})")
             else:
-                self.db_status_var.set("❌ Avast non installé")
+                self.yara_status_var.set(f"⚠   YARA ({method}) : aucune règle installée")
 
     # ══════════════════════════════════════════════════════════════════════════
-    # License import
+    # Gestion USB
     # ══════════════════════════════════════════════════════════════════════════
 
-    def _import_avast_license_usb(self) -> None:
-        self._update_log("Recherche de license.avastlic sur les clés USB…")
-        licenses = self.av.find_avast_licenses_on_usb()
+    def _refresh_usb(self) -> None:
+        selected_dev = self._selected_usb()
+        for row in self.usb_tree.get_children():
+            self.usb_tree.delete(row)
 
-        if not licenses:
-            messagebox.showwarning(
-                "Licence introuvable",
-                "Aucun fichier license.avastlic trouvé à la racine d'une clé USB.\n\n"
-                "Assurez-vous que la clé USB est montée et que le fichier\n"
-                "license.avastlic se trouve à sa racine."
-            )
+        self._usb_partitions = self.usb.list_partitions()
+
+        if not self._usb_partitions:
+            self.usb_tree.insert("", tk.END,
+                                  values=("—", "—", "—", "—",
+                                          "Aucune clé USB détectée"))
             return
 
-        if len(licenses) == 1:
-            path = licenses[0]
-        else:
-            # Let user choose if multiple
-            path = self._choose_from_list(
-                "Plusieurs licences trouvées",
-                "Choisissez la licence à importer :",
-                licenses
-            )
-            if not path:
-                return
+        reselect = None
+        for p in self._usb_partitions:
+            mp = self.usb.get_mountpoint(p.device)
+            if mp:
+                ro = self.usb._is_ro(p.device, mp)
+                status = (f"✅ Monté RO → {mp}" if ro
+                          else f"⚠  Monté RW → {mp}")
+                tag    = "ro" if ro else "rw"
+            else:
+                status = "⏏  Non monté"
+                tag    = "unmount"
 
-        self._update_log(f"Import de la licence : {path}")
-        ok, msg = self.av.import_avast_license(path)
-        if ok:
-            messagebox.showinfo("Licence importée", msg)
-            self._update_log(f"✅ {msg}")
-        else:
-            messagebox.showerror("Erreur", msg)
-            self._update_log(f"❌ {msg}", tag="threat")
-        self._refresh_engine_status()
+            iid = self.usb_tree.insert("", tk.END, iid=p.device,
+                                        values=(p.device,
+                                                p.label or "—",
+                                                p.size,
+                                                p.fstype,
+                                                status),
+                                        tags=(tag,))
+            if p.device == selected_dev:
+                reselect = iid
 
-    def _import_avast_license_file(self) -> None:
-        path = filedialog.askopenfilename(
-            title="Choisir le fichier de licence Avast",
-            filetypes=[("Fichier licence Avast", "*.avastlic"), ("Tous", "*.*")]
+        if reselect:
+            self.usb_tree.selection_set(reselect)
+
+    def _on_usb_select(self, _=None) -> None:
+        dev = self._selected_usb()
+        if not dev:
+            self.usb_info_var.set("")
+            return
+        mp = self.usb.get_mountpoint(dev)
+        self.usb_info_var.set(
+            f"Point de montage : {mp}" if mp else f"{dev} — non monté"
         )
-        if not path:
-            return
-        self._update_log(f"Import de la licence : {path}")
-        ok, msg = self.av.import_avast_license(path)
-        if ok:
-            messagebox.showinfo("Licence importée", msg)
-            self._update_log(f"✅ {msg}")
-        else:
-            messagebox.showerror("Erreur", msg)
-            self._update_log(f"❌ {msg}", tag="threat")
-        self._refresh_engine_status()
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # Database update / import
-    # ══════════════════════════════════════════════════════════════════════════
-
-    def _update_db_online(self) -> None:
-        engine = self.engine_var.get()
-
-        if engine == "clamav" and not self.av.is_freshclam_available():
-            messagebox.showerror(
-                "freshclam introuvable",
-                "freshclam n'est pas installé.\n"
-                "Installez-le avec : apt install clamav-freshclam"
-            )
-            return
-        if engine == "avast" and not self.av.is_avast_installed():
-            messagebox.showerror("Avast introuvable", "Avast n'est pas installé.")
-            return
-
-        self.btn_update_online.configure(state=tk.DISABLED)
-        self.btn_import_usb.configure(state=tk.DISABLED)
-        self.db_status_var.set("⏳ Mise à jour en cours…")
-        self._update_log("Démarrage de la mise à jour de la base virale…")
-
-        def _worker():
-            if engine == "clamav":
-                ok, msg = self.av.update_clamav_online(
-                    progress_cb=lambda l: self.root.after(0, self._update_log, l)
-                )
-            else:
-                ok, msg = self.av.update_avast_online(
-                    progress_cb=lambda l: self.root.after(0, self._update_log, l)
-                )
-
-            def _done():
-                if ok:
-                    messagebox.showinfo("Mise à jour terminée", msg)
-                    self._update_log(f"✅ {msg}")
-                else:
-                    messagebox.showerror("Échec de la mise à jour", msg)
-                    self._update_log(f"❌ {msg}", tag="threat")
-                self._refresh_db_status()
-                self.btn_update_online.configure(state=tk.NORMAL)
-                self.btn_import_usb.configure(state=tk.NORMAL)
-
-            self.root.after(0, _done)
-
-        threading.Thread(target=_worker, daemon=True).start()
-
-    def _import_db_from_usb(self) -> None:
-        engine = self.engine_var.get()
-
-        if engine == "clamav":
-            self._import_clamav_db_usb()
-        else:
-            self._import_avast_vps_usb()
-
-    def _import_clamav_db_usb(self) -> None:
-        self._update_log("Recherche des fichiers de base ClamAV sur les clés USB…")
-        files = self.av.find_clamav_db_on_usb()
-
-        if not files:
-            messagebox.showwarning(
-                "Fichiers introuvables",
-                "Aucun fichier .cvd ou .cld trouvé sur les clés USB.\n\n"
-                "Copiez les fichiers main.cvd / daily.cvd (ou .cld)\n"
-                "à la racine d'une clé USB, puis réessayez.\n\n"
-                "Ces fichiers sont téléchargeables depuis :\n"
-                "https://database.clamav.net/"
-            )
-            return
-
-        # Show found files for confirmation
-        file_list = "\n".join(f"• {os.path.basename(f)}" for f in files)
-        if not messagebox.askyesno(
-                "Confirmer l'import",
-                f"Fichiers trouvés :\n{file_list}\n\n"
-                "Importer ces fichiers dans /var/lib/clamav/ ?"
-        ):
-            return
-
-        self.btn_import_usb.configure(state=tk.DISABLED)
-        self.db_status_var.set("⏳ Import en cours…")
-
-        def _worker():
-            ok, msg = self.av.import_clamav_db_from_usb(
-                files,
-                progress_cb=lambda l: self.root.after(0, self._update_log, l)
-            )
-
-            def _done():
-                if ok:
-                    messagebox.showinfo("Import réussi", msg)
-                    self._update_log(f"✅ {msg}")
-                else:
-                    messagebox.showerror("Échec de l'import", msg)
-                    self._update_log(f"❌ {msg}", tag="threat")
-                self._refresh_db_status()
-                self.btn_import_usb.configure(state=tk.NORMAL)
-
-            self.root.after(0, _done)
-
-        threading.Thread(target=_worker, daemon=True).start()
-
-    def _import_avast_vps_usb(self) -> None:
-        self._update_log("Recherche des fichiers VPS Avast sur les clés USB…")
-        files = self.av.find_avast_vps_on_usb()
-
-        if not files:
-            # Offer manual file selection
-            path = filedialog.askopenfilename(
-                title="Choisir le fichier VPS Avast",
-                filetypes=[("Fichiers VPS", "*.vps *.zip *.vpz"),
-                            ("Tous", "*.*")]
-            )
-            if not path:
-                messagebox.showwarning(
-                    "Fichier introuvable",
-                    "Aucun fichier VPS Avast trouvé sur les clés USB.\n"
-                    "Téléchargez le fichier VPS depuis votre espace Avast Business."
-                )
-                return
-            files = [path]
-
-        if len(files) > 1:
-            chosen = self._choose_from_list(
-                "Plusieurs fichiers VPS trouvés",
-                "Choisissez le fichier VPS à importer :",
-                files
-            )
-            if not chosen:
-                return
-            files = [chosen]
-
-        self.btn_import_usb.configure(state=tk.DISABLED)
-
-        def _worker():
-            ok, msg = self.av.import_avast_vps_from_usb(
-                files[0],
-                progress_cb=lambda l: self.root.after(0, self._update_log, l)
-            )
-
-            def _done():
-                if ok:
-                    messagebox.showinfo("Import réussi", msg)
-                    self._update_log(f"✅ {msg}")
-                else:
-                    messagebox.showerror("Échec", msg)
-                    self._update_log(f"❌ {msg}", tag="threat")
-                self.btn_import_usb.configure(state=tk.NORMAL)
-
-            self.root.after(0, _done)
-
-        threading.Thread(target=_worker, daemon=True).start()
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # Disk selection
-    # ══════════════════════════════════════════════════════════════════════════
-
-    def refresh_disks(self) -> None:
-        self._update_log("Actualisation de la liste des disques…")
-        self.disk_listbox.delete(0, tk.END)
-        self.selected_disk_var.set("")
-
-        self.disks = get_disk_list()
-        active_list = get_active_disk()
-        self.active_disks = set()
-        if active_list:
-            for d in active_list:
-                self.active_disks.add(get_base_disk(d))
-
-        if not self.disks:
-            self.disk_info_var.set("Aucun disque détecté")
-            return
-
-        for disk in self.disks:
-            device  = disk.get("device", "?")
-            size    = disk.get("size", "?")
-            model   = disk.get("model", "Inconnu")
-            base    = get_base_disk(device.replace("/dev/", ""))
-            active  = " [ACTIF]" if base in self.active_disks else ""
-            ssd_tag = " [SSD]"   if is_ssd(device.replace("/dev/", "")) else ""
-            serial  = get_disk_serial(device.replace("/dev/", ""))
-            self.disk_listbox.insert(
-                tk.END, f"{device}  {size:>8}  {model}{ssd_tag}{active}"
-            )
-            if base in self.active_disks:
-                self.disk_listbox.itemconfig(tk.END, foreground="gray")
-
-        self._update_log(f"{len(self.disks)} disque(s) trouvé(s).")
-
-    def _on_disk_select(self, _event=None) -> None:
-        sel = self.disk_listbox.curselection()
+    def _selected_usb(self) -> Optional[str]:
+        sel = self.usb_tree.selection()
         if not sel:
+            return None
+        vals = self.usb_tree.item(sel[0], "values")
+        if not vals or vals[0] == "—":
+            return None
+        return vals[0]
+
+    def _mount_usb(self) -> None:
+        dev = self._selected_usb()
+        if not dev:
+            messagebox.showwarning("Sélection", "Sélectionnez une clé USB.",
+                                    parent=self.root)
             return
-        idx   = sel[0]
-        disk  = self.disks[idx]
-        dev   = disk.get("device", "")
-        self.selected_disk_var.set(dev)
+        self._log(f"Montage de {dev}…")
 
-        base = get_base_disk(dev.replace("/dev/", ""))
-        ssd  = is_ssd(dev.replace("/dev/", ""))
-        serial = get_disk_serial(dev.replace("/dev/", ""))
-        info = (f"{dev}  |  {disk.get('size','?')}  |  "
-                f"{disk.get('model','?')}  |  "
-                f"{'SSD' if ssd else 'HDD'}  |  S/N: {serial}")
-        self.disk_info_var.set(info)
-
-        if base in self.active_disks:
-            self.disk_warning_var.set(
-                "⚠ Ce disque est le disque système actif – analyse en lecture seule uniquement !"
+        def _worker():
+            ok, msg = self.usb.mount(
+                dev,
+                progress_cb=lambda m: self.root.after(0, self._log, m)
             )
-        else:
-            self.disk_warning_var.set("")
+            def _done():
+                self._log(f"{'✅' if ok else '❌'} {msg}",
+                           "ok" if ok else "threat")
+                self._refresh_usb()
+            self.root.after(0, _done)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _umount_usb(self) -> None:
+        dev = self._selected_usb()
+        if not dev:
+            messagebox.showwarning("Sélection", "Sélectionnez une clé USB.",
+                                    parent=self.root)
+            return
+        self._log(f"Démontage de {dev}…")
+
+        def _worker():
+            ok, msg = self.usb.umount(
+                dev,
+                progress_cb=lambda m: self.root.after(0, self._log, m)
+            )
+            def _done():
+                self._log(f"{'✅' if ok else '❌'} {msg}",
+                           "ok" if ok else "threat")
+                self._refresh_usb()
+            self.root.after(0, _done)
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     # ══════════════════════════════════════════════════════════════════════════
     # Scan
     # ══════════════════════════════════════════════════════════════════════════
 
     def _start_scan(self) -> None:
-        engine = self.engine_var.get()
-        device = self.selected_disk_var.get()
-
-        if not device:
-            messagebox.showwarning("Aucun disque", "Veuillez sélectionner un disque.")
+        if self.is_scanning:
             return
 
-        if engine == "clamav" and not self.av.is_clamav_installed():
+        # Vérifications
+        if not self.engine.is_clamav_installed():
             messagebox.showerror(
-                "ClamAV introuvable",
+                "ClamAV manquant",
                 "ClamAV n'est pas installé.\n"
-                "Installez-le avec : apt install clamav clamav-daemon"
+                "Installez-le : apt install clamav clamav-daemon clamav-freshclam",
+                parent=self.root
             )
             return
 
-        if engine == "avast" and not self.av.is_avast_installed():
-            messagebox.showerror(
-                "Avast introuvable",
-                "Avast n'est pas installé sur ce système."
+        dev = self._selected_usb()
+        if not dev:
+            messagebox.showwarning(
+                "Aucun périphérique",
+                "Sélectionnez une clé USB ou un disque dans la liste.",
+                parent=self.root
             )
             return
 
-        base = get_base_disk(device.replace("/dev/", ""))
-        if base in self.active_disks:
+        # Obtenir le point de montage, monter si nécessaire
+        mp = self.usb.get_mountpoint(dev)
+        if not mp:
             if not messagebox.askyesno(
-                "Disque actif",
-                "Ce disque est le disque système actif.\n"
-                "L'analyser peut être lent et perturber le système.\n\n"
-                "Continuer quand même ?"
+                "Monter le périphérique",
+                f"{dev} n'est pas monté.\nLe monter en lecture seule maintenant ?",
+                parent=self.root
+            ):
+                return
+            ok, msg = self.usb.mount(dev)
+            if not ok:
+                messagebox.showerror("Erreur de montage", msg, parent=self.root)
+                return
+            self._refresh_usb()
+            mp = self.usb.get_mountpoint(dev)
+
+        if not mp:
+            messagebox.showerror("Erreur", "Impossible d'obtenir le point de montage.",
+                                  parent=self.root)
+            return
+
+        if self.remove_var.get():
+            if not messagebox.askyesno(
+                "⚠ Suppression activée",
+                "Les fichiers infectés seront DÉFINITIVEMENT supprimés.\n"
+                "Êtes-vous certain ?",
+                parent=self.root
             ):
                 return
 
-        if self.remove_infected_var.get():
-            if not messagebox.askyesno(
-                "Suppression activée",
-                "⚠ ATTENTION : La suppression des fichiers infectés est activée.\n"
-                "Les fichiers détectés comme malveillants seront DÉFINITIVEMENT supprimés.\n\n"
-                "Êtes-vous absolument sûr ?"
-            ):
-                return
-
+        # Lance le scan
         self.is_scanning = True
-        self.scan_results = {"scanned": 0, "infected": 0, "threats": []}
-        self.scanned_var.set("Fichiers analysés : 0")
-        self.infected_var.set("Menaces : 0")
-        self.start_btn.configure(state=tk.DISABLED)
-        self.stop_btn.configure(state=tk.NORMAL)
+        self.scan_btn.configure(state=tk.DISABLED, bg="#555")
+        self.stop_btn.configure(state=tk.NORMAL, bg="#e94560")
         self.progress.configure(mode="indeterminate")
-        self.progress.start()
+        self.progress.start(10)
         self.status_var.set("Analyse en cours…")
+        self.scanned_var.set("Analysés : 0")
+        self.infected_var.set("Menaces : 0")
 
-        t = threading.Thread(target=self._scan_thread,
-                             args=(device,), daemon=True)
-        t.start()
+        self._log(f"Démarrage de l'analyse : {dev} → {mp}", "info")
 
-    def _scan_thread(self, device: str) -> None:
+        targets = self._get_scan_targets(dev, mp)
+
+        threading.Thread(
+            target=self._scan_thread,
+            args=(targets,),
+            daemon=True
+        ).start()
+
+    def _get_scan_targets(self, device: str, mountpoint: str) -> List[str]:
+        """
+        Mode rapide : utilise le point de montage existant.
+        Mode complet : monte toutes les partitions du disque parent.
+        """
+        if self.scan_mode_var.get() == "quick":
+            self._log(f"Mode rapide : {mountpoint}")
+            return [mountpoint]
+
+        # Mode complet : cherche toutes les partitions du disque parent
+        import subprocess as _sp
+        targets = []
         try:
-            self._perform_scan(device)
-            if self.is_scanning:
-                summary = (f"Analyse terminée !\n\n"
-                           f"Fichiers analysés : {self.scan_results['scanned']}\n"
-                           f"Menaces détectées : {self.scan_results['infected']}")
-                if self.scan_results["threats"]:
-                    summary += "\n\nMenaces :\n" + \
-                               "\n".join(self.scan_results["threats"][:10])
-                    if len(self.scan_results["threats"]) > 10:
-                        summary += (f"\n… et {len(self.scan_results['threats'])-10} "
-                                    "autres")
-
-                def _show():
-                    self.status_var.set("Analyse terminée")
-                    if self.scan_results["infected"] > 0:
-                        messagebox.showwarning("Menaces détectées", summary)
-                    else:
-                        messagebox.showinfo("Analyse terminée", summary)
-
-                self.root.after(0, _show)
-
-        except Exception as e:
-            msg = f"Erreur durant l'analyse : {e}"
-            log_error(msg)
-            self.root.after(0, lambda: (
-                self.status_var.set("Échec de l'analyse"),
-                self._update_log(msg, tag="threat"),
-                messagebox.showerror("Erreur", msg)
-            ))
-        finally:
-            def _cleanup():
-                self.is_scanning = False
-                self.start_btn.configure(state=tk.NORMAL)
-                self.stop_btn.configure(state=tk.DISABLED)
-                self.progress.stop()
-                self.progress.configure(mode="determinate")
-
-            self.root.after(0, _cleanup)
-
-    def _perform_scan(self, device: str) -> None:
-        engine = self.engine_var.get()
-        mount_points: List[str] = []
-        scan_targets: List[str] = []
-
-        try:
-            if self.scan_mode_var.get() == "deep":
-                scan_targets, mount_points = self._mount_all_partitions(device)
-            else:
-                scan_targets = ["/"]
-                self.root.after(0, self._update_log,
-                                "Mode rapide : analyse des systèmes de fichiers montés")
-
-            if not scan_targets:
-                scan_targets = ["/"]
-                self.root.after(0, self._update_log,
-                                "Aucune partition montée, repli sur /")
-
-            cmd = self.av.build_scan_command(scan_targets,
-                                             self.remove_infected_var.get())
-            self.root.after(0, self._update_log,
-                            f"Commande : {' '.join(cmd)}")
-
-            process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=1, universal_newlines=True
+            p = self._find_partition(device)
+            out = _sp.check_output(
+                ["lsblk", "-no", "NAME", f"/dev/{p}"],
+                text=True, stderr=_sp.PIPE
             )
-
-            last_ui_update = time.time()
-            assert process.stdout is not None
-
-            while process.poll() is None and self.is_scanning:
-                line = process.stdout.readline()
-                if line:
-                    self._handle_scan_line(line.strip(), engine)
-                now = time.time()
-                if now - last_ui_update > 0.5:
-                    self.root.after(0, self.scanned_var.set,
-                                    f"Fichiers analysés : {self.scan_results['scanned']}")
-                    self.root.after(0, self.root.update_idletasks)
-                    last_ui_update = now
-
-            if not self.is_scanning:
-                process.terminate()
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-            else:
-                # Drain remaining output
-                remaining = process.stdout.read()
-                if remaining:
-                    for line in remaining.split("\n"):
-                        if line.strip():
-                            self._handle_scan_line(line.strip(), engine)
-
-            self.root.after(0, self.scanned_var.set,
-                            f"Fichiers analysés : {self.scan_results['scanned']}")
-            self.root.after(0, self.infected_var.set,
-                            f"Menaces : {self.scan_results['infected']}")
-
-        finally:
-            for mp in mount_points:
-                try:
-                    subprocess.run(["umount", mp], timeout=10,
-                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                    os.rmdir(mp)
-                except Exception:
-                    try:
-                        subprocess.run(["umount", "-f", mp], timeout=5,
-                                       stdout=subprocess.PIPE,
-                                       stderr=subprocess.PIPE)
-                        os.rmdir(mp)
-                    except Exception as e:
-                        log_warning(f"Démontage échoué pour {mp} : {e}")
-
-    def _handle_scan_line(self, line: str, engine: str) -> None:
-        if not line:
-            return
-
-        if engine == "clamav":
-            self._parse_clamav_line(line)
-        else:
-            parsed = self.av.parse_avast_line(line)
-            if parsed:
-                if parsed["type"] == "threat":
-                    self.scan_results["infected"] += 1
-                    self.scan_results["threats"].append(parsed["value"])
-                    self.root.after(0, self._update_log,
-                                    f"🚨 MENACE : {parsed['value']}", "threat")
-                    self.root.after(0, self.infected_var.set,
-                                    f"Menaces : {self.scan_results['infected']}")
-                elif parsed["type"] == "ok":
-                    self.scan_results["scanned"] += 1
-            else:
-                # Generic progress line
-                if line.startswith("/"):
-                    self.scan_results["scanned"] += 1
-
-    def _parse_clamav_line(self, line: str) -> None:
-        if " FOUND" in line or line.endswith(" FOUND"):
-            self.scan_results["infected"] += 1
-            self.scan_results["threats"].append(line)
-            self.root.after(0, self._update_log,
-                            f"🚨 MENACE : {line}", "threat")
-            self.root.after(0, self.infected_var.set,
-                            f"Menaces : {self.scan_results['infected']}")
-            return
-
-        if line.startswith("Scanned files:"):
-            try:
-                self.scan_results["scanned"] = int(line.split(":")[1].strip())
-            except (ValueError, IndexError):
-                pass
-            return
-
-        if line.startswith("Infected files:"):
-            try:
-                n = int(line.split(":")[1].strip())
-                self.scan_results["infected"] = max(
-                    self.scan_results["infected"], n)
-                self.root.after(0, self.infected_var.set,
-                                f"Menaces : {self.scan_results['infected']}")
-            except (ValueError, IndexError):
-                pass
-            return
-
-        if line.endswith(": OK") or line.endswith(": Empty file"):
-            self.scan_results["scanned"] += 1
-            return
-
-        if "Engine version:" in line or "Known viruses:" in line:
-            self.root.after(0, self._update_log, line)
-
-    def _mount_all_partitions(self, device: str) \
-            -> tuple[List[str], List[str]]:
-        """Mount all partitions of a device; return (targets, mount_points)."""
-        targets: List[str]      = []
-        mount_points: List[str] = []
-        base = device.replace("/dev/", "")
-
-        try:
-            out = subprocess.check_output(
-                ["lsblk", "-no", "NAME", f"/dev/{base}"],
-                text=True, stderr=subprocess.PIPE
-            )
-        except subprocess.CalledProcessError:
-            return [], []
-
-        partitions: List[str] = []
-        for line in out.strip().split("\n")[1:]:
-            p = line.strip().lstrip("├─└─").strip()
-            if p and p != base:
-                partitions.append(f"/dev/{p}")
-
-        if not partitions:
-            self.root.after(0, self._update_log,
-                            f"Aucune partition trouvée sur {device}")
-            return [], []
-
-        self.root.after(0, self._update_log,
-                        f"{len(partitions)} partition(s) trouvée(s) sur {device}")
-
-        for part in partitions:
-            mp = f"/tmp/avscan_{part.replace('/','_')}_{int(time.time())}"
-            try:
-                os.makedirs(mp, exist_ok=True)
-                r = subprocess.run(
-                    ["mount", "-o", "ro", part, mp],
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    text=True, timeout=30
-                )
-                if r.returncode == 0:
-                    targets.append(mp)
-                    mount_points.append(mp)
-                    self.root.after(0, self._update_log,
-                                    f"Montage de {part} → {mp}")
+            for line in out.strip().splitlines()[1:]:
+                part = "/dev/" + line.strip().lstrip("├─└─").strip()
+                if part == device:
+                    targets.append(mountpoint)
+                    continue
+                ok, msg = self.usb.mount(part)
+                if ok:
+                    mp2 = self.usb.get_mountpoint(part)
+                    if mp2:
+                        targets.append(mp2)
+                        self._log(f"Partition supplémentaire montée : {part} → {mp2}")
                 else:
-                    self.root.after(
-                        0, self._update_log,
-                        f"Impossible de monter {part} : {r.stderr.strip()}",
-                        "warning"
-                    )
-                    os.rmdir(mp)
-            except Exception as e:
-                self.root.after(0, self._update_log,
-                                f"Erreur montage {part} : {e}", "warning")
-                try:
-                    os.rmdir(mp)
-                except Exception:
-                    pass
+                    self._log(f"Partition ignorée ({part}) : {msg}", "warning")
+        except Exception:
+            targets = [mountpoint]
 
-        return targets, mount_points
+        return targets or [mountpoint]
+
+    def _find_partition(self, device: str) -> str:
+        """Retourne le nom du disque parent (ex: sdb1 → sdb)."""
+        import re
+        name = device.replace("/dev/", "")
+        m    = re.match(r"([a-z]+)", name)
+        return m.group(1) if m else name
+
+    def _scan_thread(self, targets: List[str]) -> None:
+        _scanned_last = [0]
+        _infected_last = [0]
+
+        def _progress(msg: str, tag: str = "normal") -> None:
+            self.root.after(0, self._log, msg, tag)
+            # Mise à jour des compteurs depuis le résultat partiel
+            # (géré par le moteur en direct via les callbacks)
+
+        try:
+            result = self.engine.scan(
+                targets       = targets,
+                use_clamav    = True,
+                use_yara      = self.use_yara_var.get(),
+                remove_infected = self.remove_var.get(),
+                progress_cb   = _progress,
+            )
+        except Exception as e:
+            result = None
+            msg = f"Erreur fatale durant le scan : {e}"
+            log_error(msg)
+            self.root.after(0, self._log, msg, "threat")
+
+        self.root.after(0, self._scan_done, result)
+
+    def _scan_done(self, result: Optional[ScanResult]) -> None:
+        self.is_scanning = False
+        self.progress.stop()
+        self.progress.configure(mode="determinate")
+        self.scan_btn.configure(state=tk.NORMAL, bg="#e94560")
+        self.stop_btn.configure(state=tk.DISABLED, bg="#555")
+
+        if result is None:
+            self.status_var.set("Erreur durant le scan")
+            return
+
+        self.scanned_var.set(f"Analysés : {result.scanned}")
+        self.infected_var.set(f"Menaces : {result.infected}")
+
+        if result.stopped:
+            self.status_var.set("Analyse interrompue")
+            self._log("Analyse arrêtée par l'utilisateur.", "warning")
+            return
+
+        self.status_var.set("Analyse terminée")
+        summary = result.summary()
+
+        if result.infected > 0:
+            self._log(f"⚠  {result.infected} menace(s) détectée(s) !", "threat")
+            messagebox.showwarning("Menaces détectées", summary, parent=self.root)
+        else:
+            self._log("✅ Aucune menace détectée.", "ok")
+            messagebox.showinfo("Analyse terminée", summary, parent=self.root)
+
+        self._log(f"Durée : {result.duration:.1f}s", "info")
+
+        for err in result.errors:
+            self._log(err, "warning")
 
     def _stop_scan(self) -> None:
         if self.is_scanning:
-            if messagebox.askyesno("Confirmer",
-                                   "Arrêter l'analyse en cours ?"):
-                self.is_scanning = False
-                self._update_log("Analyse arrêtée par l'utilisateur.", "warning")
-                self.status_var.set("Analyse arrêtée")
+            self.engine.request_stop()
+            self.status_var.set("Arrêt en cours…")
+            self.stop_btn.configure(state=tk.DISABLED)
 
     # ══════════════════════════════════════════════════════════════════════════
-    # PDF export
+    # Administration (protégée par code)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _request_admin(self) -> None:
+        panel = AdminPanel(
+            parent               = self.root,
+            auth                 = self.auth,
+            on_update_clamav_online = self._admin_clamav_online,
+            on_import_clamav_usb    = self._admin_clamav_usb,
+            on_update_yara_online   = self._admin_yara_online,
+            on_import_yara_usb      = self._admin_yara_usb,
+            on_quit                 = self._quit,
+        )
+        panel.show()
+
+    # ── Actions admin ClamAV ──────────────────────────────────────────────────
+
+    def _admin_clamav_online(self) -> None:
+        if not self.engine.is_freshclam_available():
+            messagebox.showerror(
+                "freshclam manquant",
+                "Installez clamav-freshclam : apt install clamav-freshclam",
+                parent=self.root
+            )
+            return
+        self._log("Mise à jour ClamAV en ligne…", "info")
+        self._run_background(
+            task=lambda cb: self.db.update_clamav_online(progress_cb=cb),
+            label="ClamAV online update",
+            on_done=lambda ok, msg: self._refresh_status()
+        )
+
+    def _admin_clamav_usb(self) -> None:
+        self._log("Recherche de fichiers ClamAV sur les clés USB…", "info")
+        files = self.db.find_clamav_on_usb()
+        if not files:
+            messagebox.showwarning(
+                "Introuvable",
+                "Aucun fichier .cvd / .cld trouvé sur les clés USB.\n\n"
+                "Téléchargez main.cvd, daily.cvd, bytecode.cvd depuis :\n"
+                "https://database.clamav.net/\n"
+                "et copiez-les à la racine d'une clé USB.",
+                parent=self.root
+            )
+            return
+        names = "\n".join(f"• {os.path.basename(f)}" for f in files)
+        if not messagebox.askyesno(
+            "Confirmer l'import",
+            f"Fichiers trouvés :\n{names}\n\nImporter vers /var/lib/clamav/ ?",
+            parent=self.root
+        ):
+            return
+        self._run_background(
+            task=lambda cb: self.db.import_clamav_from_usb(files,
+                                                             progress_cb=cb),
+            label="ClamAV import USB",
+            on_done=lambda ok, msg: self._refresh_status()
+        )
+
+    # ── Actions admin YARA ────────────────────────────────────────────────────
+
+    def _admin_yara_online(self) -> None:
+        self._log("Téléchargement de signature-base (GitHub)…", "info")
+        self._run_background(
+            task=lambda cb: self.db.update_yara_online(progress_cb=cb),
+            label="YARA online update",
+            on_done=lambda ok, msg: self._refresh_status()
+        )
+
+    def _admin_yara_usb(self) -> None:
+        self._log("Recherche de règles YARA sur les clés USB…", "info")
+        files = self.db.find_yara_on_usb()
+        if not files:
+            messagebox.showwarning(
+                "Introuvable",
+                "Aucun fichier .yar / .yara / .zip trouvé sur les clés USB.\n\n"
+                "Téléchargez des règles depuis :\n"
+                "• https://github.com/Neo23x0/signature-base\n"
+                "• https://github.com/Yara-Rules/rules",
+                parent=self.root
+            )
+            return
+        count = len(files)
+        if not messagebox.askyesno(
+            "Confirmer l'import",
+            f"{count} fichier(s) de règles trouvé(s).\n"
+            f"Importer vers {YARA_RULES_DIR}/custom/ ?",
+            parent=self.root
+        ):
+            return
+        self._run_background(
+            task=lambda cb: self.db.import_yara_from_usb(files, progress_cb=cb),
+            label="YARA import USB",
+            on_done=lambda ok, msg: self._refresh_status()
+        )
+
+    # ── Worker générique en arrière-plan ──────────────────────────────────────
+
+    def _run_background(self, task, label: str, on_done=None) -> None:
+        def _worker():
+            def _cb(msg):
+                self.root.after(0, self._log, msg)
+            ok, msg = task(_cb)
+            self.root.after(0, self._log,
+                            f"{'✅' if ok else '❌'} {msg}",
+                            "ok" if ok else "threat")
+            if on_done:
+                self.root.after(0, on_done, ok, msg)
+            if ok:
+                self.root.after(0, messagebox.showinfo, label, msg)
+            else:
+                self.root.after(0, messagebox.showerror, label, msg)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # PDF export & quitter
     # ══════════════════════════════════════════════════════════════════════════
 
     def _export_pdf(self) -> None:
+        if not self.session_logs:
+            messagebox.showinfo("Journal vide",
+                                "Aucune entrée à exporter.",
+                                parent=self.root)
+            return
         try:
-            from log_handler import generate_session_pdf
-            if not self.session_logs:
-                messagebox.showinfo("Journal vide",
-                                    "Aucune entrée de journal à exporter.")
-                return
             path = generate_session_pdf(self.session_logs)
-            messagebox.showinfo("PDF exporté",
-                                f"Rapport de session exporté :\n{path}")
+            messagebox.showinfo("PDF exporté", f"Rapport enregistré :\n{path}",
+                                parent=self.root)
         except Exception as e:
-            messagebox.showerror("Erreur PDF", str(e))
+            messagebox.showerror("Erreur PDF", str(e), parent=self.root)
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # Helpers
-    # ══════════════════════════════════════════════════════════════════════════
-
-    def _update_log(self, message: str, tag: str = "info") -> None:
-        ts  = time.strftime("%H:%M:%S")
-        msg = f"[{ts}] {message}\n"
-        self.log_text.insert(tk.END, msg, tag)
-        self.log_text.see(tk.END)
-        self.root.update_idletasks()
-        self.session_logs.append(msg.strip())
-        log_info(message)
-
-    def _clear_log(self) -> None:
-        self.log_text.delete("1.0", tk.END)
-
-    def _toggle_fullscreen(self) -> None:
-        current = self.root.attributes("-fullscreen")
-        self.root.attributes("-fullscreen", not current)
-
-    def _exit_application(self) -> None:
+    def _quit(self) -> None:
         if self.is_scanning:
             if not messagebox.askyesno(
                 "Analyse en cours",
-                "Une analyse est en cours.\nQuitter quand même ?"
+                "Une analyse est en cours. Quitter quand même ?",
+                parent=self.root
             ):
                 return
-            self.is_scanning = False
-        # Démonte proprement les clés USB qu'on a montées
-        self.usb.umount_all_managed()
-        log_info("Application fermée par l'utilisateur.")
+            self.engine.request_stop()
+        self.usb.umount_all()
+        log_info("Application fermée.")
         self.root.destroy()
-
-    @staticmethod
-    def _choose_from_list(title: str, prompt: str,
-                          items: List[str]) -> Optional[str]:
-        """Show a simple listbox dialog and return the selected item."""
-        dlg = tk.Toplevel()
-        dlg.title(title)
-        dlg.grab_set()
-        ttk.Label(dlg, text=prompt, padding=8).pack()
-
-        lb = tk.Listbox(dlg, selectmode=tk.SINGLE, width=80, height=10)
-        for item in items:
-            lb.insert(tk.END, item)
-        lb.pack(padx=8, pady=4)
-        lb.selection_set(0)
-
-        chosen: List[Optional[str]] = [None]
-
-        def _ok():
-            sel = lb.curselection()
-            if sel:
-                chosen[0] = items[sel[0]]
-            dlg.destroy()
-
-        ttk.Button(dlg, text="Sélectionner", command=_ok).pack(pady=6)
-        dlg.wait_window()
-        return chosen[0]
