@@ -112,6 +112,7 @@ class VirusScannerGUI:
         left  = tk.Frame(body, bg="#1a1a2e")
         right = tk.Frame(body, bg="#1a1a2e")
         left.pack(side=tk.LEFT, fill=tk.BOTH, expand=False, padx=(0, 6))
+        left.configure(width=420)
         right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
 
         self._build_usb_panel(left)
@@ -123,8 +124,7 @@ class VirusScannerGUI:
     # ── Panneau USB ───────────────────────────────────────────────────────────
 
     def _build_usb_panel(self, parent: tk.Frame) -> None:
-        frm = self._lframe(parent, "Clés USB / Disques amovibles")
-        frm.pack(fill=tk.X, pady=4)
+        frm = self._lframe(parent, "Clés USB / Disques amovibles", fill=tk.BOTH, expand=False)
 
         cols = ("device", "label", "size", "fstype", "status")
         self.usb_tree = ttk.Treeview(frm, columns=cols, show="headings",
@@ -145,7 +145,7 @@ class VirusScannerGUI:
 
         usb_sb = ttk.Scrollbar(frm, orient=tk.VERTICAL, command=self.usb_tree.yview)
         self.usb_tree.configure(yscrollcommand=usb_sb.set)
-        self.usb_tree.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.usb_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         usb_sb.pack(side=tk.LEFT, fill=tk.Y)
 
         btn_col = tk.Frame(frm, bg="#1a1a2e")
@@ -170,7 +170,6 @@ class VirusScannerGUI:
 
     def _build_scan_options(self, parent: tk.Frame) -> None:
         frm = self._lframe(parent, "Options d'analyse")
-        frm.pack(fill=tk.X, pady=4)
 
         # Mode
         self.scan_mode_var = tk.StringVar(value="quick")
@@ -238,7 +237,6 @@ class VirusScannerGUI:
 
     def _build_progress_panel(self, parent: tk.Frame) -> None:
         frm = self._lframe(parent, "Progression")
-        frm.pack(fill=tk.X, pady=4)
 
         self.progress = ttk.Progressbar(frm, mode="indeterminate",
                                          length=300)
@@ -292,10 +290,14 @@ class VirusScannerGUI:
     # Helpers UI
     # ══════════════════════════════════════════════════════════════════════════
 
-    def _lframe(self, parent: tk.Frame, title: str) -> tk.Frame:
-        """Crée un cadre avec bordure et titre stylisé."""
+    def _lframe(self, parent: tk.Frame, title: str,
+                fill=tk.X, expand=False, pady=4) -> tk.Frame:
+        """
+        Crée un cadre avec bordure et titre stylisé, le pack dans parent,
+        et retourne le cadre intérieur prêt à recevoir des widgets.
+        """
         outer = tk.Frame(parent, bg="#16213e", bd=1, relief=tk.SOLID)
-        outer.pack_propagate(True)
+        outer.pack(fill=fill, expand=expand, pady=pady)
         tk.Label(outer, text=f"  {title}  ",
                  bg="#16213e", fg="#aaa",
                  font=("Arial", 8, "bold")).pack(anchor=tk.W, padx=4, pady=(4, 0))
