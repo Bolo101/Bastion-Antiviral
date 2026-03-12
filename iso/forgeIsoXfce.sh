@@ -1,381 +1,627 @@
 #!/bin/bash
+# =============================================================================
+# forgeIsoXfce.sh  –  Génère une ISO live Debian Bookworm / XFCE
+#                     avec le scanner antiviral USB (ClamAV + YARA)
+#
+# Pré-requis sur la machine de build :
+#   sudo apt install live-build wget curl python3 unzip
+#
+# Structure attendue du projet :
+#   ../code/        → les 8 fichiers Python du scanner
+#   ../database/    → (optionnel) fichiers .cvd/.yar pré-téléchargés
+#
+# Exécution :
+#   chmod +x forgeIsoXfce.sh && sudo ./forgeIsoXfce.sh
+# =============================================================================
 
-# Exit on any error
-set -e
+set -euo pipefail
 
-# Variables
-ISO_NAME="$(pwd)/virusCleaner-v0.1.iso"
+# ── Variables ─────────────────────────────────────────────────────────────────
+ISO_NAME="$(pwd)/usb-antivirus-scanner-v1.0.iso"
 WORK_DIR="$(pwd)/debian-live-build"
 CODE_DIR="$(pwd)/../code"
 DATABASE_DIR="$(pwd)/../database"
+SIGBASE_URL="https://github.com/Neo23x0/signature-base/archive/refs/heads/master.zip"
 
-# Install necessary tools
-echo "Installing live-build and required dependencies..."
-sudo apt update
-sudo apt install -y live-build python3 calamares calamares-settings-debian syslinux
+# ── Couleurs ──────────────────────────────────────────────────────────────────
+GREEN="\e[32m"; YELLOW="\e[33m"; RED="\e[31m"; RESET="\e[0m"
+ok()   { echo -e "${GREEN}✅  $*${RESET}"; }
+warn() { echo -e "${YELLOW}⚠   $*${RESET}"; }
+err()  { echo -e "${RED}❌  $*${RESET}"; exit 1; }
+step() { echo -e "\n${YELLOW}▶▶  $*${RESET}"; }
 
-# Create working directory
-echo "Setting up live-build workspace..."
+# ── Vérification des pré-requis ───────────────────────────────────────────────
+step "Vérification des pré-requis..."
+for cmd in lb wget curl python3 unzip; do
+    command -v "$cmd" &>/dev/null \
+        || err "Commande manquante : $cmd  →  apt install live-build wget curl python3 unzip"
+done
+[[ -d "$CODE_DIR" ]] || err "Répertoire code introuvable : $CODE_DIR"
+for f in config.py log_handler.py admin_auth.py usb_manager.py \
+          db_manager.py scanner.py gui.py main.py; do
+    [[ -f "$CODE_DIR/$f" ]] || err "Fichier manquant dans $CODE_DIR : $f"
+done
+ok "Pré-requis OK"
+
+# ── Installation des outils de build ─────────────────────────────────────────
+step "Installation des dépendances de build..."
+apt-get update -qq
+apt-get install -y live-build xorriso syslinux wget curl python3 unzip
+ok "Outils de build installés"
+
+# ── Préparation du répertoire de travail ──────────────────────────────────────
+step "Préparation du répertoire de travail..."
 mkdir -p "$WORK_DIR"
 cd "$WORK_DIR"
+lb clean 2>/dev/null || true
 
-# Clean previous build
-sudo lb clean
+# ── Configuration live-build ──────────────────────────────────────────────────
+step "Configuration de live-build (Debian Bookworm / XFCE / AZERTY)..."
+lb config \
+    --distribution bookworm \
+    --architectures amd64 \
+    --linux-packages linux-image \
+    --debian-installer none \
+    --bootappend-live "boot=live components quiet splash \
+hostname=antivirus-usb username=scanner \
+locales=fr_FR.UTF-8 keyboard-layouts=fr" \
+    --apt-options "--yes --no-install-recommends"
+ok "live-build configuré"
 
-# Configure live-build
-echo "Configuring live-build for Debian Bookworm..."
-lb config --distribution=bookworm --architectures=amd64 \
-    --linux-packages=linux-image \
-    --debian-installer=live \
-    --bootappend-live="boot=live components hostname=secure-eraser username=user locales=fr_FR.UTF-8 keyboard-layouts=fr"
-
-# Add Debian repositories for firmware
+# ── Dépôts Debian ─────────────────────────────────────────────────────────────
 mkdir -p config/archives
-cat << EOF > config/archives/debian.list.chroot
+cat > config/archives/debian.list.chroot << 'EOF'
 deb http://deb.debian.org/debian bookworm main contrib non-free non-free-firmware
 deb-src http://deb.debian.org/debian bookworm main contrib non-free non-free-firmware
 EOF
 
-# Add required packages
-echo "Adding required packages..."
-mkdir -p config/package-lists/
-cat << EOF > config/package-lists/custom.list.chroot
+# ── Liste des paquets ─────────────────────────────────────────────────────────
+step "Définition des paquets..."
+mkdir -p config/package-lists
+
+cat > config/package-lists/custom.list.chroot << 'EOF'
+# Système de base
 coreutils
-parted
-ntfs-3g
-python3
-python3-tk
-dosfstools
-firmware-linux-free
-firmware-linux-nonfree
-calamares
-calamares-settings-debian
-squashfs-tools
-xorg
-xfce4
-network-manager
-network-manager-gnome
 sudo
 live-boot
 live-config
 live-tools
-tasksel
-tasksel-data
 console-setup
 keyboard-configuration
-cryptsetup
-dmsetup
+locales
+# Desktop XFCE minimal
+xorg
+xfce4
+xfce4-terminal
+lightdm
+lightdm-gtk-greeter
+# Réseau
+network-manager
+network-manager-gnome
+wget
+curl
+ca-certificates
+# Python + GUI
+python3
+python3-tk
+python3-pip
+# YARA
+yara
+python3-yara
+# ClamAV
 clamav
 clamav-daemon
-libclamav11
+clamav-freshclam
+# Outils disque/USB
+parted
+ntfs-3g
+dosfstools
+exfatprogs
+util-linux
+usbutils
+# Firmware
+firmware-linux-free
+firmware-linux-nonfree
+# Divers
+unzip
+squashfs-tools
 EOF
+ok "Liste de paquets définie"
 
-# Set system locale and keyboard layout to French AZERTY
-echo "Configuring live system for French AZERTY keyboard..."
-mkdir -p config/includes.chroot/etc/default/
+# =============================================================================
+# Hooks chroot
+# =============================================================================
+mkdir -p config/hooks/normal
 
-# Set default locale to French
-cat << EOF > config/includes.chroot/etc/default/locale
-LANG=fr_FR.UTF-8
-LC_ALL=fr_FR.UTF-8
-EOF
+# ── Hook 1 : téléchargement base ClamAV ──────────────────────────────────────
+step "Création du hook ClamAV..."
+cat > config/hooks/normal/0100-clamav-db.hook.chroot << 'HOOK'
+#!/bin/bash
+set -euo pipefail
+echo ">>> [Hook ClamAV] Mise à jour de la base virale..."
 
-# Set keyboard layout to AZERTY
-cat << EOF > config/includes.chroot/etc/default/keyboard
-XKBMODEL="pc105"
-XKBLAYOUT="fr"
-XKBVARIANT="azerty"
-XKBOPTIONS=""
-EOF
+DB_DIR="/var/lib/clamav"
+MIRROR="https://database.clamav.net"
+LOG="/var/log/clamav-build.log"
+mkdir -p "$DB_DIR"
+chown clamav:clamav "$DB_DIR" 2>/dev/null || true
 
-# Set console keymap for tty
-cat << EOF > config/includes.chroot/etc/default/console-setup
-ACTIVE_CONSOLES="/dev/tty[1-6]"
-CHARMAP="UTF-8"
-CODESET="Lat15"
-XKBLAYOUT="fr"
-XKBVARIANT="azerty"
-EOF
+# Arrêt du service freshclam pour libérer le verrou PID
+systemctl stop clamav-freshclam 2>/dev/null || true
+systemctl disable clamav-freshclam 2>/dev/null || true
 
-# Configure ClamAV for offline operation
-echo "Configuring ClamAV for offline system..."
-mkdir -p config/includes.chroot/etc/clamav/
+UPDATED=0
+for FILE in main.cvd daily.cvd bytecode.cvd; do
+    DEST="$DB_DIR/$FILE"
+    # Télécharge uniquement si absent ou si la version distante est plus récente
+    if wget -q --show-progress -O "$DEST.tmp" "$MIRROR/$FILE" 2>>"$LOG"; then
+        # Vérifie que le fichier téléchargé est valide (> 1 Mo)
+        SIZE=$(stat -c%s "$DEST.tmp" 2>/dev/null || echo 0)
+        if [[ "$SIZE" -gt 1048576 ]]; then
+            mv "$DEST.tmp" "$DEST"
+            echo "  ✅ $FILE ($(du -h "$DEST" | cut -f1))" | tee -a "$LOG"
+            UPDATED=$((UPDATED + 1))
+        else
+            echo "  ⚠ $FILE ignoré : trop petit ($SIZE octets)" | tee -a "$LOG"
+            rm -f "$DEST.tmp"
+        fi
+    else
+        echo "  ⚠ Échec téléchargement $FILE" | tee -a "$LOG"
+        rm -f "$DEST.tmp"
+    fi
+done
 
-# Configure clamd (ClamAV daemon) - disabled freshclam integration
-cat << EOF > config/includes.chroot/etc/clamav/clamd.conf
-# ClamAV daemon configuration for offline live system
+# Correction des permissions
+chown clamav:clamav "$DB_DIR"/*.cvd 2>/dev/null || true
+chmod 644 "$DB_DIR"/*.cvd 2>/dev/null || true
+
+echo ">>> [Hook ClamAV] $UPDATED fichier(s) mis à jour." | tee -a "$LOG"
+HOOK
+chmod +x config/hooks/normal/0100-clamav-db.hook.chroot
+ok "Hook ClamAV créé"
+
+# ── Hook 2 : téléchargement règles YARA ──────────────────────────────────────
+step "Création du hook YARA..."
+# Le heredoc utilise des variables bash d'ici : SIGBASE_URL est interpolé.
+cat > config/hooks/normal/0200-yara-rules.hook.chroot << HOOK
+#!/bin/bash
+set -euo pipefail
+echo ">>> [Hook YARA] Téléchargement de signature-base (Florian Roth)..."
+
+YARA_DIR="/var/lib/yara-rules/signature-base"
+TMP_ZIP="/tmp/signature-base.zip"
+LOG="/var/log/yara-build.log"
+URL="${SIGBASE_URL}"
+
+mkdir -p "\$YARA_DIR"
+
+# Vérifie si les règles sont déjà présentes (copiées depuis la machine de build)
+EXISTING=\$(find "\$YARA_DIR" -name "*.yar" 2>/dev/null | wc -l)
+if [[ "\$EXISTING" -gt 50 ]]; then
+    echo ">>> [Hook YARA] \$EXISTING règles déjà présentes — skip téléchargement." | tee -a "\$LOG"
+    exit 0
+fi
+
+wget -q --show-progress -O "\$TMP_ZIP" "\$URL" 2>>"\$LOG" || {
+    echo "  ⚠ Impossible de télécharger signature-base." | tee -a "\$LOG"
+    echo "    Les règles YARA incluses dans l'image seront utilisées." | tee -a "\$LOG"
+    exit 0
+}
+
+python3 - "\$TMP_ZIP" "\$YARA_DIR" << 'PYEOF'
+import sys, zipfile, os
+
+zip_path = sys.argv[1]
+out_dir  = sys.argv[2]
+PREFIX   = "signature-base-master/yara/"
+count    = 0
+os.makedirs(out_dir, exist_ok=True)
+
+with zipfile.ZipFile(zip_path) as zf:
+    for member in zf.namelist():
+        if (member.startswith(PREFIX)
+                and member.endswith((".yar", ".yara"))
+                and not member.endswith("/")):
+            fname  = os.path.basename(member)
+            target = os.path.join(out_dir, fname)
+            with zf.open(member) as src, open(target, "wb") as dst:
+                dst.write(src.read())
+            count += 1
+
+print(f"  {count} fichier(s) de règles YARA extraits.")
+PYEOF
+
+rm -f "\$TMP_ZIP"
+COUNT=\$(find "\$YARA_DIR" -name "*.yar" | wc -l)
+echo ">>> [Hook YARA] \$COUNT règle(s) installée(s)." | tee -a "\$LOG"
+HOOK
+chmod +x config/hooks/normal/0200-yara-rules.hook.chroot
+ok "Hook YARA créé"
+
+# ── Hook 3 : configuration système ────────────────────────────────────────────
+step "Création du hook système..."
+cat > config/hooks/normal/0300-system-config.hook.chroot << 'HOOK'
+#!/bin/bash
+set -euo pipefail
+echo ">>> [Hook Système] Configuration locale, utilisateurs, services..."
+
+# Locale française
+echo "fr_FR.UTF-8 UTF-8" >> /etc/locale.gen
+locale-gen fr_FR.UTF-8
+update-locale LANG=fr_FR.UTF-8 LC_ALL=fr_FR.UTF-8
+
+# Utilisateur scanner (autologin, sudo sans mot de passe)
+if ! id scanner &>/dev/null; then
+    useradd -m -s /bin/bash -G sudo,plugdev,cdrom,dialout scanner
+    echo "scanner:scanner" | chpasswd
+fi
+echo "scanner ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/scanner
+chmod 0440 /etc/sudoers.d/scanner
+
+# Répertoires de l'application
+mkdir -p /opt/usb-antivirus
+mkdir -p /mnt/avscan_usb && chmod 777 /mnt/avscan_usb
+mkdir -p /etc/virusscanner && chmod 700 /etc/virusscanner
+mkdir -p /var/lib/yara-rules/signature-base /var/lib/yara-rules/custom
+chmod -R 755 /var/lib/yara-rules
+
+# Wrapper de lancement
+cat > /usr/local/bin/usb-antivirus << 'WRAPPER'
+#!/bin/bash
+exec sudo -E python3 /opt/usb-antivirus/main.py "$@"
+WRAPPER
+chmod 755 /usr/local/bin/usb-antivirus
+
+# Désactivation de freshclam automatique (géré depuis le panneau Admin)
+systemctl disable clamav-freshclam 2>/dev/null || true
+systemctl disable clamav-daemon    2>/dev/null || true
+
+echo ">>> [Hook Système] OK ✅"
+HOOK
+chmod +x config/hooks/normal/0300-system-config.hook.chroot
+ok "Hook système créé"
+
+# ── Hook 4 : permissions finales ────────────────────────────────────────────
+cat > config/hooks/normal/0400-permissions.hook.chroot << 'HOOK'
+#!/bin/bash
+set -euo pipefail
+echo ">>> [Hook Permissions] Finalisation..."
+
+# Application Python
+chmod 644 /opt/usb-antivirus/*.py
+chmod 755 /opt/usb-antivirus
+
+# ClamAV
+mkdir -p /var/lib/clamav /var/log/clamav /var/run/clamav
+chown -R clamav:clamav /var/lib/clamav /var/log/clamav /var/run/clamav 2>/dev/null || true
+chmod 755 /var/lib/clamav /var/log/clamav /var/run/clamav
+find /var/lib/clamav -name "*.cvd" -o -name "*.cld" 2>/dev/null \
+    | xargs chmod 644 2>/dev/null || true
+
+# YARA
+chmod -R 755 /var/lib/yara-rules
+
+# Autostart XFCE : s'assurer que le répertoire appartient à scanner
+chown -R scanner:scanner /home/scanner/ 2>/dev/null || true
+
+echo ">>> [Hook Permissions] OK ✅"
+HOOK
+chmod +x config/hooks/normal/0400-permissions.hook.chroot
+ok "Hook permissions créé"
+
+# =============================================================================
+# includes.chroot – Fichiers intégrés dans l'image
+# =============================================================================
+step "Copie des fichiers dans le chroot..."
+
+# ── Application Python ────────────────────────────────────────────────────────
+APP_CHROOT="config/includes.chroot/opt/usb-antivirus"
+mkdir -p "$APP_CHROOT"
+cp -v "$CODE_DIR"/{config.py,log_handler.py,admin_auth.py,\
+usb_manager.py,db_manager.py,scanner.py,gui.py,main.py} "$APP_CHROOT/"
+ok "Fichiers Python copiés → $APP_CHROOT"
+
+# ── Bases ClamAV : pré-téléchargement sur la machine de build ─────────────────
+step "Pré-téléchargement de la base ClamAV (machine de build)..."
+CLAMAV_CHROOT="config/includes.chroot/var/lib/clamav"
+mkdir -p "$CLAMAV_CHROOT"
+
+# 1. Copie depuis ../database/ si disponible
+DB_FOUND=0
+if [[ -d "$DATABASE_DIR" ]]; then
+    for f in main.cvd main.cld daily.cvd daily.cld bytecode.cvd bytecode.cld; do
+        if [[ -f "$DATABASE_DIR/$f" ]]; then
+            cp -v "$DATABASE_DIR/$f" "$CLAMAV_CHROOT/"
+            DB_FOUND=$((DB_FOUND + 1))
+        fi
+    done
+fi
+
+# 2. Téléchargement direct si base absente ou incomplète
+for f in main.cvd daily.cvd bytecode.cvd; do
+    DEST="$CLAMAV_CHROOT/$f"
+    if [[ -f "$DEST" ]] && [[ $(stat -c%s "$DEST") -gt 1048576 ]]; then
+        ok "$f : déjà présent ($(du -h "$DEST" | cut -f1))"
+        continue
+    fi
+    echo "  Téléchargement de $f depuis database.clamav.net..."
+    if wget -q --show-progress -O "$DEST.tmp" \
+            "https://database.clamav.net/$f" 2>&1; then
+        SIZE=$(stat -c%s "$DEST.tmp" 2>/dev/null || echo 0)
+        if [[ "$SIZE" -gt 1048576 ]]; then
+            mv "$DEST.tmp" "$DEST"
+            ok "$f téléchargé ($(du -h "$DEST" | cut -f1))"
+        else
+            warn "$f : fichier trop petit ($SIZE octets) — sera retéléchargé dans le hook"
+            rm -f "$DEST.tmp"
+        fi
+    else
+        warn "Échec téléchargement $f — le hook réseau réessaiera pendant la build"
+        rm -f "$DEST.tmp" 2>/dev/null || true
+    fi
+done
+
+# ── Règles YARA : pré-téléchargement sur la machine de build ──────────────────
+step "Pré-téléchargement des règles YARA signature-base (machine de build)..."
+YARA_CHROOT="config/includes.chroot/var/lib/yara-rules"
+mkdir -p "$YARA_CHROOT/signature-base" "$YARA_CHROOT/custom"
+
+# 1. Copie depuis ../database/yara-rules/ si disponible
+if [[ -d "$DATABASE_DIR/yara-rules" ]]; then
+    while IFS= read -r -d '' f; do
+        cp "$f" "$YARA_CHROOT/custom/"
+    done < <(find "$DATABASE_DIR/yara-rules" -name "*.yar" -o -name "*.yara" -print0)
+fi
+
+# 2. Téléchargement si règles absentes
+EXISTING_RULES=$(find "$YARA_CHROOT/signature-base" -name "*.yar" 2>/dev/null | wc -l)
+if [[ "$EXISTING_RULES" -lt 50 ]]; then
+    echo "  Téléchargement de signature-base (Florian Roth) depuis GitHub..."
+    TMP_ZIP="$(mktemp /tmp/sigbase.XXXXXX.zip)"
+    if wget -q --show-progress -O "$TMP_ZIP" "$SIGBASE_URL" 2>&1; then
+        python3 - "$TMP_ZIP" "$YARA_CHROOT/signature-base" << 'PYEOF'
+import sys, zipfile, os
+
+zip_path = sys.argv[1]
+out_dir  = sys.argv[2]
+PREFIX   = "signature-base-master/yara/"
+count    = 0
+os.makedirs(out_dir, exist_ok=True)
+
+with zipfile.ZipFile(zip_path) as zf:
+    for member in zf.namelist():
+        if (member.startswith(PREFIX)
+                and member.endswith((".yar", ".yara"))
+                and not member.endswith("/")):
+            fname  = os.path.basename(member)
+            target = os.path.join(out_dir, fname)
+            with zf.open(member) as src, open(target, "wb") as dst:
+                dst.write(src.read())
+            count += 1
+
+print(f"  {count} fichier(s) de règles YARA extraits.")
+PYEOF
+        EXISTING_RULES=$(find "$YARA_CHROOT/signature-base" -name "*.yar" | wc -l)
+        ok "$EXISTING_RULES règles YARA signature-base téléchargées"
+        rm -f "$TMP_ZIP"
+    else
+        warn "Échec téléchargement YARA — le hook réseau réessaiera pendant la build"
+        rm -f "$TMP_ZIP" 2>/dev/null || true
+    fi
+else
+    ok "$EXISTING_RULES règles YARA déjà présentes"
+fi
+
+# ── Fichiers de configuration ─────────────────────────────────────────────────
+step "Génération des fichiers de configuration..."
+
+# ClamAV
+mkdir -p config/includes.chroot/etc/clamav
+cat > config/includes.chroot/etc/clamav/clamd.conf << 'EOF'
 LogFile /var/log/clamav/clamav.log
-LogFileUnlock no
 LogFileMaxSize 0
 LogTime yes
-LogClean no
 LogSyslog yes
-LogFacility LOG_LOCAL6
-LogVerbose no
-ExtendedDetectionInfo yes
 PidFile /var/run/clamav/clamd.pid
 LocalSocket /var/run/clamav/clamd.ctl
 LocalSocketGroup clamav
 LocalSocketMode 666
 FixStaleSocket yes
-TCPSocket 3310
-TCPAddr 127.0.0.1
-MaxConnectionQueueLength 15
-StreamMaxLength 25M
-MaxThreads 12
-ReadTimeout 180
-CommandReadTimeout 30
-SendBufTimeout 200
-MaxQueue 100
-IdleTimeout 30
-ExcludePath ^/proc/
-ExcludePath ^/sys/
-ExcludePath ^/dev/
-ExcludePath ^/run/
 DatabaseDirectory /var/lib/clamav
 OfficialDatabaseOnly no
 SelfCheck 3600
-Foreground no
-Debug no
 ScanPE yes
 ScanELF yes
 ScanOLE2 yes
 ScanPDF yes
-ScanSWF yes
+ScanHTML yes
+ScanArchive yes
 ScanMail yes
 PhishingSignatures yes
 PhishingScanURLs yes
-HeuristicScanPrecedence no
-StructuredDataDetection no
-StructuredMinCreditCardCount 3
-StructuredMinSSNCount 3
-StructuredSSNFormatNormal yes
-StructuredSSNFormatStripped no
-ScanHTML yes
-ScanArchive yes
-ArchiveBlockEncrypted no
-MaxScanSize 100M
-MaxFileSize 25M
-MaxRecursion 16
-MaxFiles 10000
-MaxEmbeddedPE 10M
-MaxHTMLNormalize 10M
-MaxHTMLNoTags 2M
-MaxScriptNormalize 5M
-MaxZipTypeRcg 1M
-MaxPartitions 50
-MaxIconsPE 100
-PCREMatchLimit 10000
-PCRERecMatchLimit 5000
-PCREMaxFileSize 25M
-ScanOnAccess no
-OnAccessMaxFileSize 5M
-OnAccessIncludePath /home
-OnAccessExcludePath /var/log/
-OnAccessExcludeUID 0
-DisableCertCheck no
 AlgorithmicDetection yes
 Bytecode yes
 BytecodeSecurity TrustSigned
 BytecodeTimeout 60000
+MaxScanSize 100M
+MaxFileSize 25M
+MaxRecursion 16
+MaxFiles 10000
+ExcludePath ^/proc/
+ExcludePath ^/sys/
+ExcludePath ^/dev/
+ExcludePath ^/run/
 EOF
 
-# Create minimal freshclam config (for compatibility, but won't be used automatically)
-cat << EOF > config/includes.chroot/etc/clamav/freshclam.conf
-# Freshclam configuration (offline mode - use update_clamav_db.py instead)
+cat > config/includes.chroot/etc/clamav/freshclam.conf << 'EOF'
 DatabaseDirectory /var/lib/clamav
 UpdateLogFile /var/log/clamav/freshclam.log
 LogVerbose yes
-LogSyslog yes
-LogFacility LOG_LOCAL6
-LogFileMaxSize 0
-LogRotate yes
 LogTime yes
-Foreground no
-Debug no
-MaxAttempts 5
+MaxAttempts 3
 DatabaseOwner clamav
-AllowSupplementaryGroups no
-PidFile /var/run/clamav/freshclam.pid
-ConnectTimeout 30
-ReceiveTimeout 0
-TestDatabases yes
-ScriptedUpdates yes
-CompressLocalDatabase no
-Bytecode yes
-# Database mirrors (for reference - use offline updater instead)
-DatabaseMirror db.local.clamav.net
 DatabaseMirror database.clamav.net
+Bytecode yes
 EOF
 
-# Create ClamAV log directory structure
-mkdir -p config/includes.chroot/var/log/clamav
-mkdir -p config/includes.chroot/var/run/clamav
-mkdir -p config/includes.chroot/var/lib/clamav
-mkdir -p config/includes.chroot/usr/local/bin
-
-# Set up ClamAV permissions script (without auto-update)
-cat << EOF > config/includes.chroot/usr/local/bin/setup-clamav.sh
-#!/bin/bash
-# Setup ClamAV permissions for offline operation
-
-# Create clamav user if it doesn't exist
-if ! getent passwd clamav > /dev/null; then
-    adduser --system --group --home /var/lib/clamav --shell /bin/false clamav
-fi
-
-# Set proper ownership and permissions
-chown -R clamav:clamav /var/lib/clamav
-chown -R clamav:clamav /var/log/clamav
-chown -R clamav:clamav /var/run/clamav
-
-chmod 755 /var/lib/clamav
-chmod 755 /var/log/clamav
-chmod 755 /var/run/clamav
-
-# Set file permissions
-chmod 644 /etc/clamav/freshclam.conf
-chmod 644 /etc/clamav/clamd.conf
-
-# Create database directory structure
-mkdir -p /var/lib/clamav
-
-# Create placeholder database files if they don't exist
-if [ ! -f /var/lib/clamav/main.cvd ] && [ ! -f /var/lib/clamav/main.cld ]; then
-    touch /var/lib/clamav/main.cvd
-fi
-
-if [ ! -f /var/lib/clamav/daily.cvd ] && [ ! -f /var/lib/clamav/daily.cld ]; then
-    touch /var/lib/clamav/daily.cld
-fi
-
-if [ ! -f /var/lib/clamav/bytecode.cvd ] && [ ! -f /var/lib/clamav/bytecode.cld ]; then
-    touch /var/lib/clamav/bytecode.cld
-fi
-
-chown clamav:clamav /var/lib/clamav/*
-
-echo "ClamAV setup completed (offline mode)"
-echo "Use update_clamav_db.py script to update virus database"
+# Locale et clavier
+mkdir -p config/includes.chroot/etc/default
+cat > config/includes.chroot/etc/default/locale << 'EOF'
+LANG=fr_FR.UTF-8
+LC_ALL=fr_FR.UTF-8
 EOF
 
-chmod +x config/includes.chroot/usr/local/bin/setup-clamav.sh
+cat > config/includes.chroot/etc/default/keyboard << 'EOF'
+XKBMODEL="pc105"
+XKBLAYOUT="fr"
+XKBVARIANT="azerty"
+XKBOPTIONS=""
+BACKSPACE="guess"
+EOF
 
-# Create systemd service to setup ClamAV on boot (without freshclam auto-start)
-mkdir -p config/includes.chroot/etc/systemd/system/
-cat << EOF > config/includes.chroot/etc/systemd/system/setup-clamav.service
+# LightDM autologin
+mkdir -p config/includes.chroot/etc/lightdm
+cat > config/includes.chroot/etc/lightdm/lightdm.conf << 'EOF'
+[Seat:*]
+autologin-user=scanner
+autologin-user-timeout=0
+user-session=xfce
+EOF
+
+# NetworkManager
+mkdir -p config/includes.chroot/etc/NetworkManager
+cat > config/includes.chroot/etc/NetworkManager/NetworkManager.conf << 'EOF'
+[main]
+plugins=ifupdown,keyfile
+dns=default
+[ifupdown]
+managed=false
+EOF
+
+# Service systemd d'initialisation ClamAV
+mkdir -p config/includes.chroot/etc/systemd/system
+cat > config/includes.chroot/etc/systemd/system/clamav-init.service << 'EOF'
 [Unit]
-Description=Setup ClamAV permissions and database for offline operation
+Description=Initialisation ClamAV (répertoires et permissions)
 After=local-fs.target
+Before=clamav-daemon.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/setup-clamav.sh
 RemainAfterExit=yes
+ExecStart=/bin/bash -c "\
+    mkdir -p /var/lib/clamav /var/log/clamav /var/run/clamav && \
+    chown -R clamav:clamav /var/lib/clamav /var/log/clamav /var/run/clamav && \
+    chmod 755 /var/lib/clamav /var/log/clamav /var/run/clamav"
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-# Enable only the setup service (not freshclam)
-mkdir -p config/includes.chroot/etc/systemd/system/multi-user.target.wants/
-ln -sf /etc/systemd/system/setup-clamav.service config/includes.chroot/etc/systemd/system/multi-user.target.wants/setup-clamav.service
+mkdir -p config/includes.chroot/etc/systemd/system/multi-user.target.wants
+ln -sf /etc/systemd/system/clamav-init.service \
+    config/includes.chroot/etc/systemd/system/multi-user.target.wants/clamav-init.service
 
-# Copy all files from CODE_DIR to /usr/local/bin
-echo "Copying all files from $CODE_DIR to /usr/local/bin..."
-mkdir -p config/includes.chroot/usr/local/bin/
-cp -r "$CODE_DIR"/* config/includes.chroot/usr/local/bin/
-chmod +x config/includes.chroot/usr/local/bin/*
-
-# Copy the ClamAV database updater script to USB root directory
-echo "Copying ClamAV database updater script to USB root..."
-if [ -f "$DATABASE_DIR/update_clamav_db.py" ]; then
-    # Copy to the root of the live system (will appear at USB root when booted)
-    cp "$DATABASE_DIR/update_clamav_db.py" config/includes.chroot/
-    chmod +x config/includes.chroot/update_clamav_db.py
-    echo "✅ ClamAV database updater script copied successfully"
-else
-    echo "❌ WARNING: ClamAV database updater script not found at $DATABASE_DIR/update_clamav_db.py"
-    echo "   The script will not be available on the USB root directory"
-    echo "   Expected path: $DATABASE_DIR/update_clamav_db.py"
-fi
-
-# Create a README file for the database updater in USB root
-echo "Creating README for ClamAV database updater..."
-cat << 'EOF' > config/includes.chroot/README_ClamAV_Update.txt
-ClamAV Database Update Instructions
-===================================
-
-This bootable USB includes a ClamAV database updater script that allows you to
-update the virus definitions while the USB is mounted on a computer with internet.
-
-HOW TO UPDATE THE DATABASE:
---------------------------
-
-1. Boot a computer with internet connection using this USB
-2. Open a terminal
-3. Navigate to the USB root directory (usually /cdrom or the mount point)
-4. Run the updater script:
-   
-   python3 update_clamav_db.py
-
-   OR if you're not in the USB root directory:
-   
-   python3 update_clamav_db.py /path/to/usb/root
-
-WHAT THE SCRIPT DOES:
---------------------
-
-- Downloads the latest ClamAV virus database files from official mirrors
-- Installs them in the USB's /var/lib/clamav directory  
-- Creates a backup of existing database files
-- Verifies the integrity of downloaded files
-- Creates an update log with timestamp and file information
-
-REQUIREMENTS:
-------------
-
-- Internet connection
-- Python 3 (included in this USB)
-- Write access to the USB (automatic when booted from USB)
-
-The updated database will be persistent and available for all future
-virus scans performed with this bootable USB.
-
-For troubleshooting, check the script output messages for detailed
-information about any errors that may occur during the update process.
+# Autostart XFCE
+mkdir -p "config/includes.chroot/home/scanner/.config/autostart"
+cat > "config/includes.chroot/home/scanner/.config/autostart/usb-antivirus.desktop" << 'EOF'
+[Desktop Entry]
+Type=Application
+Name=USB Antivirus Scanner
+Exec=/usr/local/bin/usb-antivirus
+Terminal=false
+Hidden=false
+X-GNOME-Autostart-enabled=true
 EOF
 
-# Build the ISO
-echo "Building the ISO..."
-sudo lb build
+# Entrée menu application
+mkdir -p config/includes.chroot/usr/share/applications
+cat > config/includes.chroot/usr/share/applications/usb-antivirus.desktop << 'EOF'
+[Desktop Entry]
+Type=Application
+Name=USB Antivirus Scanner
+GenericName=Scanner Antiviral USB
+Comment=Analyse les clés USB avec ClamAV et YARA
+Exec=/usr/local/bin/usb-antivirus
+Icon=security-high
+Terminal=false
+Categories=Security;Utility;
+EOF
 
-# Move the ISO to the desired location
-if [ -f "live-image-amd64.hybrid.iso" ]; then
-    mv live-image-amd64.hybrid.iso "$ISO_NAME"
-    echo "✅ ISO created successfully: $ISO_NAME"
-elif [ -f "binary.hybrid.iso" ]; then
-    mv binary.hybrid.iso "$ISO_NAME"
-    echo "✅ ISO created successfully: $ISO_NAME"
-else
-    echo "❌ Error: ISO file not found after build"
-    exit 1
-fi
+# README sur l'USB
+cat > config/includes.chroot/README_SCANNER.txt << 'EOF'
+=============================================================================
+ USB Antivirus Scanner  –  ClamAV + YARA
+=============================================================================
 
-# Cleanup
-echo "Cleaning up build environment..."
-sudo lb clean
+DÉMARRAGE
+---------
+Le scanner démarre automatiquement. Si ce n'est pas le cas :
+  usb-antivirus   (dans un terminal)
+
+ADMINISTRATION (bouton ⚙, code par défaut : 0000 – À CHANGER)
+---------------------------------------------------------------
+• Mise à jour ClamAV (Internet) ou import .cvd depuis clé USB
+• Mise à jour YARA (Internet) ou import .yar/.zip depuis clé USB
+• Planification cron de la mise à jour
+• Changement du code admin
+• Quitter
+
+MISE À JOUR HORS-LIGNE
+----------------------
+ClamAV  → https://database.clamav.net  (main.cvd, daily.cvd, bytecode.cvd)
+YARA    → https://github.com/Neo23x0/signature-base/archive/master.zip
+
+Copiez les fichiers à la racine d'une clé USB, puis utilisez
+le panneau Admin → onglet ClamAV ou YARA → "Importer depuis clé USB".
+
+JOURNAUX
+--------
+/var/log/virusscanner.log
+/var/log/clamav/clamav.log
+=============================================================================
+EOF
+
+ok "Tous les fichiers de configuration générés"
+
+# =============================================================================
+# Build de l'ISO
+# =============================================================================
+step "Lancement de la build live-build (20-40 min)..."
+lb build 2>&1 | tee /tmp/lb-build.log
+
+# ── Récupération de l'ISO ─────────────────────────────────────────────────────
+step "Récupération de l'ISO générée..."
+ISO_FOUND=""
+for candidate in live-image-amd64.hybrid.iso binary.hybrid.iso; do
+    [[ -f "$candidate" ]] && { ISO_FOUND="$candidate"; break; }
+done
+[[ -n "$ISO_FOUND" ]] || err "ISO introuvable après la build. Consultez /tmp/lb-build.log"
+mv "$ISO_FOUND" "$ISO_NAME"
+ok "ISO : $ISO_NAME"
+
+# ── Nettoyage ─────────────────────────────────────────────────────────────────
+step "Nettoyage..."
+lb clean
+
+# =============================================================================
+# Résumé
+# =============================================================================
+ISO_SIZE=$(du -h "$ISO_NAME" | cut -f1)
+CV_COUNT=$(find "$CLAMAV_CHROOT" \( -name "*.cvd" -o -name "*.cld" \) 2>/dev/null | wc -l)
+YR_COUNT=$(find "$YARA_CHROOT/signature-base" -name "*.yar" 2>/dev/null | wc -l)
 
 echo ""
-echo "🎉 Build completed successfully!"
-echo "📦 ISO file: $ISO_NAME"
+echo "═══════════════════════════════════════════════════════════"
+echo -e "${GREEN}🎉  BUILD TERMINÉ AVEC SUCCÈS${RESET}"
+echo "═══════════════════════════════════════════════════════════"
+echo "  ISO         : $ISO_NAME  ($ISO_SIZE)"
+echo "  ClamAV      : $CV_COUNT fichier(s) de base inclus"
+echo "  YARA        : $YR_COUNT règle(s) signature-base incluses"
+echo "  Clavier     : AZERTY (fr)"
+echo "  Autologin   : scanner  (sudo sans mot de passe)"
+echo "  Code admin  : 0000  (À CHANGER au premier démarrage !)"
 echo ""
-echo "Summary of included components:"
-echo "- Main application files from: $CODE_DIR"
-echo "- ClamAV database updater: update_clamav_db.py (from $DATABASE_DIR)"
-echo "- ClamAV offline configuration with placeholder databases"
-echo "- French AZERTY keyboard layout"
-echo "- XFCE desktop environment"
-echo "- Network connectivity tools"
-echo ""
-echo "The ISO is ready to use!"
+echo "  Pour flasher sur une clé USB :"
+echo "    sudo dd if=$ISO_NAME of=/dev/sdX bs=4M status=progress"
+echo "═══════════════════════════════════════════════════════════"
