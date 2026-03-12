@@ -19,7 +19,7 @@ set -euo pipefail
 # ── Variables ─────────────────────────────────────────────────────────────────
 ISO_NAME="$(pwd)/usb-antivirus-scanner-v1.0.iso"
 WORK_DIR="$(pwd)/debian-live-build"
-CODE_DIR="$(pwd)/../code"
+CODE_DIR="$(pwd)/../../code"
 DATABASE_DIR="$(pwd)/../database"
 SIGBASE_URL="https://github.com/Neo23x0/signature-base/archive/refs/heads/master.zip"
 
@@ -138,44 +138,72 @@ step "Création du hook ClamAV..."
 cat > config/hooks/normal/0100-clamav-db.hook.chroot << 'HOOK'
 #!/bin/bash
 set -euo pipefail
-echo ">>> [Hook ClamAV] Mise à jour de la base virale..."
+echo ">>> [Hook ClamAV] Mise à jour de la base virale via freshclam..."
 
 DB_DIR="/var/lib/clamav"
-MIRROR="https://database.clamav.net"
 LOG="/var/log/clamav-build.log"
 mkdir -p "$DB_DIR"
 chown clamav:clamav "$DB_DIR" 2>/dev/null || true
 
-# Arrêt du service freshclam pour libérer le verrou PID
+# Arrêt des services pour libérer le verrou PID
 systemctl stop clamav-freshclam 2>/dev/null || true
+systemctl stop clamav-daemon    2>/dev/null || true
 systemctl disable clamav-freshclam 2>/dev/null || true
 
-UPDATED=0
-for FILE in main.cvd daily.cvd bytecode.cvd; do
-    DEST="$DB_DIR/$FILE"
-    # Télécharge uniquement si absent ou si la version distante est plus récente
-    if wget -q --show-progress -O "$DEST.tmp" "$MIRROR/$FILE" 2>>"$LOG"; then
-        # Vérifie que le fichier téléchargé est valide (> 1 Mo)
-        SIZE=$(stat -c%s "$DEST.tmp" 2>/dev/null || echo 0)
-        if [[ "$SIZE" -gt 1048576 ]]; then
-            mv "$DEST.tmp" "$DEST"
-            echo "  ✅ $FILE ($(du -h "$DEST" | cut -f1))" | tee -a "$LOG"
-            UPDATED=$((UPDATED + 1))
-        else
-            echo "  ⚠ $FILE ignoré : trop petit ($SIZE octets)" | tee -a "$LOG"
-            rm -f "$DEST.tmp"
+# Vérifie si les bases sont déjà présentes et récentes (copiées depuis la machine de build)
+EXISTING=$(find "$DB_DIR" -name "*.cvd" -o -name "*.cld" 2>/dev/null | wc -l)
+if [[ "$EXISTING" -ge 2 ]]; then
+    # Vérifie que les fichiers ne sont pas vides
+    VALID=0
+    for f in "$DB_DIR"/main.cvd "$DB_DIR"/daily.cvd "$DB_DIR"/main.cld "$DB_DIR"/daily.cld; do
+        if [[ -f "$f" ]] && [[ $(stat -c%s "$f" 2>/dev/null || echo 0) -gt 1048576 ]]; then
+            VALID=$((VALID + 1))
         fi
-    else
-        echo "  ⚠ Échec téléchargement $FILE" | tee -a "$LOG"
-        rm -f "$DEST.tmp"
+    done
+    if [[ "$VALID" -ge 2 ]]; then
+        echo ">>> [Hook ClamAV] $EXISTING fichier(s) de base déjà présents et valides." | tee -a "$LOG"
+        echo "    Tentative de mise à jour incrémentale via freshclam..." | tee -a "$LOG"
     fi
-done
+fi
+
+# Fichier de configuration freshclam temporaire pour ce hook
+FRESHCLAM_CONF="$(mktemp /tmp/freshclam-hook.XXXXXX.conf)"
+cat > "$FRESHCLAM_CONF" << CONF
+DatabaseDirectory $DB_DIR
+UpdateLogFile $LOG
+LogVerbose yes
+LogTime yes
+MaxAttempts 3
+DatabaseMirror database.clamav.net
+DatabaseMirror db.local.clamav.net
+ConnectTimeout 30
+ReceiveTimeout 60
+Bytecode yes
+CONF
+
+echo ">>> [Hook ClamAV] Lancement de freshclam..." | tee -a "$LOG"
+if freshclam --config-file="$FRESHCLAM_CONF" --stdout 2>&1 | tee -a "$LOG"; then
+    COUNT=$(find "$DB_DIR" \( -name "*.cvd" -o -name "*.cld" \) | wc -l)
+    echo ">>> [Hook ClamAV] ✅ Base mise à jour ($COUNT fichier(s))." | tee -a "$LOG"
+else
+    RC=$?
+    if [[ $RC -eq 1 ]]; then
+        COUNT=$(find "$DB_DIR" \( -name "*.cvd" -o -name "*.cld" \) | wc -l)
+        echo ">>> [Hook ClamAV] ✅ Base déjà à jour ($COUNT fichier(s))." | tee -a "$LOG"
+    else
+        echo ">>> [Hook ClamAV] ⚠ freshclam code $RC — base incluse dans l'image utilisée." | tee -a "$LOG"
+    fi
+fi
+
+rm -f "$FRESHCLAM_CONF"
 
 # Correction des permissions
-chown clamav:clamav "$DB_DIR"/*.cvd 2>/dev/null || true
-chmod 644 "$DB_DIR"/*.cvd 2>/dev/null || true
+chown clamav:clamav "$DB_DIR"/ 2>/dev/null || true
+find "$DB_DIR" -name "*.cvd" -o -name "*.cld" 2>/dev/null     | xargs chown clamav:clamav 2>/dev/null || true
+find "$DB_DIR" -name "*.cvd" -o -name "*.cld" 2>/dev/null     | xargs chmod 644 2>/dev/null || true
 
-echo ">>> [Hook ClamAV] $UPDATED fichier(s) mis à jour." | tee -a "$LOG"
+FINAL=$(find "$DB_DIR" -name "*.cvd" -o -name "*.cld" | wc -l)
+echo ">>> [Hook ClamAV] Terminé. $FINAL fichier(s) dans $DB_DIR." | tee -a "$LOG"
 HOOK
 chmod +x config/hooks/normal/0100-clamav-db.hook.chroot
 ok "Hook ClamAV créé"
@@ -337,29 +365,72 @@ if [[ -d "$DATABASE_DIR" ]]; then
     done
 fi
 
-# 2. Téléchargement direct si base absente ou incomplète
-for f in main.cvd daily.cvd bytecode.cvd; do
-    DEST="$CLAMAV_CHROOT/$f"
-    if [[ -f "$DEST" ]] && [[ $(stat -c%s "$DEST") -gt 1048576 ]]; then
-        ok "$f : déjà présent ($(du -h "$DEST" | cut -f1))"
-        continue
-    fi
-    echo "  Téléchargement de $f depuis database.clamav.net..."
-    if wget -q --show-progress -O "$DEST.tmp" \
-            "https://database.clamav.net/$f" 2>&1; then
-        SIZE=$(stat -c%s "$DEST.tmp" 2>/dev/null || echo 0)
-        if [[ "$SIZE" -gt 1048576 ]]; then
-            mv "$DEST.tmp" "$DEST"
-            ok "$f téléchargé ($(du -h "$DEST" | cut -f1))"
-        else
-            warn "$f : fichier trop petit ($SIZE octets) — sera retéléchargé dans le hook"
-            rm -f "$DEST.tmp"
-        fi
+# 2. Téléchargement via freshclam sur la machine de build, puis copie dans le chroot
+#
+#    Stratégie : freshclam met à jour son répertoire natif (/var/lib/clamav),
+#    qui est toujours fonctionnel (permissions, verrou, config OK).
+#    On copie ensuite les fichiers résultants dans le chroot.
+#    Cela évite tous les problèmes de freshclam avec un DatabaseDirectory
+#    non-standard (droits clamav, verrou PID résiduel, rejet silencieux).
+
+# S'assurer que freshclam est installé
+if ! command -v freshclam &>/dev/null; then
+    warn "freshclam absent — installation..."
+    apt-get install -y clamav-freshclam
+fi
+
+CLAMAV_SYSTEM="/var/lib/clamav"
+step "Mise à jour de la base ClamAV sur la machine de build (freshclam → $CLAMAV_SYSTEM)..."
+
+# Arrêt du service pour libérer le verrou PID
+systemctl stop clamav-freshclam 2>/dev/null || true
+sleep 1   # laisse le temps au PID de se libérer
+
+# Lancement de freshclam dans son environnement natif
+echo "  Lancement de freshclam..."
+freshclam --stdout 2>&1 | tee /tmp/freshclam-build.log || {
+    RC=$?
+    if [[ $RC -eq 1 ]]; then
+        ok "Base ClamAV déjà à jour (code 1)."
     else
-        warn "Échec téléchargement $f — le hook réseau réessaiera pendant la build"
-        rm -f "$DEST.tmp" 2>/dev/null || true
+        warn "freshclam a quitté avec le code $RC — voir /tmp/freshclam-build.log"
+        warn "Continuons : les fichiers déjà présents dans $CLAMAV_SYSTEM seront copiés."
+    fi
+}
+
+# Copie des bases depuis /var/lib/clamav → chroot
+echo "  Copie des bases dans le chroot..."
+COPIED=0
+# Seuils de validation par fichier :
+#   main / daily  → > 1 Mo  (fichiers de plusieurs dizaines/centaines de Mo)
+#   bytecode      → > 10 Ko (fichier léger, ~300 Ko — exclu à tort par le seuil 1 Mo)
+declare -A MIN_SIZE=(
+    ["main.cvd"]=1048576  ["main.cld"]=1048576
+    ["daily.cvd"]=1048576 ["daily.cld"]=1048576
+    ["bytecode.cvd"]=10240 ["bytecode.cld"]=10240
+)
+for f in "$CLAMAV_SYSTEM"/main.cvd "$CLAMAV_SYSTEM"/main.cld \
+          "$CLAMAV_SYSTEM"/daily.cvd "$CLAMAV_SYSTEM"/daily.cld \
+          "$CLAMAV_SYSTEM"/bytecode.cvd "$CLAMAV_SYSTEM"/bytecode.cld; do
+    FNAME=$(basename "$f")
+    THRESHOLD=${MIN_SIZE[$FNAME]:-10240}
+    if [[ -f "$f" ]] && [[ $(stat -c%s "$f" 2>/dev/null || echo 0) -gt $THRESHOLD ]]; then
+        cp -v "$f" "$CLAMAV_CHROOT/"
+        ok "$FNAME copié ($(du -h "$f" | cut -f1))"
+        COPIED=$((COPIED + 1))
     fi
 done
+
+if [[ $COPIED -gt 0 ]]; then
+    ok "$COPIED fichier(s) de base ClamAV intégrés dans le chroot."
+else
+    warn "Aucun fichier de base ClamAV trouvé dans $CLAMAV_SYSTEM."
+    warn "Le hook chroot (0100-clamav-db) tentera un second téléchargement"
+    warn "pendant lb build. Vérifiez la connexion Internet."
+fi
+
+# Redémarrage du service
+systemctl start clamav-freshclam 2>/dev/null || true
 
 # ── Règles YARA : pré-téléchargement sur la machine de build ──────────────────
 step "Pré-téléchargement des règles YARA signature-base (machine de build)..."
