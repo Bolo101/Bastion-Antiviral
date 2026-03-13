@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""admin_auth.py – Authentification et panneau d'administration."""
+"""admin_auth.py – Authentification et panneau d'administration.
+
+Onglets du panneau :
+  🛡 ClamAV     – mise à jour base (en ligne / USB)
+  🔐 Avast      – licence (activation par code, import .avastlic USB)
+                  + base VPS (en ligne / USB)
+  🔍 YARA       – règles signature-base (GitHub / USB)
+  ⏰ Planification – crontab freshclam
+  🔑 Sécurité   – changement du code admin
+  🚪 Quitter    – fermeture propre
+"""
 
 import hashlib
 import json
@@ -91,9 +101,9 @@ class AdminAuthManager:
 
     def set_cron_schedule(self, cron_expr: Optional[str]) -> Tuple[bool, str]:
         try:
-            r = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+            r        = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
             existing = r.stdout if r.returncode == 0 else ""
-            lines = [l for l in existing.splitlines() if self._CRON_TAG not in l]
+            lines    = [l for l in existing.splitlines() if self._CRON_TAG not in l]
             if cron_expr:
                 lines.append(f"{cron_expr} {FRESHCLAM_CMD} {self._CRON_TAG}")
             new_cron = "\n".join(lines) + "\n"
@@ -132,8 +142,8 @@ def ask_admin_code(parent: tk.Misc, prompt: str = "Code administrateur :") -> Op
               wraplength=290, justify=tk.CENTER).pack(pady=(0, 10))
 
     code_var = tk.StringVar()
-    entry = ttk.Entry(frm, textvariable=code_var, show="●",
-                      width=16, font=("Arial", 15), justify=tk.CENTER)
+    entry    = ttk.Entry(frm, textvariable=code_var, show="●",
+                         width=16, font=("Arial", 15), justify=tk.CENTER)
     entry.pack(pady=4)
     entry.focus_set()
 
@@ -168,21 +178,35 @@ class AdminPanel:
     def __init__(
         self,
         parent: tk.Misc,
-        auth: AdminAuthManager,
-        on_update_clamav_online: Callable,
-        on_import_clamav_usb: Callable,
-        on_update_yara_online: Callable,
-        on_import_yara_usb: Callable,
-        on_quit: Callable,
+        auth:   AdminAuthManager,
+        # ClamAV
+        on_update_clamav_online:   Callable,
+        on_import_clamav_usb:      Callable,
+        # Avast
+        on_update_avast_vps_online: Callable,
+        on_import_avast_vps_usb:   Callable,
+        on_import_avast_license_usb: Callable,
+        on_activate_avast_code:    Callable,
+        on_refresh_avast_status:   Callable,
+        # YARA
+        on_update_yara_online:     Callable,
+        on_import_yara_usb:        Callable,
+        # Système
+        on_quit:                   Callable,
     ) -> None:
         self._parent = parent
         self._auth   = auth
         self._cb = {
-            "clamav_online": on_update_clamav_online,
-            "clamav_usb":    on_import_clamav_usb,
-            "yara_online":   on_update_yara_online,
-            "yara_usb":      on_import_yara_usb,
-            "quit":          on_quit,
+            "clamav_online":         on_update_clamav_online,
+            "clamav_usb":            on_import_clamav_usb,
+            "avast_vps_online":      on_update_avast_vps_online,
+            "avast_vps_usb":         on_import_avast_vps_usb,
+            "avast_license_usb":     on_import_avast_license_usb,
+            "avast_activate":        on_activate_avast_code,
+            "avast_refresh":         on_refresh_avast_status,
+            "yara_online":           on_update_yara_online,
+            "yara_usb":              on_import_yara_usb,
+            "quit":                  on_quit,
         }
 
     def show(self) -> None:
@@ -212,7 +236,7 @@ class AdminPanel:
         dlg.grab_set()
         dlg.transient(self._parent)
 
-        w, h = 560, 460
+        w, h = 620, 520
         px = self._parent.winfo_rootx() + (self._parent.winfo_width()  - w) // 2
         py = self._parent.winfo_rooty() + (self._parent.winfo_height() - h) // 2
         dlg.geometry(f"{w}x{h}+{px}+{py}")
@@ -221,6 +245,7 @@ class AdminPanel:
         nb.pack(fill=tk.BOTH, expand=True, padx=10, pady=8)
 
         self._tab_clamav(nb)
+        self._tab_avast(nb)
         self._tab_yara(nb)
         self._tab_cron(nb)
         self._tab_security(nb)
@@ -240,16 +265,136 @@ class AdminPanel:
             tab,
             text="• En ligne : freshclam contacte les serveurs ClamAV (Internet requis).\n"
                  "• Hors-ligne : copiez main.cvd, daily.cvd et bytecode.cvd\n"
-                 "  à la racine d'une clé USB (source : database.clamav.net).",
+                 "  à la racine d'une clé USB (source : database.clamav.net).\n"
+                 "• Les signatures tierces (Sanesecurity, URLhaus…) sont incluses\n"
+                 "  dans la mise à jour en ligne.",
             justify=tk.LEFT, foreground="#444"
         ).pack(anchor=tk.W, pady=(0, 12))
 
         row = ttk.Frame(tab)
         row.pack(anchor=tk.W)
         ttk.Button(row, text="🌐  Mise à jour en ligne",
-                   command=self._cb["clamav_online"], width=24).pack(side=tk.LEFT, padx=4)
+                   command=self._cb["clamav_online"], width=26).pack(side=tk.LEFT, padx=4)
         ttk.Button(row, text="🔌  Importer depuis clé USB",
-                   command=self._cb["clamav_usb"],   width=24).pack(side=tk.LEFT, padx=4)
+                   command=self._cb["clamav_usb"],   width=26).pack(side=tk.LEFT, padx=4)
+
+    # ── Onglet Avast ───────────────────────────────────────────────────────────
+
+    def _tab_avast(self, nb: ttk.Notebook) -> None:
+        tab = ttk.Frame(nb, padding=16)
+        nb.add(tab, text="🔐 Avast")
+
+        ttk.Label(tab, text="Gestion d'Avast for Linux",
+                  font=("Arial", 11, "bold")).pack(anchor=tk.W, pady=(0, 4))
+
+        # ── Statut ────────────────────────────────────────────────────────────
+        status_frame = ttk.LabelFrame(tab, text="Statut", padding=8)
+        status_frame.pack(fill=tk.X, pady=(0, 8))
+
+        self._avast_status_var = tk.StringVar(value="Vérification…")
+        status_lbl = ttk.Label(status_frame, textvariable=self._avast_status_var,
+                                foreground="navy", font=("Courier", 9))
+        status_lbl.pack(anchor=tk.W)
+
+        ttk.Button(status_frame, text="↺  Actualiser le statut",
+                   command=self._refresh_avast_status_display,
+                   width=24).pack(anchor=tk.W, pady=(4, 0))
+
+        self._refresh_avast_status_display()
+
+        # ── Licence ───────────────────────────────────────────────────────────
+        lic_frame = ttk.LabelFrame(tab, text="Licence", padding=8)
+        lic_frame.pack(fill=tk.X, pady=(0, 8))
+
+        ttk.Label(
+            lic_frame,
+            text="Code d'activation (requiert Internet) :",
+            foreground="#444"
+        ).grid(row=0, column=0, sticky=tk.W, pady=2)
+
+        code_var = tk.StringVar()
+        code_entry = ttk.Entry(lic_frame, textvariable=code_var,
+                               width=32, font=("Courier", 10))
+        code_entry.grid(row=1, column=0, sticky=tk.W, pady=2, padx=(0, 6))
+
+        def _activate():
+            code = code_var.get().strip()
+            if not code:
+                messagebox.showwarning(
+                    "Code vide",
+                    "Entrez un code d'activation Avast.",
+                    parent=tab.winfo_toplevel()
+                )
+                return
+            self._cb["avast_activate"](code)
+
+        ttk.Button(lic_frame, text="🔑  Activer",
+                   command=_activate, width=14).grid(row=1, column=1, padx=4)
+
+        ttk.Separator(lic_frame, orient=tk.HORIZONTAL).grid(
+            row=2, column=0, columnspan=2, sticky=tk.EW, pady=8
+        )
+
+        ttk.Label(
+            lic_frame,
+            text="Hors-ligne : importez le fichier license.avastlic\n"
+                 "depuis la racine d'une clé USB.",
+            justify=tk.LEFT, foreground="#444"
+        ).grid(row=3, column=0, columnspan=2, sticky=tk.W)
+
+        ttk.Button(lic_frame, text="🔌  Importer licence (USB)",
+                   command=self._cb["avast_license_usb"],
+                   width=26).grid(row=4, column=0, sticky=tk.W, pady=(4, 0))
+
+        # ── Base VPS ──────────────────────────────────────────────────────────
+        vps_frame = ttk.LabelFrame(tab, text="Base VPS (définitions de virus)", padding=8)
+        vps_frame.pack(fill=tk.X, pady=(0, 4))
+
+        ttk.Label(
+            vps_frame,
+            text="• En ligne : Avast télécharge la dernière VPS depuis ses serveurs.\n"
+                 "• Hors-ligne : copiez un fichier .vps/.vpz à la racine d'une clé USB.",
+            justify=tk.LEFT, foreground="#444"
+        ).pack(anchor=tk.W, pady=(0, 8))
+
+        row = ttk.Frame(vps_frame)
+        row.pack(anchor=tk.W)
+        ttk.Button(row, text="🌐  Mise à jour VPS en ligne",
+                   command=self._cb["avast_vps_online"], width=26).pack(side=tk.LEFT, padx=4)
+        ttk.Button(row, text="🔌  Importer VPS depuis USB",
+                   command=self._cb["avast_vps_usb"],   width=26).pack(side=tk.LEFT, padx=4)
+
+    def _refresh_avast_status_display(self) -> None:
+        """Met à jour l'affichage du statut Avast dans le panneau."""
+        try:
+            from scanner import ScanEngine
+            eng = ScanEngine()
+            if not eng.is_avast_installed():
+                self._avast_status_var.set(
+                    "❌ Avast non installé\n"
+                    "   apt install avast  (dépôt repo.avcdn.net requis)"
+                )
+                return
+            if not eng.is_avast_licensed():
+                self._avast_status_var.set(
+                    "✅ Avast installé\n"
+                    "⚠  Aucune licence — utilisez les boutons ci-dessous\n"
+                    "   pour activer via un code ou importer un fichier .avastlic"
+                )
+                return
+            from config import AVAST_LICENSE_PATH
+            import time, os
+            try:
+                mtime = os.path.getmtime(AVAST_LICENSE_PATH)
+                date  = time.strftime("%Y-%m-%d", time.localtime(mtime))
+            except OSError:
+                date = "?"
+            self._avast_status_var.set(
+                f"✅ Avast installé et licencié\n"
+                f"   Licence importée le : {date}"
+            )
+        except Exception as e:
+            self._avast_status_var.set(f"Erreur de vérification : {e}")
 
     # ── Onglet YARA ────────────────────────────────────────────────────────────
 
@@ -271,9 +416,9 @@ class AdminPanel:
         row = ttk.Frame(tab)
         row.pack(anchor=tk.W)
         ttk.Button(row, text="🌐  Télécharger signature-base",
-                   command=self._cb["yara_online"], width=26).pack(side=tk.LEFT, padx=4)
+                   command=self._cb["yara_online"], width=28).pack(side=tk.LEFT, padx=4)
         ttk.Button(row, text="🔌  Importer depuis clé USB",
-                   command=self._cb["yara_usb"],    width=26).pack(side=tk.LEFT, padx=4)
+                   command=self._cb["yara_usb"],    width=28).pack(side=tk.LEFT, padx=4)
 
     # ── Onglet Planification ───────────────────────────────────────────────────
 
@@ -296,8 +441,10 @@ class AdminPanel:
         freq_var = tk.StringVar(value="daily")
         row1 = ttk.Frame(tab); row1.pack(anchor=tk.W)
         ttk.Label(row1, text="Fréquence :").pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Radiobutton(row1, text="Quotidienne",  variable=freq_var, value="daily").pack(side=tk.LEFT, padx=4)
-        ttk.Radiobutton(row1, text="Hebdomadaire (lundi)", variable=freq_var, value="weekly").pack(side=tk.LEFT, padx=4)
+        ttk.Radiobutton(row1, text="Quotidienne",
+                        variable=freq_var, value="daily").pack(side=tk.LEFT, padx=4)
+        ttk.Radiobutton(row1, text="Hebdomadaire (lundi)",
+                        variable=freq_var, value="weekly").pack(side=tk.LEFT, padx=4)
 
         hour_var = tk.StringVar(value="2")
         row2 = ttk.Frame(tab); row2.pack(anchor=tk.W, pady=6)
@@ -314,7 +461,8 @@ class AdminPanel:
                 h = int(hour_var.get())
                 assert 0 <= h <= 23
             except Exception:
-                messagebox.showerror("Valeur invalide", "Heure entre 0 et 23.", parent=tab.winfo_toplevel())
+                messagebox.showerror("Valeur invalide", "Heure entre 0 et 23.",
+                                     parent=tab.winfo_toplevel())
                 return
             expr = f"0 {h} * * *" if freq_var.get() == "daily" else f"0 {h} * * 1"
             ok, msg = auth.set_cron_schedule(expr)
@@ -344,13 +492,15 @@ class AdminPanel:
 
         ttk.Label(tab, text="Changer le code administrateur",
                   font=("Arial", 11, "bold")).grid(row=0, column=0,
-                                                    columnspan=2, pady=(0, 12), sticky=tk.W)
+                                                    columnspan=2,
+                                                    pady=(0, 12), sticky=tk.W)
 
         labels = ["Code actuel :", "Nouveau code :", "Confirmer :"]
         svars  = [tk.StringVar() for _ in labels]
         entries = []
         for i, (lbl, sv) in enumerate(zip(labels, svars)):
-            ttk.Label(tab, text=lbl).grid(row=i+1, column=0, sticky=tk.E, padx=(0, 8), pady=4)
+            ttk.Label(tab, text=lbl).grid(row=i+1, column=0, sticky=tk.E,
+                                           padx=(0, 8), pady=4)
             e = ttk.Entry(tab, textvariable=sv, show="●", width=20)
             e.grid(row=i+1, column=1, sticky=tk.W, pady=4)
             entries.append(e)

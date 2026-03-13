@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 """
 gui.py – Interface principale du scanner antiviral USB.
-Conçue pour des utilisateurs non-techniques :
-  • La zone centrale est dédiée au scan (sélection + bouton unique)
-  • Toutes les actions d'administration sont regroupées dans un panneau
-    protégé par code (mise à jour bases, import hors-ligne, planification,
-    changement du code, quitter)
+
+Moteurs d'analyse :
+  • ClamAV (toujours actif si installé)
+  • Avast  (activable si installé + licencié)
+  • YARA   (activable si disponible)
+
+Administration (protégée par code) :
+  • Mise à jour ClamAV (en ligne / USB)
+  • Licence Avast (activation par code / import USB) + VPS (en ligne / USB)
+  • Règles YARA (GitHub / USB)
+  • Planification crontab
+  • Changement du code admin
 """
 
 import os
@@ -14,7 +21,7 @@ import threading
 import time
 import tkinter as tk
 from tkinter import messagebox, ttk
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 from admin_auth import AdminAuthManager, AdminPanel
 from config import YARA_RULES_DIR
@@ -34,14 +41,14 @@ class VirusScannerGUI:
         self.root.configure(bg="#1a1a2e")
 
         # ── Composants métier ──
-        self.usb     = UsbManager()
-        self.db      = DBManager(usb_manager=self.usb)
-        self.engine  = ScanEngine()
-        self.auth    = AdminAuthManager()
+        self.usb    = UsbManager()
+        self.db     = DBManager(usb_manager=self.usb)
+        self.engine = ScanEngine()
+        self.auth   = AdminAuthManager()
 
         # ── État ──────────────────────────────────────────────────────────────
-        self.is_scanning    = False
-        self.session_logs:  List[str] = []
+        self.is_scanning   = False
+        self.session_logs: List[str] = []
         self._usb_partitions: List[UsbPartition] = []
 
         # ── Check root ────────────────────────────────────────────────────────
@@ -96,14 +103,13 @@ class VirusScannerGUI:
         status_bar.pack(fill=tk.X)
 
         self.clamav_status_var = tk.StringVar(value="ClamAV : vérification…")
+        self.avast_status_var  = tk.StringVar(value="Avast : vérification…")
         self.yara_status_var   = tk.StringVar(value="YARA : vérification…")
 
-        tk.Label(status_bar, textvariable=self.clamav_status_var,
-                 bg="#0f3460", fg="#90ee90",
-                 font=("Courier", 9), padx=12).pack(side=tk.LEFT)
-        tk.Label(status_bar, textvariable=self.yara_status_var,
-                 bg="#0f3460", fg="#90ee90",
-                 font=("Courier", 9), padx=12).pack(side=tk.LEFT)
+        for var in (self.clamav_status_var, self.avast_status_var, self.yara_status_var):
+            tk.Label(status_bar, textvariable=var,
+                     bg="#0f3460", fg="#90ee90",
+                     font=("Courier", 9), padx=12).pack(side=tk.LEFT)
 
         # ── Corps principal ───────────────────────────────────────────────────
         body = tk.Frame(self.root, bg="#1a1a2e")
@@ -112,7 +118,7 @@ class VirusScannerGUI:
         left  = tk.Frame(body, bg="#1a1a2e")
         right = tk.Frame(body, bg="#1a1a2e")
         left.pack(side=tk.LEFT, fill=tk.BOTH, expand=False, padx=(0, 6))
-        left.configure(width=420)
+        left.configure(width=440)
         right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
 
         self._build_usb_panel(left)
@@ -171,7 +177,7 @@ class VirusScannerGUI:
     def _build_scan_options(self, parent: tk.Frame) -> None:
         frm = self._lframe(parent, "Options d'analyse")
 
-        # Mode
+        # Mode rapide / complet
         self.scan_mode_var = tk.StringVar(value="quick")
         row1 = tk.Frame(frm, bg="#16213e"); row1.pack(fill=tk.X, pady=2)
         tk.Label(row1, text="Mode :", bg="#16213e", fg="#e0e0e0",
@@ -183,15 +189,36 @@ class VirusScannerGUI:
                            activebackground="#16213e",
                            font=("Arial", 9)).pack(side=tk.LEFT, padx=8)
 
+        # Moteurs
+        engines_row = tk.Frame(frm, bg="#16213e"); engines_row.pack(fill=tk.X, pady=2)
+        tk.Label(engines_row, text="Moteurs :", bg="#16213e", fg="#e0e0e0",
+                 width=10, anchor=tk.E).pack(side=tk.LEFT)
+
+        # ClamAV (toujours coché, désactivable pour tests uniquement)
+        self.use_clamav_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(engines_row, text="ClamAV",
+                       variable=self.use_clamav_var,
+                       bg="#16213e", fg="#e0e0e0",
+                       selectcolor="#0f3460", activebackground="#16213e",
+                       font=("Arial", 9)).pack(side=tk.LEFT, padx=6)
+
+        # Avast
+        self.use_avast_var = tk.BooleanVar(value=False)
+        self._avast_chk = tk.Checkbutton(engines_row, text="Avast",
+                                          variable=self.use_avast_var,
+                                          bg="#16213e", fg="#e0e0e0",
+                                          selectcolor="#0f3460",
+                                          activebackground="#16213e",
+                                          font=("Arial", 9))
+        self._avast_chk.pack(side=tk.LEFT, padx=6)
+
         # YARA
         self.use_yara_var = tk.BooleanVar(value=True)
-        row2 = tk.Frame(frm, bg="#16213e"); row2.pack(fill=tk.X, pady=2)
-        tk.Checkbutton(row2, text="Activer l'analyse YARA",
+        tk.Checkbutton(engines_row, text="YARA",
                        variable=self.use_yara_var,
                        bg="#16213e", fg="#e0e0e0",
-                       selectcolor="#0f3460",
-                       activebackground="#16213e",
-                       font=("Arial", 9)).pack(side=tk.LEFT, padx=(80, 0))
+                       selectcolor="#0f3460", activebackground="#16213e",
+                       font=("Arial", 9)).pack(side=tk.LEFT, padx=6)
 
         # Suppression
         self.remove_var = tk.BooleanVar(value=False)
@@ -238,8 +265,7 @@ class VirusScannerGUI:
     def _build_progress_panel(self, parent: tk.Frame) -> None:
         frm = self._lframe(parent, "Progression")
 
-        self.progress = ttk.Progressbar(frm, mode="indeterminate",
-                                         length=300)
+        self.progress = ttk.Progressbar(frm, mode="indeterminate", length=300)
         self.progress.pack(fill=tk.X, padx=4, pady=4)
 
         self.status_var = tk.StringVar(value="Prêt")
@@ -292,10 +318,6 @@ class VirusScannerGUI:
 
     def _lframe(self, parent: tk.Frame, title: str,
                 fill=tk.X, expand=False, pady=4) -> tk.Frame:
-        """
-        Crée un cadre avec bordure et titre stylisé, le pack dans parent,
-        et retourne le cadre intérieur prêt à recevoir des widgets.
-        """
         outer = tk.Frame(parent, bg="#16213e", bd=1, relief=tk.SOLID)
         outer.pack(fill=fill, expand=expand, pady=pady)
         tk.Label(outer, text=f"  {title}  ",
@@ -306,7 +328,7 @@ class VirusScannerGUI:
         return inner
 
     def _log(self, msg: str, tag: str = "normal") -> None:
-        ts  = time.strftime("%H:%M:%S")
+        ts   = time.strftime("%H:%M:%S")
         line = f"[{ts}]  {msg}\n"
         self.log_text.insert(tk.END, line, tag)
         self.log_text.see(tk.END)
@@ -326,7 +348,7 @@ class VirusScannerGUI:
     # ══════════════════════════════════════════════════════════════════════════
 
     def _refresh_status(self) -> None:
-        # ClamAV
+        # ── ClamAV ────────────────────────────────────────────────────────────
         if not self.engine.is_clamav_installed():
             self.clamav_status_var.set("❌  ClamAV : non installé")
         else:
@@ -340,7 +362,21 @@ class VirusScannerGUI:
             else:
                 self.clamav_status_var.set("❌  ClamAV : base manquante")
 
-        # YARA
+        # ── Avast ──────────────────────────────────────────────────────────────
+        self.avast_status_var.set(self.engine.avast_status_summary())
+
+        # Activer/griser la case Avast selon le statut
+        if self.engine.is_avast_installed() and self.engine.is_avast_licensed():
+            self._avast_chk.configure(state=tk.NORMAL)
+            self.use_avast_var.set(True)
+        elif self.engine.is_avast_installed():
+            self._avast_chk.configure(state=tk.NORMAL)
+            # Laisser le choix à l'utilisateur mais prévenir au lancement
+        else:
+            self._avast_chk.configure(state=tk.DISABLED)
+            self.use_avast_var.set(False)
+
+        # ── YARA ───────────────────────────────────────────────────────────────
         ok, method = self.engine.detect_yara()
         if not ok:
             self.yara_status_var.set("❌  YARA : non installé")
@@ -349,9 +385,13 @@ class VirusScannerGUI:
             n    = info["count"]
             lu   = info.get("last_update", "?")
             if n > 0:
-                self.yara_status_var.set(f"✅  YARA ({method}) : {n} règle(s)  (màj : {lu})")
+                self.yara_status_var.set(
+                    f"✅  YARA ({method}) : {n} règle(s)  (màj : {lu})"
+                )
             else:
-                self.yara_status_var.set(f"⚠   YARA ({method}) : aucune règle installée")
+                self.yara_status_var.set(
+                    f"⚠   YARA ({method}) : aucune règle installée"
+                )
 
     # ══════════════════════════════════════════════════════════════════════════
     # Gestion USB
@@ -374,20 +414,16 @@ class VirusScannerGUI:
         for p in self._usb_partitions:
             mp = self.usb.get_mountpoint(p.device)
             if mp:
-                ro = self.usb._is_ro(p.device, mp)
-                status = (f"✅ Monté RO → {mp}" if ro
-                          else f"⚠  Monté RW → {mp}")
+                ro     = self.usb._is_ro(p.device, mp)
+                status = (f"✅ Monté RO → {mp}" if ro else f"⚠  Monté RW → {mp}")
                 tag    = "ro" if ro else "rw"
             else:
                 status = "⏏  Non monté"
                 tag    = "unmount"
 
             iid = self.usb_tree.insert("", tk.END, iid=p.device,
-                                        values=(p.device,
-                                                p.label or "—",
-                                                p.size,
-                                                p.fstype,
-                                                status),
+                                        values=(p.device, p.label or "—",
+                                                p.size, p.fstype, status),
                                         tags=(tag,))
             if p.device == selected_dev:
                 reselect = iid
@@ -464,16 +500,32 @@ class VirusScannerGUI:
         if self.is_scanning:
             return
 
-        # Vérifications
-        if not self.engine.is_clamav_installed():
+        # Vérifications moteurs
+        if not self.engine.is_clamav_installed() and not self.use_avast_var.get():
             messagebox.showerror(
-                "ClamAV manquant",
-                "ClamAV n'est pas installé.\n"
-                "Installez-le : apt install clamav clamav-daemon clamav-freshclam",
+                "Aucun moteur actif",
+                "ClamAV n'est pas installé et Avast n'est pas sélectionné.\n"
+                "Installez au moins un moteur de scan.",
                 parent=self.root
             )
             return
 
+        if not self.engine.is_clamav_installed():
+            self._log("⚠ ClamAV non installé — analyse ClamAV ignorée.", "warning")
+
+        # Avertissement Avast sans licence
+        if self.use_avast_var.get() and self.engine.is_avast_installed():
+            if not self.engine.is_avast_licensed():
+                if not messagebox.askyesno(
+                    "Avast sans licence",
+                    "Avast est sélectionné mais aucune licence n'est installée.\n"
+                    "Le moteur Avast sera ignoré.\n\n"
+                    "Continuer l'analyse sans Avast ?",
+                    parent=self.root
+                ):
+                    return
+
+        # Sélection USB
         dev = self._selected_usb()
         if not dev:
             messagebox.showwarning(
@@ -483,7 +535,7 @@ class VirusScannerGUI:
             )
             return
 
-        # Obtenir le point de montage, monter si nécessaire
+        # Montage si nécessaire
         mp = self.usb.get_mountpoint(dev)
         if not mp:
             if not messagebox.askyesno(
@@ -500,7 +552,8 @@ class VirusScannerGUI:
             mp = self.usb.get_mountpoint(dev)
 
         if not mp:
-            messagebox.showerror("Erreur", "Impossible d'obtenir le point de montage.",
+            messagebox.showerror("Erreur",
+                                  "Impossible d'obtenir le point de montage.",
                                   parent=self.root)
             return
 
@@ -523,7 +576,12 @@ class VirusScannerGUI:
         self.scanned_var.set("Analysés : 0")
         self.infected_var.set("Menaces : 0")
 
-        self._log(f"Démarrage de l'analyse : {dev} → {mp}", "info")
+        engines_str = " + ".join(filter(None, [
+            "ClamAV" if self.use_clamav_var.get() else None,
+            "Avast"  if self.use_avast_var.get()  else None,
+            "YARA"   if self.use_yara_var.get()   else None,
+        ]))
+        self._log(f"Démarrage de l'analyse : {dev} → {mp}  [{engines_str}]", "info")
 
         targets = self._get_scan_targets(dev, mp)
 
@@ -534,19 +592,14 @@ class VirusScannerGUI:
         ).start()
 
     def _get_scan_targets(self, device: str, mountpoint: str) -> List[str]:
-        """
-        Mode rapide : utilise le point de montage existant.
-        Mode complet : monte toutes les partitions du disque parent.
-        """
         if self.scan_mode_var.get() == "quick":
             self._log(f"Mode rapide : {mountpoint}")
             return [mountpoint]
 
-        # Mode complet : cherche toutes les partitions du disque parent
         import subprocess as _sp
         targets = []
         try:
-            p = self._find_partition(device)
+            p   = self._find_partition(device)
             out = _sp.check_output(
                 ["lsblk", "-no", "NAME", f"/dev/{p}"],
                 text=True, stderr=_sp.PIPE
@@ -561,7 +614,7 @@ class VirusScannerGUI:
                     mp2 = self.usb.get_mountpoint(part)
                     if mp2:
                         targets.append(mp2)
-                        self._log(f"Partition supplémentaire montée : {part} → {mp2}")
+                        self._log(f"Partition supplémentaire : {part} → {mp2}")
                 else:
                     self._log(f"Partition ignorée ({part}) : {msg}", "warning")
         except Exception:
@@ -570,32 +623,27 @@ class VirusScannerGUI:
         return targets or [mountpoint]
 
     def _find_partition(self, device: str) -> str:
-        """Retourne le nom du disque parent (ex: sdb1 → sdb)."""
         import re
         name = device.replace("/dev/", "")
         m    = re.match(r"([a-z]+)", name)
         return m.group(1) if m else name
 
     def _scan_thread(self, targets: List[str]) -> None:
-        _scanned_last = [0]
-        _infected_last = [0]
-
         def _progress(msg: str, tag: str = "normal") -> None:
             self.root.after(0, self._log, msg, tag)
-            # Mise à jour des compteurs depuis le résultat partiel
-            # (géré par le moteur en direct via les callbacks)
 
         try:
             result = self.engine.scan(
-                targets       = targets,
-                use_clamav    = True,
-                use_yara      = self.use_yara_var.get(),
-                remove_infected = self.remove_var.get(),
-                progress_cb   = _progress,
+                targets          = targets,
+                use_clamav       = self.use_clamav_var.get(),
+                use_avast        = self.use_avast_var.get(),
+                use_yara         = self.use_yara_var.get(),
+                remove_infected  = self.remove_var.get(),
+                progress_cb      = _progress,
             )
         except Exception as e:
             result = None
-            msg = f"Erreur fatale durant le scan : {e}"
+            msg    = f"Erreur fatale durant le scan : {e}"
             log_error(msg)
             self.root.after(0, self._log, msg, "threat")
 
@@ -631,7 +679,6 @@ class VirusScannerGUI:
             messagebox.showinfo("Analyse terminée", summary, parent=self.root)
 
         self._log(f"Durée : {result.duration:.1f}s", "info")
-
         for err in result.errors:
             self._log(err, "warning")
 
@@ -647,13 +694,22 @@ class VirusScannerGUI:
 
     def _request_admin(self) -> None:
         panel = AdminPanel(
-            parent               = self.root,
-            auth                 = self.auth,
-            on_update_clamav_online = self._admin_clamav_online,
-            on_import_clamav_usb    = self._admin_clamav_usb,
-            on_update_yara_online   = self._admin_yara_online,
-            on_import_yara_usb      = self._admin_yara_usb,
-            on_quit                 = self._quit,
+            parent                    = self.root,
+            auth                      = self.auth,
+            # ClamAV
+            on_update_clamav_online   = self._admin_clamav_online,
+            on_import_clamav_usb      = self._admin_clamav_usb,
+            # Avast
+            on_update_avast_vps_online  = self._admin_avast_vps_online,
+            on_import_avast_vps_usb     = self._admin_avast_vps_usb,
+            on_import_avast_license_usb = self._admin_avast_license_usb,
+            on_activate_avast_code      = self._admin_avast_activate_code,
+            on_refresh_avast_status     = self._refresh_status,
+            # YARA
+            on_update_yara_online     = self._admin_yara_online,
+            on_import_yara_usb        = self._admin_yara_usb,
+            # Système
+            on_quit                   = self._quit,
         )
         panel.show()
 
@@ -669,9 +725,9 @@ class VirusScannerGUI:
             return
         self._log("Mise à jour ClamAV en ligne…", "info")
         self._run_background(
-            task=lambda cb: self.db.update_clamav_online(progress_cb=cb),
-            label="ClamAV online update",
-            on_done=lambda ok, msg: self._refresh_status()
+            task     = lambda cb: self.db.update_clamav_online(progress_cb=cb),
+            label    = "ClamAV online update",
+            on_done  = lambda ok, msg: self._refresh_status()
         )
 
     def _admin_clamav_usb(self) -> None:
@@ -695,10 +751,105 @@ class VirusScannerGUI:
         ):
             return
         self._run_background(
-            task=lambda cb: self.db.import_clamav_from_usb(files,
-                                                             progress_cb=cb),
-            label="ClamAV import USB",
-            on_done=lambda ok, msg: self._refresh_status()
+            task    = lambda cb: self.db.import_clamav_from_usb(files, progress_cb=cb),
+            label   = "ClamAV import USB",
+            on_done = lambda ok, msg: self._refresh_status()
+        )
+
+    # ── Actions admin Avast ───────────────────────────────────────────────────
+
+    def _admin_avast_activate_code(self, code: str) -> None:
+        """Appelé depuis l'onglet Avast du panneau admin avec le code saisi."""
+        self._log(f"Activation du code Avast {code[:4]}****…", "info")
+        self._run_background(
+            task    = lambda cb: self.db.activate_avast_with_code(code, progress_cb=cb),
+            label   = "Activation Avast",
+            on_done = lambda ok, msg: self._refresh_status()
+        )
+
+    def _admin_avast_license_usb(self) -> None:
+        self._log("Recherche de license.avastlic sur les clés USB…", "info")
+        files = self.db.find_avast_license_on_usb()
+        if not files:
+            messagebox.showwarning(
+                "Introuvable",
+                "Aucun fichier license.avastlic trouvé sur les clés USB.\n\n"
+                "Copiez le fichier license.avastlic à la racine d'une clé USB.\n"
+                "Vous pouvez l'obtenir depuis votre espace client Avast Business,\n"
+                "ou en utilisant l'outil avastlic avec votre code d'activation.",
+                parent=self.root
+            )
+            return
+        if len(files) == 1:
+            chosen = files[0]
+        else:
+            # Si plusieurs fichiers trouvés, utiliser le plus récent
+            chosen = max(files, key=os.path.getmtime)
+            names  = "\n".join(f"• {f}" for f in files)
+            if not messagebox.askyesno(
+                "Plusieurs fichiers trouvés",
+                f"Fichiers détectés :\n{names}\n\n"
+                f"Utiliser le plus récent :\n{chosen} ?",
+                parent=self.root
+            ):
+                return
+        if not messagebox.askyesno(
+            "Confirmer l'import",
+            f"Importer la licence depuis :\n{chosen}\n\n"
+            f"vers {self.db._find_avastlic() or '/etc/avast/license.avastlic'} ?",
+            parent=self.root
+        ):
+            return
+        self._run_background(
+            task    = lambda cb: self.db.import_avast_license_from_file(chosen,
+                                                                         progress_cb=cb),
+            label   = "Avast licence import",
+            on_done = lambda ok, msg: self._refresh_status()
+        )
+
+    def _admin_avast_vps_online(self) -> None:
+        if not self.engine.is_avast_installed():
+            messagebox.showerror(
+                "Avast non installé",
+                "Avast n'est pas installé sur ce système.\n\n"
+                "Consultez https://www.avast.com/business/linux\n"
+                "ou utilisez le dépôt repo.avcdn.net.",
+                parent=self.root
+            )
+            return
+        self._log("Mise à jour de la base VPS Avast en ligne…", "info")
+        self._run_background(
+            task    = lambda cb: self.db.update_avast_vps_online(progress_cb=cb),
+            label   = "Avast VPS online update",
+            on_done = lambda ok, msg: self._refresh_status()
+        )
+
+    def _admin_avast_vps_usb(self) -> None:
+        self._log("Recherche de fichiers VPS Avast sur les clés USB…", "info")
+        files = self.db.find_avast_vps_on_usb()
+        if not files:
+            messagebox.showwarning(
+                "Introuvable",
+                "Aucun fichier VPS Avast (.vps, .vpz) trouvé sur les clés USB.\n\n"
+                "Téléchargez la base VPS depuis votre espace client Avast\n"
+                "et copiez-la à la racine d'une clé USB.",
+                parent=self.root
+            )
+            return
+        names = "\n".join(f"• {os.path.basename(f)}" for f in files)
+        if not messagebox.askyesno(
+            "Confirmer l'import",
+            f"Fichiers VPS trouvés :\n{names}\n\nImporter ?",
+            parent=self.root
+        ):
+            return
+        # Importer le premier fichier trouvé (ou le plus récent)
+        chosen = max(files, key=os.path.getmtime)
+        self._run_background(
+            task    = lambda cb: self.db.import_avast_vps_from_usb(chosen,
+                                                                    progress_cb=cb),
+            label   = "Avast VPS import USB",
+            on_done = lambda ok, msg: self._refresh_status()
         )
 
     # ── Actions admin YARA ────────────────────────────────────────────────────
@@ -706,9 +857,9 @@ class VirusScannerGUI:
     def _admin_yara_online(self) -> None:
         self._log("Téléchargement de signature-base (GitHub)…", "info")
         self._run_background(
-            task=lambda cb: self.db.update_yara_online(progress_cb=cb),
-            label="YARA online update",
-            on_done=lambda ok, msg: self._refresh_status()
+            task    = lambda cb: self.db.update_yara_online(progress_cb=cb),
+            label   = "YARA online update",
+            on_done = lambda ok, msg: self._refresh_status()
         )
 
     def _admin_yara_usb(self) -> None:
@@ -733,9 +884,9 @@ class VirusScannerGUI:
         ):
             return
         self._run_background(
-            task=lambda cb: self.db.import_yara_from_usb(files, progress_cb=cb),
-            label="YARA import USB",
-            on_done=lambda ok, msg: self._refresh_status()
+            task    = lambda cb: self.db.import_yara_from_usb(files, progress_cb=cb),
+            label   = "YARA import USB",
+            on_done = lambda ok, msg: self._refresh_status()
         )
 
     # ── Worker générique en arrière-plan ──────────────────────────────────────
@@ -769,7 +920,8 @@ class VirusScannerGUI:
             return
         try:
             path = generate_session_pdf(self.session_logs)
-            messagebox.showinfo("PDF exporté", f"Rapport enregistré :\n{path}",
+            messagebox.showinfo("PDF exporté",
+                                f"Rapport enregistré :\n{path}",
                                 parent=self.root)
         except Exception as e:
             messagebox.showerror("Erreur PDF", str(e), parent=self.root)

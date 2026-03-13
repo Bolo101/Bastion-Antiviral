@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 """
-scanner.py – Moteur de scan combiné ClamAV + YARA.
-Supporte python-yara (prioritaire) et le binaire yara en secours.
+scanner.py – Moteur de scan combiné ClamAV + Avast + YARA.
+
+Moteurs disponibles :
+  • ClamAV  – clamscan (toujours disponible si installé)
+  • Avast   – binaire scan/avast (requiert licence dans /etc/avast/)
+  • YARA    – python-yara (prioritaire) ou binaire yara (secours)
+
+Le scan est séquentiel : ClamAV → Avast → YARA.
+Les résultats des trois moteurs sont agrégés dans un ScanResult unique.
 """
 
 import os
@@ -11,7 +18,12 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Tuple
 
-from config import YARA_RULES_DIR
+from config import (
+    YARA_RULES_DIR,
+    AVAST_LICENSE_PATH,
+    AVAST_BIN_PATHS,
+    AVAST_SCAN_BIN_PATHS,
+)
 from log_handler import log_error, log_info, log_warning
 
 ProgressCB = Optional[Callable[[str, str], None]]   # (message, tag)
@@ -22,7 +34,7 @@ ProgressCB = Optional[Callable[[str, str], None]]   # (message, tag)
 class ThreatInfo:
     path:   str
     threat: str
-    engine: str   # "ClamAV" | "YARA"
+    engine: str   # "ClamAV" | "Avast" | "YARA"
 
 
 @dataclass
@@ -34,18 +46,32 @@ class ScanResult:
     duration: float             = 0.0
     stopped:  bool              = False
 
+    # Compteurs par moteur (pour affichage détaillé)
+    scanned_clamav:  int = 0
+    scanned_avast:   int = 0
+    scanned_yara:    int = 0
+
     def summary(self) -> str:
         lines = [
             f"Fichiers analysés : {self.scanned}",
             f"Menaces détectées : {self.infected}",
             f"Durée : {self.duration:.1f}s",
         ]
+        if self.scanned_clamav or self.scanned_avast or self.scanned_yara:
+            detail_parts = []
+            if self.scanned_clamav:
+                detail_parts.append(f"ClamAV:{self.scanned_clamav}")
+            if self.scanned_avast:
+                detail_parts.append(f"Avast:{self.scanned_avast}")
+            if self.scanned_yara:
+                detail_parts.append(f"YARA:{self.scanned_yara}")
+            lines.append(f"  ({' | '.join(detail_parts)})")
         if self.threats:
-            lines.append("\nDétail :")
-            for t in self.threats[:15]:
+            lines.append("\nDétail des menaces :")
+            for t in self.threats[:20]:
                 lines.append(f"  [{t.engine}] {t.threat}  →  {t.path}")
-            if len(self.threats) > 15:
-                lines.append(f"  … et {len(self.threats) - 15} autre(s)")
+            if len(self.threats) > 20:
+                lines.append(f"  … et {len(self.threats) - 20} autre(s)")
         return "\n".join(lines)
 
 
@@ -54,7 +80,7 @@ class ScanEngine:
 
     def __init__(self) -> None:
         self._stop   = False
-        self._proc   = None    # subprocess ClamAV en cours
+        self._proc   = None    # subprocess en cours (ClamAV ou Avast)
         self._yara_method: Optional[str] = None   # "python" | "binary" | None
 
     # ── Contrôle ──────────────────────────────────────────────────────────────
@@ -71,7 +97,7 @@ class ScanEngine:
         self._stop = False
         self._proc = None
 
-    # ── Détection des moteurs ─────────────────────────────────────────────────
+    # ── Détection : ClamAV ────────────────────────────────────────────────────
 
     @staticmethod
     def is_clamav_installed() -> bool:
@@ -80,6 +106,62 @@ class ScanEngine:
     @staticmethod
     def is_freshclam_available() -> bool:
         return shutil.which("freshclam") is not None
+
+    # ── Détection : Avast ─────────────────────────────────────────────────────
+
+    @staticmethod
+    def is_avast_installed() -> bool:
+        """True si le binaire avast ou scan est trouvé sur le système."""
+        if shutil.which("avast") or shutil.which("scan"):
+            return True
+        for p in AVAST_BIN_PATHS + AVAST_SCAN_BIN_PATHS:
+            if os.path.exists(p):
+                return True
+        return False
+
+    @staticmethod
+    def is_avast_licensed() -> bool:
+        """True si le fichier de licence existe et n'est pas vide."""
+        try:
+            return (os.path.exists(AVAST_LICENSE_PATH)
+                    and os.path.getsize(AVAST_LICENSE_PATH) > 0)
+        except OSError:
+            return False
+
+    @staticmethod
+    def get_avast_scan_binary() -> Optional[str]:
+        """
+        Retourne le binaire de scan Avast.
+        Priorité : 'scan' (CLI scan dédié) → 'avast' (daemon avec sous-cmd).
+        """
+        found = shutil.which("scan")
+        if found:
+            return found
+        for p in AVAST_SCAN_BIN_PATHS:
+            if os.path.exists(p):
+                return p
+        found = shutil.which("avast")
+        if found:
+            return found
+        for p in AVAST_BIN_PATHS:
+            if os.path.exists(p):
+                return p
+        return None
+
+    def avast_status_summary(self) -> str:
+        """Résumé court de l'état d'Avast pour la barre de statut de la GUI."""
+        if not self.is_avast_installed():
+            return "❌  Avast : non installé"
+        if not self.is_avast_licensed():
+            return "⚠   Avast : installé — licence manquante"
+        try:
+            mtime = os.path.getmtime(AVAST_LICENSE_PATH)
+            date  = time.strftime("%Y-%m-%d", time.localtime(mtime))
+            return f"✅  Avast : prêt  (licence : {date})"
+        except OSError:
+            return "✅  Avast : prêt"
+
+    # ── Détection : YARA ──────────────────────────────────────────────────────
 
     def detect_yara(self) -> Tuple[bool, str]:
         """Retourne (dispo, méthode) : méthode = 'python' | 'binary' | ''."""
@@ -98,12 +180,11 @@ class ScanEngine:
     def yara_rules_count(self) -> int:
         if not os.path.isdir(YARA_RULES_DIR):
             return 0
-        n = 0
-        for root, _, files in os.walk(YARA_RULES_DIR):
-            for f in files:
-                if f.endswith((".yar", ".yara")) and not f.startswith("."):
-                    n += 1
-        return n
+        return sum(
+            1 for _, _, files in os.walk(YARA_RULES_DIR)
+            for f in files
+            if f.endswith((".yar", ".yara")) and not f.startswith(".")
+        )
 
     def _collect_rules(self) -> List[str]:
         rules: List[str] = []
@@ -117,12 +198,17 @@ class ScanEngine:
     # Scan principal
     # ══════════════════════════════════════════════════════════════════════════
 
-    def scan(self, targets: List[str],
-             use_clamav: bool,
-             use_yara: bool,
-             remove_infected: bool,
-             progress_cb: ProgressCB) -> ScanResult:
-        """Lance le scan complet et retourne le résultat agrégé."""
+    def scan(self,
+             targets:          List[str],
+             use_clamav:       bool,
+             use_avast:        bool,
+             use_yara:         bool,
+             remove_infected:  bool,
+             progress_cb:      ProgressCB) -> ScanResult:
+        """
+        Lance le scan complet et retourne le résultat agrégé.
+        Ordre : ClamAV → Avast → YARA.
+        """
         self._reset()
         result = ScanResult()
         start  = time.time()
@@ -130,17 +216,25 @@ class ScanEngine:
         if use_clamav:
             self._scan_clamav(targets, remove_infected, result, progress_cb)
 
+        if use_avast and not result.stopped:
+            self._scan_avast(targets, remove_infected, result, progress_cb)
+
         if use_yara and not result.stopped:
             self._scan_yara(targets, result, progress_cb)
 
         result.duration = time.time() - start
         log_info(
             f"Scan terminé : {result.scanned} fichiers, "
-            f"{result.infected} menace(s), {result.duration:.1f}s"
+            f"{result.infected} menace(s), {result.duration:.1f}s  "
+            f"[ClamAV:{result.scanned_clamav} | "
+            f"Avast:{result.scanned_avast} | "
+            f"YARA:{result.scanned_yara}]"
         )
         return result
 
-    # ── ClamAV ────────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # Moteur ClamAV
+    # ══════════════════════════════════════════════════════════════════════════
 
     def _scan_clamav(self, targets: List[str], remove: bool,
                      result: ScanResult, cb: ProgressCB) -> None:
@@ -150,7 +244,7 @@ class ScanEngine:
         cmd.extend(targets)
 
         if cb:
-            cb(f"ClamAV : démarrage de l'analyse…", "info")
+            cb("ClamAV : démarrage de l'analyse…", "info")
         try:
             self._proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -165,7 +259,7 @@ class ScanEngine:
             self._proc.wait()
         except Exception as e:
             result.errors.append(f"ClamAV : {e}")
-            log_error(f"ClamAV : {e}")
+            log_error(f"ClamAV scan : {e}")
         finally:
             self._proc = None
 
@@ -173,28 +267,174 @@ class ScanEngine:
         if not line:
             return
         if " FOUND" in line:
-            parts = line.rsplit(":", 1)
+            parts  = line.rsplit(":", 1)
             path   = parts[0].strip()
             threat = parts[1].replace(" FOUND", "").strip() if len(parts) == 2 else line
             result.infected += 1
+            result.scanned_clamav += 1
             result.threats.append(ThreatInfo(path=path, threat=threat, engine="ClamAV"))
             if cb:
                 cb(f"🚨 ClamAV : {threat}  →  {path}", "threat")
             return
         if line.startswith("Scanned files:"):
             try:
-                result.scanned = max(result.scanned, int(line.split(":")[1].strip()))
+                n = int(line.split(":")[1].strip())
+                result.scanned_clamav = max(result.scanned_clamav, n)
+                result.scanned        = max(result.scanned, n)
             except (ValueError, IndexError):
                 pass
             return
         if line.endswith(": OK") or line.endswith(": Empty file"):
-            result.scanned += 1
+            result.scanned_clamav += 1
+            result.scanned        += 1
             return
         if any(k in line for k in ("Engine version:", "Known viruses:", "Scan time:")):
             if cb:
                 cb(f"[ClamAV] {line}", "info")
 
-    # ── YARA ──────────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # Moteur Avast
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _scan_avast(self, targets: List[str], remove: bool,
+                    result: ScanResult, cb: ProgressCB) -> None:
+        """
+        Lance le scan Avast via la commande `scan` (CLI de l'agent Avast Linux).
+
+        Format de sortie Avast :
+          Fichier sain    :  /chemin/fichier [+]
+          Fichier infecté :  /chemin/fichier\tNom-Menace [L]\t0
+        """
+        if not self.is_avast_installed():
+            msg = "⚠ Avast : non installé — moteur ignoré."
+            result.errors.append(msg)
+            if cb:
+                cb(msg, "warning")
+            return
+
+        if not self.is_avast_licensed():
+            msg = ("⚠ Avast : licence manquante — moteur ignoré.\n"
+                   "Importez une licence depuis le panneau Administration.")
+            result.errors.append(msg)
+            if cb:
+                cb(msg, "warning")
+            return
+
+        avast_bin = self.get_avast_scan_binary()
+        if not avast_bin:
+            msg = "⚠ Avast : binaire de scan introuvable."
+            result.errors.append(msg)
+            if cb:
+                cb(msg, "warning")
+            return
+
+        # Construction de la commande
+        # `scan` est le CLI dédié ; s'il n'est pas disponible, on utilise
+        # `avast scan` (interface daemon)
+        scan_binary_name = os.path.basename(avast_bin)
+        if scan_binary_name == "scan":
+            cmd = [avast_bin, "-p"]           # -p : afficher chemin + statut
+            if remove:
+                cmd.append("-a")              # -a action=delete (selon version)
+            cmd.extend(targets)
+        else:
+            cmd = [avast_bin, "scan", "-r"]   # avast scan --recursive
+            if remove:
+                cmd += ["--action", "remove"]
+            cmd.extend(targets)
+
+        if cb:
+            cb("Avast : démarrage de l'analyse…", "info")
+
+        try:
+            self._proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1
+            )
+            assert self._proc.stdout
+            for line in self._proc.stdout:
+                if self._stop:
+                    result.stopped = True
+                    break
+                self._parse_avast(line.rstrip(), result, cb)
+            self._proc.wait()
+
+            if cb:
+                cb(f"Avast : analyse terminée ({result.scanned_avast} fichier(s)).",
+                   "info")
+        except Exception as e:
+            result.errors.append(f"Avast : {e}")
+            log_error(f"Avast scan : {e}")
+        finally:
+            self._proc = None
+
+    def _parse_avast(self, line: str, result: ScanResult, cb: ProgressCB) -> None:
+        """
+        Parse une ligne de sortie du CLI Avast for Linux.
+
+          Sain     : "/chemin/fichier [+]"
+          Infecté  : "/chemin/fichier\tNom-Menace [L]\t0"
+                   ou "/chemin/fichier: Nom-Menace"
+        """
+        if not line:
+            return
+
+        # Format tab-séparé (commande scan)
+        if "\t" in line:
+            parts = line.split("\t")
+            path  = parts[0].strip()
+            if len(parts) >= 2 and parts[1].strip():
+                threat = parts[1].strip()
+                # Nettoyer le suffixe " [L]  0" ou similaire
+                for suffix in (" [L]  0", " [L] 0", " [L]", " [S]"):
+                    threat = threat.replace(suffix, "")
+                threat = threat.strip()
+                if threat and threat != "[+]":
+                    result.infected += 1
+                    result.scanned_avast += 1
+                    result.scanned       += 1
+                    result.threats.append(
+                        ThreatInfo(path=path, threat=threat, engine="Avast")
+                    )
+                    if cb:
+                        cb(f"🚨 Avast : {threat}  →  {path}", "threat")
+                    return
+            # Sain
+            if len(parts) >= 2 and parts[1].strip() in ("[+]", "OK", ""):
+                result.scanned_avast += 1
+                result.scanned       += 1
+            return
+
+        # Format "[+]" sans tabulation
+        stripped = line.strip()
+        if stripped.endswith("[+]"):
+            result.scanned_avast += 1
+            result.scanned       += 1
+            return
+
+        # Format "chemin: Menace" (certaines versions)
+        if stripped.startswith("/") and ": " in stripped:
+            path, _, threat = stripped.partition(": ")
+            threat = threat.strip()
+            if threat and threat.upper() not in ("OK", "CLEAN", ""):
+                result.infected      += 1
+                result.scanned_avast += 1
+                result.scanned       += 1
+                result.threats.append(
+                    ThreatInfo(path=path.strip(), threat=threat, engine="Avast")
+                )
+                if cb:
+                    cb(f"🚨 Avast : {threat}  →  {path.strip()}", "threat")
+            return
+
+        # Lignes d'info (version, statistiques)
+        if any(k in stripped for k in ("Avast", "VPS", "Scan", "Files")):
+            if cb:
+                cb(f"[Avast] {stripped}", "info")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Moteur YARA
+    # ══════════════════════════════════════════════════════════════════════════
 
     def _scan_yara(self, targets: List[str],
                    result: ScanResult, cb: ProgressCB) -> None:
@@ -210,7 +450,8 @@ class ScanEngine:
 
         count = self.yara_rules_count()
         if count == 0:
-            msg = "⚠ YARA : aucune règle installée — utilisez le panneau Admin pour en importer."
+            msg = ("⚠ YARA : aucune règle installée — "
+                   "utilisez le panneau Admin pour en importer.")
             result.errors.append(msg)
             if cb:
                 cb(msg, "warning")
@@ -230,7 +471,7 @@ class ScanEngine:
                      result: ScanResult, cb: ProgressCB) -> None:
         import yara   # type: ignore
 
-        rule_files = self._collect_rules()
+        rule_files    = self._collect_rules()
         compiled_sets: List = []
 
         if cb:
@@ -260,30 +501,34 @@ class ScanEngine:
             return
 
         if cb:
-            cb(f"YARA : {len(compiled_sets)} ensemble(s) de règles compilés.", "info")
+            cb(f"YARA : {len(compiled_sets)} ensemble(s) compilé(s).", "info")
 
         scanned_yara = [0]
 
         def _scan_file(fpath: str) -> None:
             try:
                 ext  = os.path.splitext(fpath)[1].lstrip(".").lower()
-                exts = {"filename": os.path.basename(fpath),
-                        "filepath": fpath,
-                        "extension": ext,
-                        "filetype": ext.upper()}
+                exts = {
+                    "filename":  os.path.basename(fpath),
+                    "filepath":  fpath,
+                    "extension": ext,
+                    "filetype":  ext.upper(),
+                }
                 for rules in compiled_sets:
                     matches = rules.match(fpath, externals=exts, timeout=15)
                     for m in matches:
-                        result.infected += 1
+                        result.infected      += 1
+                        result.scanned_yara  += 1
                         result.threats.append(
                             ThreatInfo(path=fpath, threat=m.rule, engine="YARA")
                         )
                         if cb:
                             cb(f"🚨 YARA : {m.rule}  →  {fpath}", "threat")
             except Exception:
-                pass   # permission denied, timeout, binary errors → skip
+                pass
             finally:
                 scanned_yara[0] += 1
+                result.scanned_yara = scanned_yara[0]
                 if scanned_yara[0] % 200 == 0 and cb:
                     cb(f"YARA : {scanned_yara[0]} fichiers analysés…", "info")
 
@@ -336,7 +581,9 @@ class ScanEngine:
                             parts = line.split(None, 1)
                             if len(parts) == 2:
                                 rule_name, fpath = parts
-                                result.infected += 1
+                                result.infected      += 1
+                                result.scanned_yara  += 1
+                                result.scanned       += 1
                                 result.threats.append(
                                     ThreatInfo(path=fpath,
                                                threat=rule_name,
