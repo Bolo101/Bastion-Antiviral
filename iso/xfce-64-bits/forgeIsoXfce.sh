@@ -211,6 +211,129 @@ HOOK
 chmod +x config/hooks/normal/0100-clamav-db.hook.chroot
 ok "Hook ClamAV créé"
 
+# ── Hook 1.5 : signatures tierces ClamAV ─────────────────────────────────────
+step "Création du hook signatures tierces ClamAV..."
+cat > config/hooks/normal/0150-clamav-thirdparty.hook.chroot << 'HOOK'
+#!/bin/bash
+# =============================================================================
+# Hook 0150 – Téléchargement des signatures tierces ClamAV
+#
+# Sources intégrées :
+#   Sanesecurity  – phishing, malwares, spam (màj horaire)
+#   InterServer   – signatures généralistes
+#   URLhaus       – URLs malveillantes actives (abuse.ch)
+#
+# Toutes les signatures sont déposées dans /var/lib/clamav/ aux côtés des
+# bases officielles. ClamAV les charge automatiquement depuis ce répertoire.
+# Un fichier corrompu ou trop petit est supprimé : clamscan doit pouvoir
+# démarrer même si un téléchargement échoue.
+# =============================================================================
+set -uo pipefail      # pas de -e : on ne veut pas stopper sur un wget raté
+
+DB_DIR="/var/lib/clamav"
+LOG="/var/log/clamav-thirdparty.log"
+mkdir -p "$DB_DIR"
+
+echo ">>> [Hook TP] Début des signatures tierces ClamAV…" | tee "$LOG"
+
+# ── Fonction de téléchargement + validation ───────────────────────────────────
+# Usage : download_sig <url> <fichier> <seuil_octets>
+download_sig() {
+    local URL="$1" FNAME="$2" MIN_SIZE="$3"
+    local DEST="$DB_DIR/$FNAME"
+    local TMP
+    TMP="$(mktemp /tmp/clamtp_XXXXXX)"
+
+    echo "  Téléchargement de $FNAME …" | tee -a "$LOG"
+    if wget -q --timeout=30 --tries=3 -O "$TMP" "$URL" 2>>"$LOG"; then
+        local SIZE
+        SIZE=$(stat -c%s "$TMP" 2>/dev/null || echo 0)
+        if [[ "$SIZE" -gt "$MIN_SIZE" ]]; then
+            # Validation ClamAV : sigtool si dispo, sinon test de syntaxe de base
+            local VALID=true
+            if command -v sigtool &>/dev/null; then
+                sigtool --info "$TMP" &>/dev/null || VALID=false
+            fi
+            if $VALID; then
+                mv "$TMP" "$DEST"
+                chmod 644 "$DEST"
+                chown clamav:clamav "$DEST" 2>/dev/null || true
+                echo "  ✅ $FNAME installé (${SIZE} octets)" | tee -a "$LOG"
+                return 0
+            else
+                echo "  ⚠ $FNAME invalide selon sigtool — ignoré" | tee -a "$LOG"
+            fi
+        else
+            echo "  ⚠ $FNAME trop petit (${SIZE} < ${MIN_SIZE} octets) — ignoré" | tee -a "$LOG"
+        fi
+    else
+        echo "  ⚠ Échec téléchargement $FNAME (réseau ?)" | tee -a "$LOG"
+    fi
+    rm -f "$TMP"
+    return 1
+}
+
+# ── Sanesecurity ──────────────────────────────────────────────────────────────
+SANE_BASE="https://sanesecurity.com/databases"
+echo ">>> [Hook TP] Sanesecurity…" | tee -a "$LOG"
+download_sig "$SANE_BASE/sanesecurity.ftm"       "sanesecurity.ftm"      500   || true
+download_sig "$SANE_BASE/sigpack.ndb"             "sigpack.ndb"           1000  || true
+download_sig "$SANE_BASE/junk.ndb"                "junk.ndb"              1000  || true
+download_sig "$SANE_BASE/phish.ndb"               "phish.ndb"             1000  || true
+download_sig "$SANE_BASE/malware.expert.db"       "malware.expert.db"     1000  || true
+download_sig "$SANE_BASE/malware.expert.hdb"      "malware.expert.hdb"    1000  || true
+download_sig "$SANE_BASE/scam.ndb"                "scam.ndb"              1000  || true
+
+# ── InterServer ───────────────────────────────────────────────────────────────
+echo ">>> [Hook TP] InterServer…" | tee -a "$LOG"
+download_sig "https://www.interserver.net/tips/clamav/interserver.ndb"              "interserver.ndb" 1000 || true
+
+# ── URLhaus (abuse.ch) ────────────────────────────────────────────────────────
+echo ">>> [Hook TP] URLhaus (abuse.ch)…" | tee -a "$LOG"
+download_sig "https://urlhaus.abuse.ch/downloads/urlhaus.ndb"              "urlhaus.ndb" 1000 || true
+
+# ── Bilan et test de chargement ───────────────────────────────────────────────
+TP_INSTALLED=$(find "$DB_DIR" \( -name "*.ndb" -o -name "*.hdb"     -o -name "*.db" -o -name "*.ftm" \) 2>/dev/null | wc -l)
+echo ">>> [Hook TP] $TP_INSTALLED fichier(s) tiers installé(s)." | tee -a "$LOG"
+
+# Test de chargement : si clamscan plante à cause d'un fichier tiers,
+# on l'identifie et on le supprime pour garantir un scan fonctionnel.
+if command -v clamscan &>/dev/null; then
+    echo ">>> [Hook TP] Validation du chargement de la base complète…" | tee -a "$LOG"
+    TEST_ERR="$(mktemp /tmp/clamscan_test_XXXXXX)"
+    clamscan --no-summary --database="$DB_DIR" /dev/null 2>"$TEST_ERR"
+    TEST_RC=$?
+    if [[ $TEST_RC -ne 0 ]]; then
+        echo ">>> [Hook TP] ⚠ clamscan ne charge pas la base (code $TEST_RC)." | tee -a "$LOG"
+        echo "    Tentative d'isolation du fichier problématique…" | tee -a "$LOG"
+        # Tester chaque fichier tiers individuellement
+        for f in "$DB_DIR"/*.ndb "$DB_DIR"/*.hdb "$DB_DIR"/*.db "$DB_DIR"/*.ftm; do
+            [[ -f "$f" ]] || continue
+            FNAME=$(basename "$f")
+            if ! clamscan --no-summary --database="$f" /dev/null &>/dev/null; then
+                echo "    ❌ $FNAME est défectueux — supprimé" | tee -a "$LOG"
+                rm -f "$f"
+            fi
+        done
+        # Re-test après nettoyage
+        if clamscan --no-summary --database="$DB_DIR" /dev/null &>/dev/null; then
+            echo ">>> [Hook TP] ✅ Base assainie — scan opérationnel." | tee -a "$LOG"
+        else
+            echo ">>> [Hook TP] ⚠ Problème persistant — suppression de tous les fichiers tiers." | tee -a "$LOG"
+            find "$DB_DIR" \( -name "*.ndb" -o -name "*.hdb"                  -o -name "*.db" -o -name "*.ftm" \) -delete 2>/dev/null || true
+        fi
+    else
+        echo ">>> [Hook TP] ✅ Base complète chargée sans erreur." | tee -a "$LOG"
+    fi
+    rm -f "$TEST_ERR"
+fi
+
+TP_FINAL=$(find "$DB_DIR" \( -name "*.ndb" -o -name "*.hdb"     -o -name "*.db" -o -name "*.ftm" \) 2>/dev/null | wc -l)
+echo ">>> [Hook TP] Terminé — $TP_FINAL fichier(s) tiers actifs." | tee -a "$LOG"
+HOOK
+chmod +x config/hooks/normal/0150-clamav-thirdparty.hook.chroot
+ok "Hook signatures tierces ClamAV créé"
+
 # ── Hook 2 : téléchargement règles YARA ──────────────────────────────────────
 step "Création du hook YARA..."
 # Le heredoc utilise des variables bash d'ici : SIGBASE_URL est interpolé.
@@ -435,12 +558,25 @@ echo ">>> [Hook Permissions] Finalisation..."
 chmod 644 /opt/usb-antivirus/*.py
 chmod 755 /opt/usb-antivirus
 
-# ClamAV
+# ClamAV – bases officielles + signatures tierces
 mkdir -p /var/lib/clamav /var/log/clamav /var/run/clamav
 chown -R clamav:clamav /var/lib/clamav /var/log/clamav /var/run/clamav 2>/dev/null || true
 chmod 755 /var/lib/clamav /var/log/clamav /var/run/clamav
-find /var/lib/clamav -name "*.cvd" -o -name "*.cld" 2>/dev/null \
-    | xargs chmod 644 2>/dev/null || true
+# Bases officielles
+find /var/lib/clamav \( -name "*.cvd" -o -name "*.cld" \) 2>/dev/null     | xargs chmod 644 2>/dev/null || true
+# Signatures tierces (.ndb .hdb .db .ftm) — même permissions, lisibles par clamav
+find /var/lib/clamav \( -name "*.ndb" -o -name "*.hdb"     -o -name "*.db"  -o -name "*.ftm" \) 2>/dev/null     | xargs chown clamav:clamav 2>/dev/null || true
+find /var/lib/clamav \( -name "*.ndb" -o -name "*.hdb"     -o -name "*.db"  -o -name "*.ftm" \) 2>/dev/null     | xargs chmod 644 2>/dev/null || true
+# Validation au moment du hook permissions
+if command -v clamscan &>/dev/null; then
+    if ! clamscan --no-summary --database=/var/lib/clamav /dev/null &>/dev/null; then
+        echo ">>> [Hook Perms] ⚠ Base invalide détectée — purge des sigs tierces défectueuses"
+        for f in /var/lib/clamav/*.ndb /var/lib/clamav/*.hdb                  /var/lib/clamav/*.db  /var/lib/clamav/*.ftm; do
+            [ -f "$f" ] || continue
+            clamscan --no-summary --database="$f" /dev/null &>/dev/null                 || { echo "    Suppression : $(basename "$f")"; rm -f "$f"; }
+        done
+    fi
+fi
 
 # YARA
 chmod -R 755 /var/lib/yara-rules
@@ -557,6 +693,63 @@ fi
 
 # Redémarrage du service
 systemctl start clamav-freshclam 2>/dev/null || true
+
+# ── Signatures tierces ClamAV : pré-téléchargement sur la machine de build ────
+step "Téléchargement des signatures tierces ClamAV (machine de build)..."
+
+# Fonction de téléchargement avec validation de taille
+_dl_tp() {
+    local URL="$1" DEST="$2" MIN="$3"
+    local TMP
+    TMP="$(mktemp /tmp/clamtp_build_XXXXXX)"
+    if wget -q --timeout=30 --tries=3 -O "$TMP" "$URL" 2>/dev/null; then
+        local SZ; SZ=$(stat -c%s "$TMP" 2>/dev/null || echo 0)
+        if [[ "$SZ" -gt "$MIN" ]]; then
+            mv "$TMP" "$DEST"; chmod 644 "$DEST"
+            ok "$(basename "$DEST") inclus ($(du -h "$DEST" | cut -f1))"
+        else
+            warn "$(basename "$DEST") trop petit (${SZ} o) — ignoré"
+            rm -f "$TMP"
+        fi
+    else
+        warn "Échec téléchargement $(basename "$DEST") (réseau ?)"
+        rm -f "$TMP"
+    fi
+}
+
+SANE="https://sanesecurity.com/databases"
+_dl_tp "$SANE/sanesecurity.ftm"       "$CLAMAV_CHROOT/sanesecurity.ftm"     500
+_dl_tp "$SANE/sigpack.ndb"             "$CLAMAV_CHROOT/sigpack.ndb"          1000
+_dl_tp "$SANE/junk.ndb"               "$CLAMAV_CHROOT/junk.ndb"             1000
+_dl_tp "$SANE/phish.ndb"              "$CLAMAV_CHROOT/phish.ndb"            1000
+_dl_tp "$SANE/malware.expert.db"      "$CLAMAV_CHROOT/malware.expert.db"    1000
+_dl_tp "$SANE/malware.expert.hdb"     "$CLAMAV_CHROOT/malware.expert.hdb"   1000
+_dl_tp "$SANE/scam.ndb"               "$CLAMAV_CHROOT/scam.ndb"             1000
+_dl_tp "https://www.interserver.net/tips/clamav/interserver.ndb"         "$CLAMAV_CHROOT/interserver.ndb" 1000
+_dl_tp "https://urlhaus.abuse.ch/downloads/urlhaus.ndb"         "$CLAMAV_CHROOT/urlhaus.ndb" 1000
+
+# Validation finale : tester le chargement de toute la base avec clamscan
+echo "  Validation de la base complète (clamscan --no-summary)..."
+if clamscan --no-summary --database="$CLAMAV_CHROOT" /dev/null 2>/tmp/clamval.log; then
+    ok "Base ClamAV complète (officielle + tierces) validée"
+else
+    warn "Un fichier tiers pose problème — isolation en cours..."
+    for f in "$CLAMAV_CHROOT"/*.ndb "$CLAMAV_CHROOT"/*.hdb               "$CLAMAV_CHROOT"/*.db  "$CLAMAV_CHROOT"/*.ftm; do
+        [[ -f "$f" ]] || continue
+        if ! clamscan --no-summary --database="$f" /dev/null &>/dev/null; then
+            warn "$(basename "$f") défectueux — retiré du chroot"
+            rm -f "$f"
+        fi
+    done
+    if clamscan --no-summary --database="$CLAMAV_CHROOT" /dev/null &>/dev/null; then
+        ok "Base assainie — scan opérationnel"
+    else
+        warn "Problème persistant sur les bases officielles — vérifiez la connexion"
+    fi
+fi
+
+TP_BUILD=$(find "$CLAMAV_CHROOT" \( -name "*.ndb" -o -name "*.hdb"     -o -name "*.db" -o -name "*.ftm" \) 2>/dev/null | wc -l)
+ok "$TP_BUILD fichier(s) de signatures tierces intégrés dans le chroot"
 
 # ── Règles YARA : pré-téléchargement sur la machine de build ──────────────────
 step "Pré-téléchargement des règles YARA signature-base (machine de build)..."

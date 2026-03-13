@@ -236,8 +236,67 @@ class ScanEngine:
     # Moteur ClamAV
     # ══════════════════════════════════════════════════════════════════════════
 
+    # ── Pré-validation de la base ClamAV ──────────────────────────────────────
+
+    def _check_clamav_db(self, cb: ProgressCB) -> bool:
+        """
+        Lance clamscan --no-summary /dev/null pour vérifier que la base
+        (officielle + signatures tierces) se charge correctement.
+        Code 0 = OK, code 1 = OK (virus détecté sur /dev/null, impossible),
+        code 2 = erreur DB.  Retourne False uniquement sur code 2.
+        """
+        try:
+            r = subprocess.run(
+                ["clamscan", "--no-summary", "/dev/null"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, timeout=60
+            )
+        except Exception as e:
+            log_warning(f"ClamAV pré-validation impossible : {e}")
+            return True  # on tente quand même le vrai scan
+
+        if r.returncode in (0, 1):
+            return True
+
+        # Code 2 = au moins un fichier de signature est invalide
+        combined = (r.stdout + r.stderr).strip()
+        bad_lines = [l for l in combined.splitlines()
+                     if "Error" in l or "Can't load" in l or "Invalid" in l]
+        detail = "\n   ".join(bad_lines[:5]) if bad_lines else combined[:200]
+
+        msg = ("❌ ClamAV : échec de chargement de la base (code 2).\n"
+               "   Cause : une signature tierce est probablement corrompue.\n"
+               f"   {detail}\n"
+               "   → Relancez une mise à jour depuis le panneau Admin.")
+        if cb:
+            cb(msg, "threat")
+        log_error(msg)
+        return False
+
+    @staticmethod
+    def _count_files(targets: List[str]) -> int:
+        """Compte les fichiers réguliers dans les cibles (filet de sécurité)."""
+        total = 0
+        for t in targets:
+            if os.path.isfile(t):
+                total += 1
+            elif os.path.isdir(t):
+                for _, _, files in os.walk(t):
+                    total += len(files)
+        return total
+
     def _scan_clamav(self, targets: List[str], remove: bool,
                      result: ScanResult, cb: ProgressCB) -> None:
+
+        # ── 1. Pré-validation : base chargeable ? ─────────────────────────────
+        if not self._check_clamav_db(cb):
+            result.errors.append(
+                "ClamAV : base invalide (code 2) — scan annulé. "
+                "Lancez une mise à jour depuis le panneau Admin."
+            )
+            return
+
+        # ── 2. Scan ───────────────────────────────────────────────────────────
         cmd = ["clamscan", "--recursive", "--stdout"]
         if remove:
             cmd.append("--remove")
@@ -245,6 +304,8 @@ class ScanEngine:
 
         if cb:
             cb("ClamAV : démarrage de l'analyse…", "info")
+
+        rc = -99
         try:
             self._proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -257,38 +318,85 @@ class ScanEngine:
                     break
                 self._parse_clamav(line.rstrip(), result, cb)
             self._proc.wait()
+            rc = self._proc.returncode
         except Exception as e:
             result.errors.append(f"ClamAV : {e}")
             log_error(f"ClamAV scan : {e}")
         finally:
             self._proc = None
 
+        # ── 3. Analyse du code de retour ──────────────────────────────────────
+        # 0 = propre, 1 = menace(s) détectée(s), 2 = erreur DB / I/O
+        if rc == 2:
+            msg = ("⚠ ClamAV : erreur pendant le scan (code 2). "
+                   "Mettez à jour la base depuis le panneau Admin.")
+            result.errors.append(msg)
+            if cb:
+                cb(msg, "warning")
+            log_error(msg)
+        elif rc not in (0, 1, -99) and not result.stopped:
+            log_warning(f"ClamAV : code de retour inattendu {rc}")
+
+        # ── 4. Filet de sécurité : compteur nul alors que le scan a tourné ────
+        # Arrive si clamscan n'émet pas la ligne "Scanned files:" (version
+        # ancienne, scan vide, stderr non capturé, etc.)
+        if result.scanned_clamav == 0 and not result.stopped and rc in (0, 1):
+            estimated = self._count_files(targets)
+            if estimated > 0:
+                result.scanned_clamav = estimated
+                result.scanned = max(result.scanned, estimated)
+                if cb:
+                    cb(f"[ClamAV] {estimated} fichier(s) parcourus (comptage direct).",
+                       "info")
+
     def _parse_clamav(self, line: str, result: ScanResult, cb: ProgressCB) -> None:
         if not line:
             return
+
+        line = line.strip()  # robustesse : CR résiduels, espaces
+
+        # ── Menace détectée ───────────────────────────────────────────────────
         if " FOUND" in line:
             parts  = line.rsplit(":", 1)
             path   = parts[0].strip()
             threat = parts[1].replace(" FOUND", "").strip() if len(parts) == 2 else line
-            result.infected += 1
+            result.infected       += 1
             result.scanned_clamav += 1
+            result.scanned        += 1
             result.threats.append(ThreatInfo(path=path, threat=threat, engine="ClamAV"))
             if cb:
                 cb(f"🚨 ClamAV : {threat}  →  {path}", "threat")
             return
+
+        # ── Résumé final : "Scanned files: N" ────────────────────────────────
+        # Source principale du compteur ; prioritaire sur le comptage ligne à ligne
         if line.startswith("Scanned files:"):
             try:
                 n = int(line.split(":")[1].strip())
-                result.scanned_clamav = max(result.scanned_clamav, n)
-                result.scanned        = max(result.scanned, n)
+                if n > 0:
+                    result.scanned_clamav = max(result.scanned_clamav, n)
+                    result.scanned        = max(result.scanned, n)
             except (ValueError, IndexError):
                 pass
             return
+
+        # ── Fichier sain (émis seulement avec --verbose) ──────────────────────
         if line.endswith(": OK") or line.endswith(": Empty file"):
             result.scanned_clamav += 1
             result.scanned        += 1
             return
-        if any(k in line for k in ("Engine version:", "Known viruses:", "Scan time:")):
+
+        # ── Erreurs de chargement DB (à logger sans bloquer) ─────────────────
+        if "LibClamAV Error" in line or "LibClamAV Warning" in line:
+            if cb:
+                cb(f"[ClamAV] {line}", "warning")
+            log_warning(f"ClamAV DB : {line}")
+            return
+
+        # ── Lignes d'info du résumé ───────────────────────────────────────────
+        if any(k in line for k in ("Engine version:", "Known viruses:",
+                                    "Scan time:", "Scanned directories:",
+                                    "Data scanned:", "Start Date:")):
             if cb:
                 cb(f"[ClamAV] {line}", "info")
 
