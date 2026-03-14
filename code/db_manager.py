@@ -35,6 +35,68 @@ from log_handler import log_error, log_info, log_warning
 
 ProgressCB = Optional[Callable[[str], None]]
 
+# ── Sources de signatures tierces téléchargeables gratuitement ────────────────
+# Chaque entrée : url, nom de fichier local dans CLAMAV_DB_DIR, description courte.
+THIRD_PARTY_SIGNATURES: List[Dict] = [
+    # abuse.ch / URLhaus – URLs malveillantes actives
+    {
+        "name": "URLhaus",
+        "url":  "https://urlhaus-filter.abuse.ch/urlhaus-filter-clam.ndb",
+        "file": "urlhaus-filter.ndb",
+        "desc": "URLs malveillantes actives (abuse.ch / URLhaus)",
+    },
+    # Sanesecurity – phishing, scam, spam, macros, rogues
+    {
+        "name": "Sanesecurity – phishing",
+        "url":  "https://mirror.sanewall.org/sanesecurity/phish.ndb",
+        "file": "sanesecurity-phish.ndb",
+        "desc": "Hameçonnage (Sanesecurity)",
+    },
+    {
+        "name": "Sanesecurity – scam",
+        "url":  "https://mirror.sanewall.org/sanesecurity/scam.ndb",
+        "file": "sanesecurity-scam.ndb",
+        "desc": "Arnaques (Sanesecurity)",
+    },
+    {
+        "name": "Sanesecurity – junk",
+        "url":  "https://mirror.sanewall.org/sanesecurity/junk.ndb",
+        "file": "sanesecurity-junk.ndb",
+        "desc": "Spam / courrier indésirable (Sanesecurity)",
+    },
+    {
+        "name": "Sanesecurity – sigpack",
+        "url":  "https://mirror.sanewall.org/sanesecurity/sigpack.ndb",
+        "file": "sanesecurity-sigpack.ndb",
+        "desc": "Pack de signatures génériques (Sanesecurity)",
+    },
+    {
+        "name": "Sanesecurity – malware (hdb)",
+        "url":  "https://mirror.sanewall.org/sanesecurity/malware.expert.hdb",
+        "file": "sanesecurity-malware.hdb",
+        "desc": "Hashes de malwares (Sanesecurity)",
+    },
+    {
+        "name": "Sanesecurity – malware (db)",
+        "url":  "https://mirror.sanewall.org/sanesecurity/malware.expert.db",
+        "file": "sanesecurity-malware.db",
+        "desc": "Base malwares généraliste (Sanesecurity)",
+    },
+    {
+        "name": "Sanesecurity – FTM",
+        "url":  "https://mirror.sanewall.org/sanesecurity/sanesecurity.ftm",
+        "file": "sanesecurity.ftm",
+        "desc": "Magic file types (Sanesecurity)",
+    },
+    # InterServer – base complémentaire généraliste
+    {
+        "name": "InterServer",
+        "url":  "https://www.interserver.net/virus-l/interserver.ndb",
+        "file": "interserver.ndb",
+        "desc": "Signatures génériques InterServer",
+    },
+]
+
 
 def _run(cmd: List[str], timeout: int = 60) -> Tuple[int, str, str]:
     try:
@@ -66,30 +128,98 @@ class DBManager:
     # ══════════════════════════════════════════════════════════════════════════
 
     def get_clamav_status(self) -> Dict:
-        """Retourne status (OK/OUTDATED/MISSING), fichiers, date de dernière màj."""
-        db_files = ["main.cvd", "main.cld", "daily.cvd",
-                    "daily.cld", "bytecode.cvd", "bytecode.cld"]
-        result   = {"status": "MISSING", "files": {}, "last_update": None}
-        newest   = 0.0
-        found    = 0
+        """
+        Retourne status (OK/OUTDATED/MISSING), fichiers détectés, bases manquantes
+        et date de dernière mise à jour.
 
-        for fname in db_files:
-            fpath = os.path.join(CLAMAV_DB_DIR, fname)
-            if os.path.exists(fpath):
+        Clés du dict retourné :
+          status      – "OK" | "OUTDATED" | "MISSING"
+          files       – {nom_fichier: "X.X Mo  (YYYY-MM-DD HH:MM)"}
+          missing     – liste des groupes requis absents ("main", "daily", "bytecode")
+          last_update – date la plus récente parmi tous les fichiers trouvés
+        """
+        # ── Groupes officiels requis (au moins un fichier par groupe) ──────────
+        REQUIRED_GROUPS: Dict[str, Tuple[str, ...]] = {
+            "main":     ("main.cvd",     "main.cld"),
+            "daily":    ("daily.cvd",    "daily.cld"),
+            "bytecode": ("bytecode.cvd", "bytecode.cld"),
+        }
+
+        # ── Toutes les extensions reconnues par ClamAV ─────────────────────────
+        CLAMAV_EXTS = (
+            ".cvd", ".cld",                         # bases officielles compressées
+            ".ndb", ".ndu",                         # signatures NDB (hash + motif)
+            ".hdb", ".hdu", ".hsb", ".hsu",         # MD5 / SHA-1 / SHA-256
+            ".mdb", ".mdu", ".msb", ".msu",         # PE section hashes
+            ".ldb", ".ldu",                         # signatures logiques
+            ".cdb",                                  # signatures container
+            ".idb",                                  # icônes PE
+            ".fp",  ".sfp",                         # faux-positifs
+            ".ign", ".ign2",                        # listes d'ignorés
+            ".wdb",                                 # whitelists d'URL
+            ".gdb",                                 # hashes graphiques
+            ".pdb",                                 # listes de phishing
+            ".crb",                                 # certificats révoqués
+        )
+
+        result: Dict = {
+            "status":      "MISSING",
+            "files":       {},
+            "missing":     [],
+            "last_update": None,
+        }
+        newest = 0.0
+
+        # ── 1. Vérification des groupes officiels ─────────────────────────────
+        for group, candidates in REQUIRED_GROUPS.items():
+            group_found = False
+            for fname in candidates:
+                fpath = os.path.join(CLAMAV_DB_DIR, fname)
+                if os.path.exists(fpath):
+                    try:
+                        st    = os.stat(fpath)
+                        size  = f"{st.st_size / (1024*1024):.1f} Mo"
+                        mtime = time.strftime("%Y-%m-%d %H:%M",
+                                              time.localtime(st.st_mtime))
+                        result["files"][fname] = f"{size}  ({mtime})"
+                        if st.st_mtime > newest:
+                            newest = st.st_mtime
+                        group_found = True
+                    except OSError:
+                        pass
+            if not group_found:
+                result["missing"].append(group)
+
+        # ── 2. Signatures tierces et supplémentaires dans le répertoire ────────
+        if os.path.isdir(CLAMAV_DB_DIR):
+            for fname in sorted(os.listdir(CLAMAV_DB_DIR)):
+                if fname in result["files"]:
+                    continue          # déjà compté dans les groupes officiels
+                if not any(fname.endswith(ext) for ext in CLAMAV_EXTS):
+                    continue
+                fpath = os.path.join(CLAMAV_DB_DIR, fname)
+                if not os.path.isfile(fpath):
+                    continue
                 try:
                     st    = os.stat(fpath)
                     size  = f"{st.st_size / (1024*1024):.1f} Mo"
-                    mtime = time.strftime("%Y-%m-%d %H:%M", time.localtime(st.st_mtime))
+                    mtime = time.strftime("%Y-%m-%d %H:%M",
+                                          time.localtime(st.st_mtime))
                     result["files"][fname] = f"{size}  ({mtime})"
                     if st.st_mtime > newest:
                         newest = st.st_mtime
-                    found += 1
                 except OSError:
                     pass
 
-        if found >= 2:
+        # ── 3. Calcul du statut global ─────────────────────────────────────────
+        # main ET daily doivent être présents pour considérer la base utilisable
+        has_main  = "main"  not in result["missing"]
+        has_daily = "daily" not in result["missing"]
+
+        if has_main and has_daily:
             days_old         = (time.time() - newest) / 86400
             result["status"] = "OK" if days_old < 7 else "OUTDATED"
+        # sinon status reste "MISSING"
 
         if newest > 0:
             result["last_update"] = time.strftime(
@@ -150,6 +280,107 @@ class DBManager:
 
         (log_info if success else log_error)(message)
         return success, message
+
+    def download_third_party_sigs(
+            self,
+            progress_cb: ProgressCB = None) -> Tuple[bool, str]:
+        """
+        Télécharge les signatures ClamAV tierces définies dans THIRD_PARTY_SIGNATURES
+        et les installe dans CLAMAV_DB_DIR.
+
+        Pour chaque source :
+          - Téléchargement via urllib dans un fichier temporaire
+          - Vérification que le fichier n'est pas vide
+          - Copie atomique vers CLAMAV_DB_DIR avec les bons droits
+          - En cas d'échec individuel, on continue avec les autres sources
+
+        Retourne (True, résumé) si au moins une signature a été installée.
+        """
+        os.makedirs(CLAMAV_DB_DIR, exist_ok=True)
+
+        installed:  List[str] = []
+        failed:     List[str] = []
+
+        for sig in THIRD_PARTY_SIGNATURES:
+            name = sig["name"]
+            url  = sig["url"]
+            dest = os.path.join(CLAMAV_DB_DIR, sig["file"])
+
+            if progress_cb:
+                progress_cb(f"⬇  {name} …")
+
+            try:
+                with tempfile.NamedTemporaryFile(
+                        delete=False,
+                        suffix=os.path.splitext(sig["file"])[1],
+                        dir="/tmp") as tmp:
+                    tmp_path = tmp.name
+
+                def _hook(blocks: int, block_size: int, total: int) -> None:
+                    if total > 0 and progress_cb:
+                        pct = min(100, blocks * block_size * 100 // total)
+                        progress_cb(f"   {name} : {pct}%")
+
+                urllib.request.urlretrieve(url, tmp_path, _hook)
+
+                size = os.path.getsize(tmp_path)
+                if size < 64:
+                    raise ValueError(f"fichier trop petit ({size} octets) — source indisponible ?")
+
+                shutil.move(tmp_path, dest)
+                os.chmod(dest, 0o644)
+                _run(["chown", "clamav:clamav", dest], timeout=5)
+
+                size_kb = size / 1024
+                log_info(f"Signature tierce installée : {sig['file']}  ({size_kb:.0f} Ko)")
+                installed.append(f"{sig['file']} ({size_kb:.0f} Ko)")
+                if progress_cb:
+                    progress_cb(f"   ✅ {name} : {size_kb:.0f} Ko installé")
+
+            except urllib.error.URLError as e:
+                reason = getattr(e, "reason", str(e))
+                msg = f"   ⚠ {name} : erreur réseau – {reason}"
+                log_warning(msg)
+                failed.append(name)
+                if progress_cb:
+                    progress_cb(msg)
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+
+            except Exception as e:
+                msg = f"   ⚠ {name} : {e}"
+                log_warning(msg)
+                failed.append(name)
+                if progress_cb:
+                    progress_cb(msg)
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+
+        # ── Rechargement du daemon ClamAV ─────────────────────────────────────
+        if installed:
+            if progress_cb:
+                progress_cb("Rechargement du daemon ClamAV…")
+            _run(["systemctl", "reload-or-restart", "clamav-daemon"], timeout=30)
+
+        # ── Résumé ────────────────────────────────────────────────────────────
+        lines: List[str] = []
+        if installed:
+            lines.append(f"✅ {len(installed)} signature(s) installée(s) :")
+            lines.extend(f"   • {f}" for f in installed)
+        if failed:
+            lines.append(f"⚠ {len(failed)} source(s) inaccessible(s) :")
+            lines.extend(f"   • {f}" for f in failed)
+
+        summary = "\n".join(lines) if lines else "Aucune signature traitée."
+        success = len(installed) > 0
+        (log_info if success else log_error)(
+            f"Signatures tierces : {len(installed)} OK, {len(failed)} échoué(s)"
+        )
+        return success, summary
 
     def find_clamav_on_usb(self) -> List[str]:
         files: List[str] = []

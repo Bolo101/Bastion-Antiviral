@@ -352,15 +352,21 @@ class VirusScannerGUI:
         if not self.engine.is_clamav_installed():
             self.clamav_status_var.set("❌  ClamAV : non installé")
         else:
-            info = self.db.get_clamav_status()
-            st   = info["status"]
-            lu   = info.get("last_update", "?")
+            info    = self.db.get_clamav_status()
+            st      = info["status"]
+            lu      = info.get("last_update", "?")
+            missing = info.get("missing", [])
             if st == "OK":
                 self.clamav_status_var.set(f"✅  ClamAV : base OK  (màj : {lu})")
             elif st == "OUTDATED":
                 self.clamav_status_var.set(f"⚠   ClamAV : base obsolète  ({lu})")
             else:
-                self.clamav_status_var.set("❌  ClamAV : base manquante")
+                if missing:
+                    self.clamav_status_var.set(
+                        f"❌  ClamAV : bases manquantes – {', '.join(missing)}"
+                    )
+                else:
+                    self.clamav_status_var.set("❌  ClamAV : base manquante")
 
         # ── Avast ──────────────────────────────────────────────────────────────
         self.avast_status_var.set(self.engine.avast_status_summary())
@@ -697,8 +703,9 @@ class VirusScannerGUI:
             parent                    = self.root,
             auth                      = self.auth,
             # ClamAV
-            on_update_clamav_online   = self._admin_clamav_online,
-            on_import_clamav_usb      = self._admin_clamav_usb,
+            on_update_clamav_online      = self._admin_clamav_online,
+            on_import_clamav_usb         = self._admin_clamav_usb,
+            on_download_third_party_sigs = self._admin_clamav_thirdparty,
             # Avast
             on_update_avast_vps_online  = self._admin_avast_vps_online,
             on_import_avast_vps_usb     = self._admin_avast_vps_usb,
@@ -753,6 +760,24 @@ class VirusScannerGUI:
         self._run_background(
             task    = lambda cb: self.db.import_clamav_from_usb(files, progress_cb=cb),
             label   = "ClamAV import USB",
+            on_done = lambda ok, msg: self._refresh_status()
+        )
+
+    def _admin_clamav_thirdparty(self) -> None:
+        from db_manager import THIRD_PARTY_SIGNATURES
+        names = "\n".join(f"  • {s['name']} — {s['desc']}" for s in THIRD_PARTY_SIGNATURES)
+        if not messagebox.askyesno(
+            "Télécharger signatures tierces",
+            f"Les sources suivantes seront contactées (Internet requis) :\n\n"
+            f"{names}\n\n"
+            f"Les fichiers seront installés dans /var/lib/clamav/.\n"
+            f"Continuer ?",
+            parent=self.root
+        ):
+            return
+        self._run_background(
+            task    = lambda cb: self.db.download_third_party_sigs(progress_cb=cb),
+            label   = "Signatures tierces ClamAV",
             on_done = lambda ok, msg: self._refresh_status()
         )
 

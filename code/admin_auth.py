@@ -180,8 +180,9 @@ class AdminPanel:
         parent: tk.Misc,
         auth:   AdminAuthManager,
         # ClamAV
-        on_update_clamav_online:   Callable,
-        on_import_clamav_usb:      Callable,
+        on_update_clamav_online:      Callable,
+        on_import_clamav_usb:         Callable,
+        on_download_third_party_sigs: Callable,
         # Avast
         on_update_avast_vps_online: Callable,
         on_import_avast_vps_usb:   Callable,
@@ -199,6 +200,7 @@ class AdminPanel:
         self._cb = {
             "clamav_online":         on_update_clamav_online,
             "clamav_usb":            on_import_clamav_usb,
+            "clamav_thirdparty":     on_download_third_party_sigs,
             "avast_vps_online":      on_update_avast_vps_online,
             "avast_vps_usb":         on_import_avast_vps_usb,
             "avast_license_usb":     on_import_avast_license_usb,
@@ -265,18 +267,36 @@ class AdminPanel:
             tab,
             text="• En ligne : freshclam contacte les serveurs ClamAV (Internet requis).\n"
                  "• Hors-ligne : copiez main.cvd, daily.cvd et bytecode.cvd\n"
-                 "  à la racine d'une clé USB (source : database.clamav.net).\n"
-                 "• Les signatures tierces (Sanesecurity, URLhaus…) sont incluses\n"
-                 "  dans la mise à jour en ligne.",
+                 "  à la racine d'une clé USB (source : database.clamav.net).",
             justify=tk.LEFT, foreground="#444"
-        ).pack(anchor=tk.W, pady=(0, 12))
+        ).pack(anchor=tk.W, pady=(0, 8))
 
-        row = ttk.Frame(tab)
-        row.pack(anchor=tk.W)
-        ttk.Button(row, text="🌐  Mise à jour en ligne",
-                   command=self._cb["clamav_online"], width=26).pack(side=tk.LEFT, padx=4)
-        ttk.Button(row, text="🔌  Importer depuis clé USB",
+        row1 = ttk.Frame(tab)
+        row1.pack(anchor=tk.W)
+        ttk.Button(row1, text="🌐  Mise à jour en ligne (freshclam)",
+                   command=self._cb["clamav_online"], width=36).pack(side=tk.LEFT, padx=4)
+        ttk.Button(row1, text="🔌  Importer depuis clé USB",
                    command=self._cb["clamav_usb"],   width=26).pack(side=tk.LEFT, padx=4)
+
+        ttk.Separator(tab, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=10)
+
+        ttk.Label(tab, text="Signatures tierces supplémentaires",
+                  font=("Arial", 10, "bold")).pack(anchor=tk.W, pady=(0, 4))
+        ttk.Label(
+            tab,
+            text="Télécharge des bases complémentaires gratuites :\n"
+                 "  • URLhaus (abuse.ch) – URLs malveillantes actives\n"
+                 "  • Sanesecurity       – phishing, scam, spam, macros, rogues, foxhole\n"
+                 "  • InterServer        – signatures génériques\n"
+                 "Ces fichiers (.ndb/.hdb/.cdb) sont installés dans /var/lib/clamav/\n"
+                 "et pris en compte immédiatement par le daemon ClamAV.",
+            justify=tk.LEFT, foreground="#444"
+        ).pack(anchor=tk.W, pady=(0, 8))
+
+        row2 = ttk.Frame(tab)
+        row2.pack(anchor=tk.W)
+        ttk.Button(row2, text="🌐  Télécharger signatures tierces",
+                   command=self._cb["clamav_thirdparty"], width=36).pack(side=tk.LEFT, padx=4)
 
     # ── Onglet Avast ───────────────────────────────────────────────────────────
 
