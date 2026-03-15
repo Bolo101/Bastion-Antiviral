@@ -32,7 +32,7 @@ step() { echo -e "\n${YELLOW}▶▶  $*${RESET}"; }
 
 # ── Vérification des pré-requis ───────────────────────────────────────────────
 step "Vérification des pré-requis..."
-for cmd in lb wget curl python3 unzip; do
+for cmd in lb wget curl python3 unzip rsync; do
     command -v "$cmd" &>/dev/null \
         || err "Commande manquante : $cmd  →  apt install live-build wget curl python3 unzip"
 done
@@ -46,7 +46,7 @@ ok "Pré-requis OK"
 # ── Installation des outils de build ─────────────────────────────────────────
 step "Installation des dépendances de build..."
 apt-get update -qq
-apt-get install -y live-build xorriso syslinux wget curl python3 unzip
+apt-get install -y live-build xorriso syslinux wget curl python3 unzip rsync
 ok "Outils de build installés"
 
 # ── Préparation du répertoire de travail ──────────────────────────────────────
@@ -249,11 +249,16 @@ download_sig() {
         local SIZE
         SIZE=$(stat -c%s "$TMP" 2>/dev/null || echo 0)
         if [[ "$SIZE" -gt "$MIN_SIZE" ]]; then
-            # Validation ClamAV : sigtool si dispo, sinon test de syntaxe de base
+            # sigtool --info ne reconnaît que les .cvd/.cld (bases officielles).
+            # Pour les .ndb/.hdb/.db/.ftm tiers, la vérification de taille suffit.
             local VALID=true
-            if command -v sigtool &>/dev/null; then
-                sigtool --info "$TMP" &>/dev/null || VALID=false
-            fi
+            case "$FNAME" in
+                *.cvd|*.cld)
+                    if command -v sigtool &>/dev/null; then
+                        sigtool --info "$TMP" &>/dev/null || VALID=false
+                    fi
+                    ;;
+            esac
             if $VALID; then
                 mv "$TMP" "$DEST"
                 chmod 644 "$DEST"
@@ -274,40 +279,143 @@ download_sig() {
 }
 
 # ── Sanesecurity ──────────────────────────────────────────────────────────────
-SANE_BASE="https://sanesecurity.com/databases"
+# Distribution officielle : rsync://rsync.sanesecurity.net/sanesecurity
+# Fallback HTTP : http://ftp.swin.edu.au/sanesecurity/ (miroir Swinburne Univ.)
+# NB : malware.expert.db/.hdb retirés (absents de la liste officielle).
+# Signatures incluses : uniquement celles listées sur sanesecurity.com/usage/signatures/
 echo ">>> [Hook TP] Sanesecurity…" | tee -a "$LOG"
-download_sig "$SANE_BASE/sanesecurity.ftm"       "sanesecurity.ftm"      500   || true
-download_sig "$SANE_BASE/sigpack.ndb"             "sigpack.ndb"           1000  || true
-download_sig "$SANE_BASE/junk.ndb"                "junk.ndb"              1000  || true
-download_sig "$SANE_BASE/phish.ndb"               "phish.ndb"             1000  || true
-download_sig "$SANE_BASE/malware.expert.db"       "malware.expert.db"     1000  || true
-download_sig "$SANE_BASE/malware.expert.hdb"      "malware.expert.hdb"    1000  || true
-download_sig "$SANE_BASE/scam.ndb"                "scam.ndb"              1000  || true
 
-# ── InterServer ───────────────────────────────────────────────────────────────
+# Liste complète établie depuis https://mirror.ihost.md/?dir=clamav/sanesecurity
+# NB : ne pas utiliser winnow_phish_complete.ndb ET winnow_phish_complete_url.ndb ensemble.
+#      On prend la variante _url (URLs complètes, FP plus faible).
+SANE_FILES=(
+    # Requis
+    sanesecurity.ftm  sigwhitelist.ign2
+    # Sanesecurity propres
+    junk.ndb    jurlbl.ndb   jurlbla.ndb  lott.ndb
+    phish.ndb   rogue.hdb    scam.ndb     blurl.ndb
+    spamimg.hdb spamattach.hdb spam.ldb   shelter.ldb
+    spear.ndb   spearl.ndb   badmacro.ndb
+    malwarehash.hsb   hackingteam.hsb
+    # Foxhole
+    foxhole_generic.cdb  foxhole_filename.cdb  foxhole_js.cdb
+    foxhole_js.ndb       foxhole_all.cdb        foxhole_all.ndb
+    foxhole_mail.cdb     foxhole_links.ldb
+    # MiscreantPunch
+    MiscreantPunch099-Low.ldb  MiscreantPunch099-INFO-Low.ldb
+    # Porcupine
+    porcupine.ndb  phishtank.ndb  porcupine.hsb
+    # bofhland
+    bofhland_cracked_URL.ndb   bofhland_malware_URL.ndb
+    bofhland_phishing_URL.ndb  bofhland_malware_attach.hdb
+    # OITC winnow (winnow_phish_complete_url seul, pas les deux variantes)
+    winnow_malware.hdb           winnow_malware_links.ndb
+    winnow_spam_complete.ndb     winnow_phish_complete_url.ndb
+    winnow.complex.patterns.ldb  winnow_extended_malware.hdb
+    winnow_extended_malware_links.ndb  winnow.attachments.hdb
+    # doppelstern / crdfam / scamnailer / malware.expert
+    doppelstern.ndb   doppelstern.hdb   doppelstern-phishtank.ndb
+    crdfam.clamav.hdb scamnailer.ndb
+    malware.expert.ndb  malware.expert.hdb  malware.expert.ldb
+    malware.expert.fp
+)
+
+SANE_OK=false
+
+# Méthode 1 : rsync (méthode officielle recommandée par sanesecurity.com)
+# --no-recursive : copie uniquement les fichiers du répertoire racine du module.
+# Sans --no-recursive les filtres --include peuvent être silencieusement ignorés.
+if command -v rsync &>/dev/null; then
+    echo "  Tentative rsync://rsync.sanesecurity.net/sanesecurity …" | tee -a "$LOG"
+    RSYNC_TMP="$(mktemp -d /tmp/sanesec_rsync_XXXXXX)"
+    if rsync --timeout=30 --contimeout=15 --no-recursive -q \
+        rsync://rsync.sanesecurity.net/sanesecurity/ "$RSYNC_TMP/" \
+        2>>"$LOG"; then
+        RSYNC_COUNT=$(ls "$RSYNC_TMP" 2>/dev/null | wc -l)
+        if [[ "$RSYNC_COUNT" -gt 0 ]]; then
+            for fname in "${SANE_FILES[@]}"; do
+                if [[ -f "$RSYNC_TMP/$fname" ]]; then
+                    SZ=$(stat -c%s "$RSYNC_TMP/$fname" 2>/dev/null || echo 0)
+                    if [[ "$SZ" -gt 100 ]]; then
+                        mv "$RSYNC_TMP/$fname" "$DB_DIR/$fname"
+                        chmod 644 "$DB_DIR/$fname"
+                        chown clamav:clamav "$DB_DIR/$fname" 2>/dev/null || true
+                        echo "  ✅ $fname (rsync, ${SZ}o)" | tee -a "$LOG"
+                    fi
+                fi
+            done
+            SANE_OK=true
+            echo "  ✅ Sanesecurity rsync OK ($RSYNC_COUNT fichiers reçus)" | tee -a "$LOG"
+        else
+            echo "  ⚠ rsync exit 0 mais 0 fichier — fallback HTTP" | tee -a "$LOG"
+        fi
+    else
+        echo "  ⚠ rsync Sanesecurity inaccessible." | tee -a "$LOG"
+    fi
+    rm -rf "$RSYNC_TMP"
+fi
+
+# Méthode 2 : HTTP (mirror.ihost.md — miroir public vérifié)
+if ! $SANE_OK; then
+    echo "  Fallback HTTP Sanesecurity…" | tee -a "$LOG"
+    for SANE_HTTP in \
+        "https://mirror.ihost.md/clamav/sanesecurity" \
+        "https://ftp.swin.edu.au/sanesecurity"; do
+        if wget --timeout=15 --tries=1 -q --spider "$SANE_HTTP/sanesecurity.ftm" 2>/dev/null; then
+            SANE_OK=true
+            echo "  Miroir joignable : $SANE_HTTP" | tee -a "$LOG"
+            for fname in "${SANE_FILES[@]}"; do
+                download_sig "$SANE_HTTP/$fname" "$fname" 64 || true
+            done
+            break
+        else
+            echo "  ⚠ $SANE_HTTP inaccessible" | tee -a "$LOG"
+        fi
+    done
+fi
+
+$SANE_OK || echo "  ⚠ Aucune source Sanesecurity joignable." | tee -a "$LOG"
+
+# ── InterServer (nouvelle URL — sigs.interserver.net) ─────────────────────────
 echo ">>> [Hook TP] InterServer…" | tee -a "$LOG"
-download_sig "https://www.interserver.net/tips/clamav/interserver.ndb"              "interserver.ndb" 1000 || true
+download_sig "http://sigs.interserver.net/interserver256.hdb" "interserver256.hdb" 500 || true
+download_sig "http://sigs.interserver.net/topline.db"          "topline.db"          500 || true
 
 # ── URLhaus (abuse.ch) ────────────────────────────────────────────────────────
-echo ">>> [Hook TP] URLhaus (abuse.ch)…" | tee -a "$LOG"
-download_sig "https://urlhaus.abuse.ch/downloads/urlhaus.ndb"              "urlhaus.ndb" 1000 || true
+echo ">>> [Hook TP] URLhaus…" | tee -a "$LOG"
+URLHAUS_OK=false
+for _url in \
+    "https://urlhaus.abuse.ch/downloads/urlhaus.ndb" \
+    "https://curbengh.github.io/malware-filter/urlhaus-filter-clam.ndb"; do
+    if download_sig "$_url" "urlhaus-filter.ndb" 1000; then
+        URLHAUS_OK=true; break
+    fi
+done
+$URLHAUS_OK || echo "  ⚠ URLhaus inaccessible — signature ignorée." | tee -a "$LOG"
+
 
 # ── Bilan et test de chargement ───────────────────────────────────────────────
-TP_INSTALLED=$(find "$DB_DIR" \( -name "*.ndb" -o -name "*.hdb"     -o -name "*.db" -o -name "*.ftm" \) 2>/dev/null | wc -l)
+# Étendu aux .hsb (malwarehash, porcupine) .ldb .cdb .fp (malware.expert.fp, sigwhitelist.ign2 géré séparément)
+TP_INSTALLED=$(find "$DB_DIR" \( \
+    -name "*.ndb" -o -name "*.hdb" -o -name "*.hsb" \
+    -o -name "*.db"  -o -name "*.ftm" -o -name "*.ldb" \
+    -o -name "*.cdb" -o -name "*.fp" \
+    \) 2>/dev/null | wc -l)
 echo ">>> [Hook TP] $TP_INSTALLED fichier(s) tiers installé(s)." | tee -a "$LOG"
 
-# Test de chargement : si clamscan plante à cause d'un fichier tiers,
-# on l'identifie et on le supprime pour garantir un scan fonctionnel.
-if command -v clamscan &>/dev/null; then
+# Test de chargement uniquement si au moins un fichier tiers est présent.
+# timeout 90s : évite un blocage si la base est très volumineuse.
+if [[ "$TP_INSTALLED" -gt 0 ]] && command -v clamscan &>/dev/null; then
     echo ">>> [Hook TP] Validation du chargement de la base complète…" | tee -a "$LOG"
     TEST_ERR="$(mktemp /tmp/clamscan_test_XXXXXX)"
-    clamscan --no-summary --database="$DB_DIR" /dev/null 2>"$TEST_ERR"
+    timeout 90 clamscan --no-summary --database="$DB_DIR" /dev/null 2>"$TEST_ERR"
     TEST_RC=$?
     if [[ $TEST_RC -ne 0 ]]; then
         echo ">>> [Hook TP] ⚠ clamscan ne charge pas la base (code $TEST_RC)." | tee -a "$LOG"
         echo "    Tentative d'isolation du fichier problématique…" | tee -a "$LOG"
-        # Tester chaque fichier tiers individuellement
-        for f in "$DB_DIR"/*.ndb "$DB_DIR"/*.hdb "$DB_DIR"/*.db "$DB_DIR"/*.ftm; do
+        for f in "$DB_DIR"/*.ndb "$DB_DIR"/*.hdb "$DB_DIR"/*.hsb \
+                 "$DB_DIR"/*.db  "$DB_DIR"/*.ftm "$DB_DIR"/*.ldb \
+                 "$DB_DIR"/*.cdb "$DB_DIR"/*.fp; do
             [[ -f "$f" ]] || continue
             FNAME=$(basename "$f")
             if ! clamscan --no-summary --database="$f" /dev/null &>/dev/null; then
@@ -320,7 +428,9 @@ if command -v clamscan &>/dev/null; then
             echo ">>> [Hook TP] ✅ Base assainie — scan opérationnel." | tee -a "$LOG"
         else
             echo ">>> [Hook TP] ⚠ Problème persistant — suppression de tous les fichiers tiers." | tee -a "$LOG"
-            find "$DB_DIR" \( -name "*.ndb" -o -name "*.hdb"                  -o -name "*.db" -o -name "*.ftm" \) -delete 2>/dev/null || true
+            find "$DB_DIR" \( -name "*.ndb" -o -name "*.hdb" -o -name "*.hsb" \
+                -o -name "*.db" -o -name "*.ftm" -o -name "*.ldb" \
+                -o -name "*.cdb" -o -name "*.fp" \) -delete 2>/dev/null || true
         fi
     else
         echo ">>> [Hook TP] ✅ Base complète chargée sans erreur." | tee -a "$LOG"
@@ -328,7 +438,11 @@ if command -v clamscan &>/dev/null; then
     rm -f "$TEST_ERR"
 fi
 
-TP_FINAL=$(find "$DB_DIR" \( -name "*.ndb" -o -name "*.hdb"     -o -name "*.db" -o -name "*.ftm" \) 2>/dev/null | wc -l)
+TP_FINAL=$(find "$DB_DIR" \( \
+    -name "*.ndb" -o -name "*.hdb" -o -name "*.hsb" \
+    -o -name "*.db"  -o -name "*.ftm" -o -name "*.ldb" \
+    -o -name "*.cdb" -o -name "*.fp" \
+    \) 2>/dev/null | wc -l)
 echo ">>> [Hook TP] Terminé — $TP_FINAL fichier(s) tiers actifs." | tee -a "$LOG"
 HOOK
 chmod +x config/hooks/normal/0150-clamav-thirdparty.hook.chroot
@@ -563,17 +677,27 @@ mkdir -p /var/lib/clamav /var/log/clamav /var/run/clamav
 chown -R clamav:clamav /var/lib/clamav /var/log/clamav /var/run/clamav 2>/dev/null || true
 chmod 755 /var/lib/clamav /var/log/clamav /var/run/clamav
 # Bases officielles
-find /var/lib/clamav \( -name "*.cvd" -o -name "*.cld" \) 2>/dev/null     | xargs chmod 644 2>/dev/null || true
-# Signatures tierces (.ndb .hdb .db .ftm) — même permissions, lisibles par clamav
-find /var/lib/clamav \( -name "*.ndb" -o -name "*.hdb"     -o -name "*.db"  -o -name "*.ftm" \) 2>/dev/null     | xargs chown clamav:clamav 2>/dev/null || true
-find /var/lib/clamav \( -name "*.ndb" -o -name "*.hdb"     -o -name "*.db"  -o -name "*.ftm" \) 2>/dev/null     | xargs chmod 644 2>/dev/null || true
+find /var/lib/clamav \( -name "*.cvd" -o -name "*.cld" \) 2>/dev/null \
+    | xargs chmod 644 2>/dev/null || true
+# Signatures tierces (toutes extensions ClamAV tierces)
+find /var/lib/clamav \( -name "*.ndb" -o -name "*.hdb" -o -name "*.hsb" \
+    -o -name "*.db" -o -name "*.ftm" -o -name "*.ldb" \
+    -o -name "*.cdb" -o -name "*.fp" \) 2>/dev/null \
+    | xargs chown clamav:clamav 2>/dev/null || true
+find /var/lib/clamav \( -name "*.ndb" -o -name "*.hdb" -o -name "*.hsb" \
+    -o -name "*.db" -o -name "*.ftm" -o -name "*.ldb" \
+    -o -name "*.cdb" -o -name "*.fp" \) 2>/dev/null \
+    | xargs chmod 644 2>/dev/null || true
 # Validation au moment du hook permissions
 if command -v clamscan &>/dev/null; then
     if ! clamscan --no-summary --database=/var/lib/clamav /dev/null &>/dev/null; then
         echo ">>> [Hook Perms] ⚠ Base invalide détectée — purge des sigs tierces défectueuses"
-        for f in /var/lib/clamav/*.ndb /var/lib/clamav/*.hdb                  /var/lib/clamav/*.db  /var/lib/clamav/*.ftm; do
+        for f in /var/lib/clamav/*.ndb /var/lib/clamav/*.hdb /var/lib/clamav/*.hsb \
+                 /var/lib/clamav/*.db  /var/lib/clamav/*.ftm /var/lib/clamav/*.ldb \
+                 /var/lib/clamav/*.cdb /var/lib/clamav/*.fp; do
             [ -f "$f" ] || continue
-            clamscan --no-summary --database="$f" /dev/null &>/dev/null                 || { echo "    Suppression : $(basename "$f")"; rm -f "$f"; }
+            clamscan --no-summary --database="$f" /dev/null &>/dev/null \
+                || { echo "    Suppression : $(basename "$f")"; rm -f "$f"; }
         done
     fi
 fi
@@ -697,59 +821,181 @@ systemctl start clamav-freshclam 2>/dev/null || true
 # ── Signatures tierces ClamAV : pré-téléchargement sur la machine de build ────
 step "Téléchargement des signatures tierces ClamAV (machine de build)..."
 
-# Fonction de téléchargement avec validation de taille
+# Fonction de téléchargement HTTP avec log d'erreur visible
 _dl_tp() {
     local URL="$1" DEST="$2" MIN="$3"
-    local TMP
+    local TMP FNAME WGETLOG
+    FNAME="$(basename "$DEST")"
     TMP="$(mktemp /tmp/clamtp_build_XXXXXX)"
-    if wget -q --timeout=30 --tries=3 -O "$TMP" "$URL" 2>/dev/null; then
+    WGETLOG="$(mktemp /tmp/wget_err_XXXXXX)"
+
+    if wget --timeout=30 --tries=2 -O "$TMP" "$URL" 2>"$WGETLOG"; then
         local SZ; SZ=$(stat -c%s "$TMP" 2>/dev/null || echo 0)
         if [[ "$SZ" -gt "$MIN" ]]; then
             mv "$TMP" "$DEST"; chmod 644 "$DEST"
-            ok "$(basename "$DEST") inclus ($(du -h "$DEST" | cut -f1))"
+            ok "$FNAME inclus ($(du -h "$DEST" | cut -f1))"
         else
-            warn "$(basename "$DEST") trop petit (${SZ} o) — ignoré"
+            warn "$FNAME trop petit (${SZ} o < ${MIN} o) — ignoré"
             rm -f "$TMP"
         fi
     else
-        warn "Échec téléchargement $(basename "$DEST") (réseau ?)"
+        local ERR; ERR="$(tail -3 "$WGETLOG" 2>/dev/null)"
+        warn "Échec téléchargement $FNAME"
+        echo "    URL    : $URL"
+        echo "    Erreur : $ERR"
         rm -f "$TMP"
     fi
+    rm -f "$WGETLOG"
 }
 
-SANE="https://sanesecurity.com/databases"
-_dl_tp "$SANE/sanesecurity.ftm"       "$CLAMAV_CHROOT/sanesecurity.ftm"     500
-_dl_tp "$SANE/sigpack.ndb"             "$CLAMAV_CHROOT/sigpack.ndb"          1000
-_dl_tp "$SANE/junk.ndb"               "$CLAMAV_CHROOT/junk.ndb"             1000
-_dl_tp "$SANE/phish.ndb"              "$CLAMAV_CHROOT/phish.ndb"            1000
-_dl_tp "$SANE/malware.expert.db"      "$CLAMAV_CHROOT/malware.expert.db"    1000
-_dl_tp "$SANE/malware.expert.hdb"     "$CLAMAV_CHROOT/malware.expert.hdb"   1000
-_dl_tp "$SANE/scam.ndb"               "$CLAMAV_CHROOT/scam.ndb"             1000
-_dl_tp "https://www.interserver.net/tips/clamav/interserver.ndb"         "$CLAMAV_CHROOT/interserver.ndb" 1000
-_dl_tp "https://urlhaus.abuse.ch/downloads/urlhaus.ndb"         "$CLAMAV_CHROOT/urlhaus.ndb" 1000
+# Liste complète établie depuis https://mirror.ihost.md/?dir=clamav/sanesecurity
+# NB : winnow_phish_complete_url.ndb uniquement (pas les deux variantes ensemble).
+_SANE_FILES=(
+    # Requis
+    sanesecurity.ftm  sigwhitelist.ign2
+    # Sanesecurity propres
+    junk.ndb    jurlbl.ndb   jurlbla.ndb  lott.ndb
+    phish.ndb   rogue.hdb    scam.ndb     blurl.ndb
+    spamimg.hdb spamattach.hdb spam.ldb   shelter.ldb
+    spear.ndb   spearl.ndb   badmacro.ndb
+    malwarehash.hsb   hackingteam.hsb
+    # Foxhole
+    foxhole_generic.cdb  foxhole_filename.cdb  foxhole_js.cdb
+    foxhole_js.ndb       foxhole_all.cdb        foxhole_all.ndb
+    foxhole_mail.cdb     foxhole_links.ldb
+    # MiscreantPunch
+    MiscreantPunch099-Low.ldb  MiscreantPunch099-INFO-Low.ldb
+    # Porcupine
+    porcupine.ndb  phishtank.ndb  porcupine.hsb
+    # bofhland
+    bofhland_cracked_URL.ndb   bofhland_malware_URL.ndb
+    bofhland_phishing_URL.ndb  bofhland_malware_attach.hdb
+    # OITC winnow (winnow_phish_complete_url seul, pas les deux variantes)
+    winnow_malware.hdb           winnow_malware_links.ndb
+    winnow_spam_complete.ndb     winnow_phish_complete_url.ndb
+    winnow.complex.patterns.ldb  winnow_extended_malware.hdb
+    winnow_extended_malware_links.ndb  winnow.attachments.hdb
+    # doppelstern / crdfam / scamnailer / malware.expert
+    doppelstern.ndb   doppelstern.hdb   doppelstern-phishtank.ndb
+    crdfam.clamav.hdb scamnailer.ndb
+    malware.expert.ndb  malware.expert.hdb  malware.expert.ldb
+    malware.expert.fp
+)
 
-# Validation finale : tester le chargement de toute la base avec clamscan
-echo "  Validation de la base complète (clamscan --no-summary)..."
-if clamscan --no-summary --database="$CLAMAV_CHROOT" /dev/null 2>/tmp/clamval.log; then
-    ok "Base ClamAV complète (officielle + tierces) validée"
-else
-    warn "Un fichier tiers pose problème — isolation en cours..."
-    for f in "$CLAMAV_CHROOT"/*.ndb "$CLAMAV_CHROOT"/*.hdb               "$CLAMAV_CHROOT"/*.db  "$CLAMAV_CHROOT"/*.ftm; do
-        [[ -f "$f" ]] || continue
-        if ! clamscan --no-summary --database="$f" /dev/null &>/dev/null; then
-            warn "$(basename "$f") défectueux — retiré du chroot"
-            rm -f "$f"
+# ── Méthode 1 : rsync (méthode officielle — sanesecurity.com) ─────────────────
+_SANE_OK=false
+if command -v rsync &>/dev/null; then
+    step "Sanesecurity via rsync://rsync.sanesecurity.net ..."
+    RSYNC_TMP="$(mktemp -d /tmp/sanesec_rsync_XXXXXX)"
+    # --include="*/" requis pour que rsync descende dans les sous-répertoires
+    # éventuels, même si la source est plate. Sans lui, certains rsync ignorent
+    # silencieusement les filtres d'extension et transfèrent 0 fichier (exit 0).
+    if rsync --timeout=30 --contimeout=15 --no-recursive -q \
+        rsync://rsync.sanesecurity.net/sanesecurity/ "$RSYNC_TMP/" \
+        2>/tmp/rsync-sane.log; then
+        # Vérification que des fichiers ont bien été transférés
+        RSYNC_COUNT=$(ls "$RSYNC_TMP" 2>/dev/null | wc -l)
+        if [[ "$RSYNC_COUNT" -gt 0 ]]; then
+            for _fname in "${_SANE_FILES[@]}"; do
+                if [[ -f "$RSYNC_TMP/$_fname" ]]; then
+                    SZ=$(stat -c%s "$RSYNC_TMP/$_fname" 2>/dev/null || echo 0)
+                    if [[ "$SZ" -gt 100 ]]; then
+                        cp "$RSYNC_TMP/$_fname" "$CLAMAV_CHROOT/$_fname"
+                        chmod 644 "$CLAMAV_CHROOT/$_fname"
+                        ok "$_fname (rsync, $(du -h "$CLAMAV_CHROOT/$_fname" | cut -f1))"
+                    fi
+                fi
+            done
+            _SANE_OK=true
+            ok "Sanesecurity : rsync OK ($RSYNC_COUNT fichier(s) reçus)"
+        else
+            warn "rsync a réussi mais a transféré 0 fichier — fallback HTTP"
         fi
-    done
-    if clamscan --no-summary --database="$CLAMAV_CHROOT" /dev/null &>/dev/null; then
-        ok "Base assainie — scan opérationnel"
     else
-        warn "Problème persistant sur les bases officielles — vérifiez la connexion"
+        warn "rsync Sanesecurity inaccessible — $(head -2 /tmp/rsync-sane.log)"
     fi
+    rm -rf "$RSYNC_TMP"
 fi
 
-TP_BUILD=$(find "$CLAMAV_CHROOT" \( -name "*.ndb" -o -name "*.hdb"     -o -name "*.db" -o -name "*.ftm" \) 2>/dev/null | wc -l)
+# ── Méthode 2 : HTTP (mirror.ihost.md — miroir vérifié le 2026-03-14) ────────
+if ! $_SANE_OK; then
+    warn "rsync indisponible ou sans résultat — tentative HTTP..."
+    for SANE_HTTP in \
+        "https://mirror.ihost.md/clamav/sanesecurity" \
+        "https://ftp.swin.edu.au/sanesecurity"; do
+        if wget --timeout=15 --tries=1 -q --spider "$SANE_HTTP/sanesecurity.ftm" 2>/dev/null; then
+            ok "Miroir HTTP Sanesecurity joignable : $SANE_HTTP"
+            _SANE_OK=true
+            for _fname in "${_SANE_FILES[@]}"; do
+                _dl_tp "$SANE_HTTP/$_fname" "$CLAMAV_CHROOT/$_fname" 64
+            done
+            break
+        else
+            warn "$SANE_HTTP inaccessible"
+        fi
+    done
+fi
+
+$_SANE_OK || warn "Aucune source Sanesecurity joignable. L'image fonctionnera avec les bases officielles uniquement."
+
+# ── InterServer (nouvelle URL — sigs.interserver.net) ─────────────────────────
+# L'ancienne URL interserver.net/virus-l/ retournait 403.
+# Fichiers disponibles : interserver256.hdb, shell.ldb, topline.db
+for _ifile in "interserver256.hdb" "topline.db"; do
+    _dl_tp "http://sigs.interserver.net/$_ifile" "$CLAMAV_CHROOT/$_ifile" 500 || true
+done
+
+# ── URLhaus (abuse.ch) ────────────────────────────────────────────────────────
+# L'accès direct abuse.ch nécessite désormais une auth-key.
+# On tente néanmoins l'URL publique historique puis le miroir GitHub.
+_URLHAUS_OK=false
+for _url in \
+    "https://urlhaus.abuse.ch/downloads/urlhaus.ndb" \
+    "https://curbengh.github.io/malware-filter/urlhaus-filter-clam.ndb"; do
+    if _dl_tp "$_url" "$CLAMAV_CHROOT/urlhaus-filter.ndb" 1000; then
+        _URLHAUS_OK=true; break
+    fi
+done
+$_URLHAUS_OK || warn "URLhaus inaccessible (auth-key requise ?) — signature ignorée"
+
+# Validation finale : uniquement si des fichiers tiers ont été téléchargés.
+# timeout 120s : évite un blocage sur les grosses bases officielles.
+TP_BUILD=$(find "$CLAMAV_CHROOT" \( \
+    -name "*.ndb" -o -name "*.hdb" -o -name "*.hsb" \
+    -o -name "*.db"  -o -name "*.ftm" -o -name "*.ldb" \
+    -o -name "*.cdb" -o -name "*.fp" \
+    \) 2>/dev/null | wc -l)
+if [[ "$TP_BUILD" -gt 0 ]]; then
+    echo "  Validation de la base complète (clamscan --no-summary, timeout 120s)..."
+    if timeout 120 clamscan --no-summary --database="$CLAMAV_CHROOT" /dev/null 2>/tmp/clamval.log; then
+        ok "Base ClamAV complète (officielle + tierces) validée"
+    else
+        warn "Un fichier tiers pose problème — isolation en cours..."
+        for f in "$CLAMAV_CHROOT"/*.ndb "$CLAMAV_CHROOT"/*.hdb "$CLAMAV_CHROOT"/*.hsb \
+                 "$CLAMAV_CHROOT"/*.db  "$CLAMAV_CHROOT"/*.ftm "$CLAMAV_CHROOT"/*.ldb \
+                 "$CLAMAV_CHROOT"/*.cdb "$CLAMAV_CHROOT"/*.fp; do
+            [[ -f "$f" ]] || continue
+            if ! timeout 60 clamscan --no-summary --database="$f" /dev/null &>/dev/null; then
+                warn "$(basename "$f") défectueux — retiré du chroot"
+                rm -f "$f"
+            fi
+        done
+        TP_BUILD=$(find "$CLAMAV_CHROOT" \( \
+            -name "*.ndb" -o -name "*.hdb" -o -name "*.hsb" \
+            -o -name "*.db"  -o -name "*.ftm" -o -name "*.ldb" \
+            -o -name "*.cdb" -o -name "*.fp" \
+            \) 2>/dev/null | wc -l)
+        if timeout 120 clamscan --no-summary --database="$CLAMAV_CHROOT" /dev/null &>/dev/null; then
+            ok "Base assainie — scan opérationnel"
+        else
+            warn "Problème persistant sur les bases officielles — vérifiez la connexion"
+        fi
+    fi
+else
+    warn "Aucune signature tierce téléchargée — validation clamscan ignorée"
+fi
 ok "$TP_BUILD fichier(s) de signatures tierces intégrés dans le chroot"
+
 
 # ── Règles YARA : pré-téléchargement sur la machine de build ──────────────────
 step "Pré-téléchargement des règles YARA signature-base (machine de build)..."
@@ -999,7 +1245,9 @@ lb clean
 # =============================================================================
 ISO_SIZE=$(du -h "$ISO_NAME" | cut -f1)
 CV_COUNT=$(find "$CLAMAV_CHROOT" \( -name "*.cvd" -o -name "*.cld" \) 2>/dev/null | wc -l)
-TP_COUNT=$(find "$CLAMAV_CHROOT" \( -name "*.ndb" -o -name "*.hdb" -o -name "*.db" -o -name "*.ftm" \) 2>/dev/null | wc -l)
+TP_COUNT=$(find "$CLAMAV_CHROOT" \( -name "*.ndb" -o -name "*.hdb" -o -name "*.hsb" \
+    -o -name "*.db" -o -name "*.ftm" -o -name "*.ldb" \
+    -o -name "*.cdb" -o -name "*.fp" \) 2>/dev/null | wc -l)
 YR_COUNT=$(find "$YARA_CHROOT/signature-base" -name "*.yar" 2>/dev/null | wc -l)
 
 echo ""
