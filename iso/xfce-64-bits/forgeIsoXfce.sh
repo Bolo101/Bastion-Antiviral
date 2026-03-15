@@ -248,7 +248,7 @@ download_sig() {
     if wget -q --timeout=30 --tries=3 -O "$TMP" "$URL" 2>>"$LOG"; then
         local SIZE
         SIZE=$(stat -c%s "$TMP" 2>/dev/null || echo 0)
-        if [[ "$SIZE" -gt "$MIN_SIZE" ]]; then
+        if [[ "$SIZE" -ge "$MIN_SIZE" ]]; then
             # sigtool --info ne reconnaît que les .cvd/.cld (bases officielles).
             # Pour les .ndb/.hdb/.db/.ftm tiers, la vérification de taille suffit.
             local VALID=true
@@ -336,7 +336,7 @@ if command -v rsync &>/dev/null; then
             for fname in "${SANE_FILES[@]}"; do
                 if [[ -f "$RSYNC_TMP/$fname" ]]; then
                     SZ=$(stat -c%s "$RSYNC_TMP/$fname" 2>/dev/null || echo 0)
-                    if [[ "$SZ" -gt 100 ]]; then
+                    if [[ "$SZ" -ge 64 ]]; then
                         mv "$RSYNC_TMP/$fname" "$DB_DIR/$fname"
                         chmod 644 "$DB_DIR/$fname"
                         chown clamav:clamav "$DB_DIR/$fname" 2>/dev/null || true
@@ -395,7 +395,6 @@ $URLHAUS_OK || echo "  ⚠ URLhaus inaccessible — signature ignorée." | tee -
 
 
 # ── Bilan et test de chargement ───────────────────────────────────────────────
-# Étendu aux .hsb (malwarehash, porcupine) .ldb .cdb .fp (malware.expert.fp, sigwhitelist.ign2 géré séparément)
 TP_INSTALLED=$(find "$DB_DIR" \( \
     -name "*.ndb" -o -name "*.hdb" -o -name "*.hsb" \
     -o -name "*.db"  -o -name "*.ftm" -o -name "*.ldb" \
@@ -403,39 +402,50 @@ TP_INSTALLED=$(find "$DB_DIR" \( \
     \) 2>/dev/null | wc -l)
 echo ">>> [Hook TP] $TP_INSTALLED fichier(s) tiers installé(s)." | tee -a "$LOG"
 
-# Test de chargement uniquement si au moins un fichier tiers est présent.
-# timeout 90s : évite un blocage si la base est très volumineuse.
+# Validation uniquement si des fichiers tiers sont présents.
+# IMPORTANT : on ne teste JAMAIS chaque fichier tiers en isolation :
+#   clamscan --database="fichier_unique.ndb" échoue systématiquement
+#   sans les bases officielles chargées en parallèle (code 2, faux positif).
+# Stratégie : test du répertoire complet (officiel + tiers). Si ça échoue,
+#   isolation binaire — on déplace les fichiers tiers un à un hors du DB_DIR
+#   et on reteste le répertoire complet. Quand le test repasse, le dernier
+#   fichier déplacé est le coupable ; on le supprime et on remet les autres.
 if [[ "$TP_INSTALLED" -gt 0 ]] && command -v clamscan &>/dev/null; then
-    echo ">>> [Hook TP] Validation du chargement de la base complète…" | tee -a "$LOG"
-    TEST_ERR="$(mktemp /tmp/clamscan_test_XXXXXX)"
-    timeout 90 clamscan --no-summary --database="$DB_DIR" /dev/null 2>"$TEST_ERR"
-    TEST_RC=$?
-    if [[ $TEST_RC -ne 0 ]]; then
-        echo ">>> [Hook TP] ⚠ clamscan ne charge pas la base (code $TEST_RC)." | tee -a "$LOG"
-        echo "    Tentative d'isolation du fichier problématique…" | tee -a "$LOG"
+    echo ">>> [Hook TP] Validation base complète (timeout 90s)…" | tee -a "$LOG"
+    if timeout 90 clamscan --no-summary --database="$DB_DIR" /dev/null 2>/dev/null; then
+        echo ">>> [Hook TP] ✅ Base complète chargée sans erreur." | tee -a "$LOG"
+    else
+        echo ">>> [Hook TP] ⚠ Un fichier tiers empêche le chargement — isolation binaire…" | tee -a "$LOG"
+        QUARANTINE="$(mktemp -d /tmp/clamav_quar_XXXXXX)"
+        CULPRITS=0
+        # Déplacer les fichiers tiers un à un ; retester à chaque fois.
         for f in "$DB_DIR"/*.ndb "$DB_DIR"/*.hdb "$DB_DIR"/*.hsb \
                  "$DB_DIR"/*.db  "$DB_DIR"/*.ftm "$DB_DIR"/*.ldb \
                  "$DB_DIR"/*.cdb "$DB_DIR"/*.fp; do
             [[ -f "$f" ]] || continue
             FNAME=$(basename "$f")
-            if ! clamscan --no-summary --database="$f" /dev/null &>/dev/null; then
-                echo "    ❌ $FNAME est défectueux — supprimé" | tee -a "$LOG"
-                rm -f "$f"
+            mv "$f" "$QUARANTINE/"
+            if timeout 60 clamscan --no-summary --database="$DB_DIR" /dev/null 2>/dev/null; then
+                # Le retrait de ce fichier a résolu le problème : c'est le coupable.
+                echo "    ❌ $FNAME défectueux — supprimé" | tee -a "$LOG"
+                rm -f "$QUARANTINE/$FNAME"
+                CULPRITS=$((CULPRITS + 1))
+            else
+                # Pas encore résolu : remettre le fichier et continuer.
+                mv "$QUARANTINE/$FNAME" "$DB_DIR/"
             fi
         done
-        # Re-test après nettoyage
-        if clamscan --no-summary --database="$DB_DIR" /dev/null &>/dev/null; then
-            echo ">>> [Hook TP] ✅ Base assainie — scan opérationnel." | tee -a "$LOG"
+        rm -rf "$QUARANTINE"
+        if [[ "$CULPRITS" -gt 0 ]]; then
+            echo ">>> [Hook TP] ✅ Base assainie ($CULPRITS fichier(s) retiré(s))." | tee -a "$LOG"
         else
-            echo ">>> [Hook TP] ⚠ Problème persistant — suppression de tous les fichiers tiers." | tee -a "$LOG"
+            echo ">>> [Hook TP] ⚠ Impossible d'isoler le fichier problématique." | tee -a "$LOG"
+            echo "    Les bases officielles seront utilisées seules." | tee -a "$LOG"
             find "$DB_DIR" \( -name "*.ndb" -o -name "*.hdb" -o -name "*.hsb" \
                 -o -name "*.db" -o -name "*.ftm" -o -name "*.ldb" \
                 -o -name "*.cdb" -o -name "*.fp" \) -delete 2>/dev/null || true
         fi
-    else
-        echo ">>> [Hook TP] ✅ Base complète chargée sans erreur." | tee -a "$LOG"
     fi
-    rm -f "$TEST_ERR"
 fi
 
 TP_FINAL=$(find "$DB_DIR" \( \
@@ -689,16 +699,25 @@ find /var/lib/clamav \( -name "*.ndb" -o -name "*.hdb" -o -name "*.hsb" \
     -o -name "*.cdb" -o -name "*.fp" \) 2>/dev/null \
     | xargs chmod 644 2>/dev/null || true
 # Validation au moment du hook permissions
+# Même logique que le hook 0150 : jamais de test sur fichier unique.
 if command -v clamscan &>/dev/null; then
     if ! clamscan --no-summary --database=/var/lib/clamav /dev/null &>/dev/null; then
-        echo ">>> [Hook Perms] ⚠ Base invalide détectée — purge des sigs tierces défectueuses"
+        echo ">>> [Hook Perms] ⚠ Base invalide — isolation binaire des fichiers tiers…"
+        QDIR="$(mktemp -d /tmp/clamav_perms_quar_XXXXXX)"
         for f in /var/lib/clamav/*.ndb /var/lib/clamav/*.hdb /var/lib/clamav/*.hsb \
                  /var/lib/clamav/*.db  /var/lib/clamav/*.ftm /var/lib/clamav/*.ldb \
                  /var/lib/clamav/*.cdb /var/lib/clamav/*.fp; do
             [ -f "$f" ] || continue
-            clamscan --no-summary --database="$f" /dev/null &>/dev/null \
-                || { echo "    Suppression : $(basename "$f")"; rm -f "$f"; }
+            BNAME=$(basename "$f")
+            mv "$f" "$QDIR/"
+            if clamscan --no-summary --database=/var/lib/clamav /dev/null &>/dev/null; then
+                echo "    Suppression : $BNAME (coupable)"
+                rm -f "$QDIR/$BNAME"
+            else
+                mv "$QDIR/$BNAME" /var/lib/clamav/
+            fi
         done
+        rm -rf "$QDIR"
     fi
 fi
 
@@ -831,7 +850,7 @@ _dl_tp() {
 
     if wget --timeout=30 --tries=2 -O "$TMP" "$URL" 2>"$WGETLOG"; then
         local SZ; SZ=$(stat -c%s "$TMP" 2>/dev/null || echo 0)
-        if [[ "$SZ" -gt "$MIN" ]]; then
+        if [[ "$SZ" -ge "$MIN" ]]; then
             mv "$TMP" "$DEST"; chmod 644 "$DEST"
             ok "$FNAME inclus ($(du -h "$DEST" | cut -f1))"
         else
@@ -899,7 +918,7 @@ if command -v rsync &>/dev/null; then
             for _fname in "${_SANE_FILES[@]}"; do
                 if [[ -f "$RSYNC_TMP/$_fname" ]]; then
                     SZ=$(stat -c%s "$RSYNC_TMP/$_fname" 2>/dev/null || echo 0)
-                    if [[ "$SZ" -gt 100 ]]; then
+                    if [[ "$SZ" -ge 64 ]]; then
                         cp "$RSYNC_TMP/$_fname" "$CLAMAV_CHROOT/$_fname"
                         chmod 644 "$CLAMAV_CHROOT/$_fname"
                         ok "$_fname (rsync, $(du -h "$CLAMAV_CHROOT/$_fname" | cut -f1))"
@@ -958,42 +977,17 @@ for _url in \
 done
 $_URLHAUS_OK || warn "URLhaus inaccessible (auth-key requise ?) — signature ignorée"
 
-# Validation finale : uniquement si des fichiers tiers ont été téléchargés.
-# timeout 120s : évite un blocage sur les grosses bases officielles.
+# Comptage final — pas de validation clamscan ici.
+# Raison : clamscan --database="fichier_unique" retourne toujours une erreur
+# quand il n'a pas les bases officielles chargées en parallèle. Tester chaque
+# fichier tiers isolément purgerait tous les fichiers à tort.
+# La validation réelle est déléguée au hook 0150 qui tourne avec la bonne
+# version de ClamAV à l'intérieur du chroot pendant lb build.
 TP_BUILD=$(find "$CLAMAV_CHROOT" \( \
     -name "*.ndb" -o -name "*.hdb" -o -name "*.hsb" \
     -o -name "*.db"  -o -name "*.ftm" -o -name "*.ldb" \
     -o -name "*.cdb" -o -name "*.fp" \
     \) 2>/dev/null | wc -l)
-if [[ "$TP_BUILD" -gt 0 ]]; then
-    echo "  Validation de la base complète (clamscan --no-summary, timeout 120s)..."
-    if timeout 120 clamscan --no-summary --database="$CLAMAV_CHROOT" /dev/null 2>/tmp/clamval.log; then
-        ok "Base ClamAV complète (officielle + tierces) validée"
-    else
-        warn "Un fichier tiers pose problème — isolation en cours..."
-        for f in "$CLAMAV_CHROOT"/*.ndb "$CLAMAV_CHROOT"/*.hdb "$CLAMAV_CHROOT"/*.hsb \
-                 "$CLAMAV_CHROOT"/*.db  "$CLAMAV_CHROOT"/*.ftm "$CLAMAV_CHROOT"/*.ldb \
-                 "$CLAMAV_CHROOT"/*.cdb "$CLAMAV_CHROOT"/*.fp; do
-            [[ -f "$f" ]] || continue
-            if ! timeout 60 clamscan --no-summary --database="$f" /dev/null &>/dev/null; then
-                warn "$(basename "$f") défectueux — retiré du chroot"
-                rm -f "$f"
-            fi
-        done
-        TP_BUILD=$(find "$CLAMAV_CHROOT" \( \
-            -name "*.ndb" -o -name "*.hdb" -o -name "*.hsb" \
-            -o -name "*.db"  -o -name "*.ftm" -o -name "*.ldb" \
-            -o -name "*.cdb" -o -name "*.fp" \
-            \) 2>/dev/null | wc -l)
-        if timeout 120 clamscan --no-summary --database="$CLAMAV_CHROOT" /dev/null &>/dev/null; then
-            ok "Base assainie — scan opérationnel"
-        else
-            warn "Problème persistant sur les bases officielles — vérifiez la connexion"
-        fi
-    fi
-else
-    warn "Aucune signature tierce téléchargée — validation clamscan ignorée"
-fi
 ok "$TP_BUILD fichier(s) de signatures tierces intégrés dans le chroot"
 
 
@@ -1236,6 +1230,14 @@ done
 mv "$ISO_FOUND" "$ISO_NAME"
 ok "ISO : $ISO_NAME"
 
+# ── Comptage des fichiers intégrés (avant lb clean qui efface le chroot) ──────
+ISO_SIZE=$(du -h "$ISO_NAME" | cut -f1)
+CV_COUNT=$(find "$CLAMAV_CHROOT" \( -name "*.cvd" -o -name "*.cld" \) 2>/dev/null | wc -l)
+TP_COUNT=$(find "$CLAMAV_CHROOT" \( -name "*.ndb" -o -name "*.hdb" -o -name "*.hsb" \
+    -o -name "*.db" -o -name "*.ftm" -o -name "*.ldb" \
+    -o -name "*.cdb" -o -name "*.fp" \) 2>/dev/null | wc -l)
+YR_COUNT=$(find "$YARA_CHROOT/signature-base" -name "*.yar" 2>/dev/null | wc -l)
+
 # ── Nettoyage ─────────────────────────────────────────────────────────────────
 step "Nettoyage..."
 lb clean
@@ -1243,12 +1245,6 @@ lb clean
 # =============================================================================
 # Résumé
 # =============================================================================
-ISO_SIZE=$(du -h "$ISO_NAME" | cut -f1)
-CV_COUNT=$(find "$CLAMAV_CHROOT" \( -name "*.cvd" -o -name "*.cld" \) 2>/dev/null | wc -l)
-TP_COUNT=$(find "$CLAMAV_CHROOT" \( -name "*.ndb" -o -name "*.hdb" -o -name "*.hsb" \
-    -o -name "*.db" -o -name "*.ftm" -o -name "*.ldb" \
-    -o -name "*.cdb" -o -name "*.fp" \) 2>/dev/null | wc -l)
-YR_COUNT=$(find "$YARA_CHROOT/signature-base" -name "*.yar" 2>/dev/null | wc -l)
 
 echo ""
 echo "═══════════════════════════════════════════════════════════"
