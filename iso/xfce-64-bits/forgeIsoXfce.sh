@@ -129,11 +129,10 @@ firmware-linux-free
 firmware-linux-nonfree
 # Installateur graphique (option "Installer sur le disque")
 calamares
-calamares-settings-debian
-live-installer
 os-prober
-grub-pc
-grub-efi-amd64
+grub-common
+grub2-common
+shim-signed
 efibootmgr
 # Divers
 unzip
@@ -911,6 +910,13 @@ grubCfg: "/boot/grub/grub.cfg"
 grubProbe: "grub-probe"
 efiBootLoaderId: "AV-Scanner"
 installEFIFallback: true
+# Calamares installe lui-même le bon paquet GRUB selon le firmware détecté.
+# grub-pc (BIOS) et grub-efi-amd64 (UEFI) sont mutuellement exclusifs et ne
+# peuvent pas coexister dans le chroot live — on les laisse donc à Calamares.
+packages:
+  - try_install:
+    - grub-pc
+    - grub-efi-amd64
 CONF
 
 # ── Module : services-systemd ─────────────────────────────────────────────────
@@ -1145,6 +1151,7 @@ POSTINSTALL
 chmod 755 config/includes.chroot/usr/lib/antivirus-installer/post-install.sh
 
 # Service systemd oneshot pour le premier démarrage après installation
+mkdir -p config/includes.chroot/etc/systemd/system
 cat > config/includes.chroot/etc/systemd/system/antivirus-post-install.service << 'EOF'
 [Unit]
 Description=Configuration post-installation USB Antivirus Scanner
