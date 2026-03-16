@@ -348,56 +348,83 @@ class VirusScannerGUI:
     # ══════════════════════════════════════════════════════════════════════════
 
     def _refresh_status(self) -> None:
+        """Lance le rafraîchissement du statut en arrière-plan (clamscan peut
+        prendre quelques secondes pour charger toutes les bases)."""
+        threading.Thread(target=self._refresh_status_worker, daemon=True).start()
+
+    def _refresh_status_worker(self) -> None:
         # ── ClamAV ────────────────────────────────────────────────────────────
         if not self.engine.is_clamav_installed():
-            self.clamav_status_var.set("❌  ClamAV : non installé")
+            clamav_text = "❌  ClamAV : non installé"
         else:
             info    = self.db.get_clamav_status()
             st      = info["status"]
             lu      = info.get("last_update", "?")
             missing = info.get("missing", [])
+
+            # Compteur de signatures (toutes bases confondues) — appel bloquant
+            count = self.db.get_known_virus_count()
+            count_str = (f"  |  {count:,} signatures".replace(",", "\u202f")
+                         if count else "")
+
+            # Statut des bases tierces
+            tp          = self.db.get_third_party_sig_status()
+            n_installed = len(tp["installed"])
+            n_missing   = len(tp["missing"])
+            if n_missing == 0 and n_installed > 0:
+                tp_str = f"  |  {n_installed} bases tierces ✅"
+            elif n_installed > 0:
+                tp_str = f"  |  {n_installed}/{n_installed + n_missing} bases tierces ⚠"
+            else:
+                tp_str = "  |  bases tierces absentes ❌"
+
             if st == "OK":
-                self.clamav_status_var.set(f"✅  ClamAV : base OK  (màj : {lu})")
+                clamav_text = f"✅  ClamAV  (màj : {lu}){count_str}{tp_str}"
             elif st == "OUTDATED":
-                self.clamav_status_var.set(f"⚠   ClamAV : base obsolète  ({lu})")
+                clamav_text = (
+                    f"⚠   ClamAV : base obsolète  ({lu}){count_str}{tp_str}"
+                )
             else:
                 if missing:
-                    self.clamav_status_var.set(
+                    clamav_text = (
                         f"❌  ClamAV : bases manquantes – {', '.join(missing)}"
                     )
                 else:
-                    self.clamav_status_var.set("❌  ClamAV : base manquante")
+                    clamav_text = "❌  ClamAV : base manquante"
 
         # ── Avast ──────────────────────────────────────────────────────────────
-        self.avast_status_var.set(self.engine.avast_status_summary())
-
-        # Activer/griser la case Avast selon le statut
-        if self.engine.is_avast_installed() and self.engine.is_avast_licensed():
-            self._avast_chk.configure(state=tk.NORMAL)
-            self.use_avast_var.set(True)
-        elif self.engine.is_avast_installed():
-            self._avast_chk.configure(state=tk.NORMAL)
-            # Laisser le choix à l'utilisateur mais prévenir au lancement
-        else:
-            self._avast_chk.configure(state=tk.DISABLED)
-            self.use_avast_var.set(False)
+        avast_text = self.engine.avast_status_summary()
+        avast_installed  = self.engine.is_avast_installed()
+        avast_licensed   = self.engine.is_avast_licensed()
 
         # ── YARA ───────────────────────────────────────────────────────────────
         ok, method = self.engine.detect_yara()
         if not ok:
-            self.yara_status_var.set("❌  YARA : non installé")
+            yara_text = "❌  YARA : non installé"
         else:
-            info = self.db.get_yara_status()
-            n    = info["count"]
-            lu   = info.get("last_update", "?")
+            yara_info = self.db.get_yara_status()
+            n    = yara_info["count"]
+            lu2  = yara_info.get("last_update", "?")
             if n > 0:
-                self.yara_status_var.set(
-                    f"✅  YARA ({method}) : {n} règle(s)  (màj : {lu})"
-                )
+                yara_text = f"✅  YARA ({method}) : {n} règle(s)  (màj : {lu2})"
             else:
-                self.yara_status_var.set(
-                    f"⚠   YARA ({method}) : aucune règle installée"
-                )
+                yara_text = f"⚠   YARA ({method}) : aucune règle installée"
+
+        # ── Mise à jour UI (thread-safe) ───────────────────────────────────────
+        def _apply():
+            self.clamav_status_var.set(clamav_text)
+            self.avast_status_var.set(avast_text)
+            self.yara_status_var.set(yara_text)
+            if avast_installed and avast_licensed:
+                self._avast_chk.configure(state=tk.NORMAL)
+                self.use_avast_var.set(True)
+            elif avast_installed:
+                self._avast_chk.configure(state=tk.NORMAL)
+            else:
+                self._avast_chk.configure(state=tk.DISABLED)
+                self.use_avast_var.set(False)
+
+        self.root.after(0, _apply)
 
     # ══════════════════════════════════════════════════════════════════════════
     # Gestion USB

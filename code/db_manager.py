@@ -382,6 +382,72 @@ class DBManager:
         )
         return success, summary
 
+    def get_known_virus_count(self) -> Optional[int]:
+        """
+        Retourne le nombre de signatures chargées par clamscan (toutes bases
+        confondues : officielles + tierces), en lançant un scan rapide sur un
+        fichier vide temporaire et en parsant la ligne "Known viruses: N".
+
+        Retourne None si clamscan n'est pas disponible ou en cas d'erreur.
+        Ce compteur est la seule source fiable pour savoir si les bases tierces
+        sont réellement prises en compte.
+        """
+        import tempfile, shutil
+        if not shutil.which("clamscan"):
+            return None
+
+        tmp_path: Optional[str] = None
+        try:
+            fd, tmp_path = tempfile.mkstemp(prefix="clamav_count_", suffix=".tmp")
+            os.close(fd)
+            r = subprocess.run(
+                ["clamscan", tmp_path],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, timeout=60
+            )
+            combined = r.stdout + r.stderr
+            for line in combined.splitlines():
+                if line.startswith("Known viruses:"):
+                    try:
+                        return int(line.split(":")[1].strip().replace(",", ""))
+                    except (ValueError, IndexError):
+                        pass
+        except Exception:
+            pass
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+        return None
+
+    def get_third_party_sig_status(self) -> Dict:
+        """
+        Retourne un dict décrivant l'état des signatures tierces installées :
+          installed  – liste de (nom_fichier, taille_Ko, date)
+          missing    – liste des noms de fichiers attendus mais absents
+          total_size – taille totale en Ko
+        """
+        result: Dict = {"installed": [], "missing": [], "total_size": 0}
+        for sig in THIRD_PARTY_SIGNATURES:
+            dest = os.path.join(CLAMAV_DB_DIR, sig["file"])
+            if os.path.exists(dest):
+                try:
+                    st      = os.stat(dest)
+                    size_kb = st.st_size / 1024
+                    mtime   = time.strftime("%Y-%m-%d", time.localtime(st.st_mtime))
+                    result["installed"].append(
+                        {"name": sig["name"], "file": sig["file"],
+                         "size_kb": size_kb, "date": mtime}
+                    )
+                    result["total_size"] += size_kb
+                except OSError:
+                    result["missing"].append(sig["name"])
+            else:
+                result["missing"].append(sig["name"])
+        return result
+
     def find_clamav_on_usb(self) -> List[str]:
         files: List[str] = []
         for mp in self._usb_mountpoints():
