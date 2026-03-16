@@ -240,30 +240,52 @@ class ScanEngine:
 
     def _check_clamav_db(self, cb: ProgressCB) -> bool:
         """
-        Lance clamscan --no-summary /dev/null pour vérifier que la base
-        (officielle + signatures tierces) se charge correctement.
-        Code 0 = OK, code 1 = OK (virus détecté sur /dev/null, impossible),
-        code 2 = erreur DB.  Retourne False uniquement sur code 2.
+        Vérifie que la base ClamAV se charge correctement en scannant un fichier
+        vide temporaire.
+
+        Note : /dev/null NE doit PAS être utilisé — c'est un fichier spécial que
+        clamscan rejette systématiquement avec le code 2 ("Not supported file type"),
+        déclenchant un faux positif d'erreur de base.
+
+        Code 0 = OK, code 1 = OK, code 2 + messages d'erreur DB = base invalide.
         """
+        import tempfile
+
+        tmp_path: Optional[str] = None
         try:
+            fd, tmp_path = tempfile.mkstemp(prefix="clamav_check_", suffix=".tmp")
+            os.close(fd)
+
             r = subprocess.run(
-                ["clamscan", "--no-summary", "/dev/null"],
+                ["clamscan", "--no-summary", tmp_path],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, timeout=60
             )
         except Exception as e:
             log_warning(f"ClamAV pré-validation impossible : {e}")
-            return True  # on tente quand même le vrai scan
+            return True
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
 
         if r.returncode in (0, 1):
             return True
 
-        # Code 2 = au moins un fichier de signature est invalide
         combined = (r.stdout + r.stderr).strip()
         bad_lines = [l for l in combined.splitlines()
-                     if "Error" in l or "Can't load" in l or "Invalid" in l]
-        detail = "\n   ".join(bad_lines[:5]) if bad_lines else combined[:200]
+                     if any(k in l for k in
+                            ("Error loading", "Can't load", "Invalid",
+                             "Corrupt", "corrupt", "Can't open"))]
 
+        if not bad_lines:
+            log_warning(f"ClamAV pré-validation : code 2 sans erreur DB "
+                        f"({combined[:120]}). Scan autorisé.")
+            return True
+
+        detail = "\n   ".join(bad_lines[:5])
         msg = ("❌ ClamAV : échec de chargement de la base (code 2).\n"
                "   Cause : une signature tierce est probablement corrompue.\n"
                f"   {detail}\n"
@@ -297,7 +319,31 @@ class ScanEngine:
             return
 
         # ── 2. Scan ───────────────────────────────────────────────────────────
-        cmd = ["clamscan", "--recursive", "--stdout"]
+        # Notes sur les options :
+        #   --max-filesize=0 / --max-scansize=0 / --max-files=0
+        #     Lève les limites silencieuses par défaut (25 Mo/fichier, 100 Mo/total,
+        #     10 000 fichiers). Sans ces options, les samples volumineux sont
+        #     simplement ignorés sans avertissement → faux "aucune menace".
+        #   --scan-archive=yes
+        #     Force le scan des archives (tar, zip non chiffrés, etc.).
+        #     Note : les ZIP protégés par mot de passe ne peuvent PAS être scannés
+        #     par ClamAV (ni par aucun autre moteur AV sans le mot de passe).
+        #   --alert-broken
+        #     Signale les PE/archives corrompus ou tronqués comme suspects.
+        #   --detect-pua=yes
+        #     Détecte les logiciels potentiellement indésirables (adware,
+        #     downloaders, packers, outils d'administration, etc.).
+        cmd = [
+            "clamscan",
+            "--recursive",
+            "--stdout",
+            "--max-filesize=0",
+            "--max-scansize=0",
+            "--max-files=0",
+            "--scan-archive=yes",
+            "--alert-broken",
+            "--detect-pua=yes",
+        ]
         if remove:
             cmd.append("--remove")
         cmd.extend(targets)
