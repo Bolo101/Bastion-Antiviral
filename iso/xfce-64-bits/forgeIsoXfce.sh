@@ -61,9 +61,11 @@ lb config \
     --distribution bookworm \
     --architectures amd64 \
     --linux-packages linux-image \
-    --debian-installer none \
+    --debian-installer live \
     --bootappend-live "boot=live components quiet splash \
 hostname=antivirus-usb username=scanner \
+locales=fr_FR.UTF-8 keyboard-layouts=fr" \
+    --bootappend-install "modules=keyboard-configuration \
 locales=fr_FR.UTF-8 keyboard-layouts=fr" \
     --apt-options "--yes --no-install-recommends"
 ok "live-build configuré"
@@ -125,6 +127,14 @@ usbutils
 # Firmware
 firmware-linux-free
 firmware-linux-nonfree
+# Installateur graphique (option "Installer sur le disque")
+calamares
+calamares-settings-debian
+live-installer
+os-prober
+grub-pc
+grub-efi-amd64
+efibootmgr
 # Divers
 unzip
 squashfs-tools
@@ -709,7 +719,251 @@ HOOK
 chmod +x config/hooks/normal/0300-system-config.hook.chroot
 ok "Hook système créé"
 
-# ── Hook 4 : permissions finales ────────────────────────────────────────────
+# ── Hook 3.5 : configuration Calamares (installateur graphique) ───────────────
+step "Création du hook Calamares..."
+cat > config/hooks/normal/0350-calamares.hook.chroot << 'HOOK'
+#!/bin/bash
+# =============================================================================
+# Hook 0350 – Configuration de Calamares, l'installateur graphique.
+#
+# Ce hook configure Calamares pour installer sur disque le système live
+# tel quel (ClamAV + YARA + scanner + XFCE), sans téléchargement réseau.
+# La méthode "unsquashfs" copie le squashfs live directement sur la partition
+# cible — toutes les bases virales et règles YARA sont donc préservées.
+#
+# Modules activés (dans l'ordre d'exécution) :
+#   welcome → locale → keyboard → partition → users →
+#   networkcfg → summary → unpackfs → fstab → bootloader →
+#   services-systemd → grubcfg → umount → finished
+# =============================================================================
+set -euo pipefail
+echo ">>> [Hook Calamares] Configuration de l'installateur..."
+
+CALA_DIR="/etc/calamares"
+MODULES_DIR="$CALA_DIR/modules"
+BRAND_DIR="/usr/share/calamares/branding/antivirus"
+mkdir -p "$MODULES_DIR" "$BRAND_DIR"
+
+# ── Paramètres globaux ────────────────────────────────────────────────────────
+cat > "$CALA_DIR/settings.conf" << 'CONF'
+modules-search: [ local, /usr/lib/calamares/modules ]
+
+sequence:
+  - show:
+    - welcome
+    - locale
+    - keyboard
+    - partition
+    - users
+    - summary
+  - exec:
+    - partition
+    - mount
+    - unpackfs
+    - machineid
+    - fstab
+    - locale
+    - keyboard
+    - localecfg
+    - users
+    - networkcfg
+    - hwclock
+    - services-systemd
+    - grubcfg
+    - bootloader
+    - umount
+  - show:
+    - finished
+
+branding: antivirus
+prompt-install: true
+dont-chroot: false
+CONF
+
+# ── Branding ──────────────────────────────────────────────────────────────────
+cat > "$BRAND_DIR/branding.desc" << 'BRAND'
+componentName: antivirus
+
+strings:
+  productName:         "USB Antivirus Scanner"
+  shortProductName:    "AV Scanner"
+  version:             "1.0"
+  shortVersion:        "1.0"
+  versionedName:       "USB Antivirus Scanner 1.0"
+  shortVersionedName:  "AV Scanner 1.0"
+  bootloaderEntryName: "AV Scanner"
+  productUrl:          ""
+  supportUrl:          ""
+  knownIssuesUrl:      ""
+  releaseNotesUrl:     ""
+
+images:
+  productLogo:   "logo.png"
+  productIcon:   "logo.png"
+  productWelcome: "languages.png"
+
+slideshow: "show.qml"
+BRAND
+
+# Logo minimal (copie l'icône système si disponible)
+if [ -f /usr/share/pixmaps/security-high.png ]; then
+    cp /usr/share/pixmaps/security-high.png "$BRAND_DIR/logo.png"
+elif [ -f /usr/share/icons/hicolor/48x48/apps/clamtk.png ]; then
+    cp /usr/share/icons/hicolor/48x48/apps/clamtk.png "$BRAND_DIR/logo.png"
+else
+    # Crée une image PNG minimale 1×1 transparent pour éviter l'erreur au démarrage
+    printf '\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82' \
+        > "$BRAND_DIR/logo.png"
+fi
+cp "$BRAND_DIR/logo.png" "$BRAND_DIR/languages.png" 2>/dev/null || true
+
+# Slideshow minimal QML (obligatoire, sinon Calamares refuse de démarrer)
+cat > "$BRAND_DIR/show.qml" << 'QML'
+import QtQuick 2.0
+import calamares.slideshow 1.0
+
+Presentation {
+    id: presentation
+    Slide {
+        anchors.fill: parent
+        Text {
+            anchors.centerIn: parent
+            text: "Installation en cours…\n\nClamAV, YARA et toutes les bases\nvirales sont copiés sur le disque."
+            horizontalAlignment: Text.AlignHCenter
+            font.pixelSize: 18
+            color: "#e0e0e0"
+        }
+        Rectangle { anchors.fill: parent; color: "#1a1a2e"; z: -1 }
+    }
+}
+QML
+
+# ── Module : unpackfs (copie le squashfs live → partition cible) ──────────────
+# C'est l'étape clé : copie tout le système live tel quel (bases AV incluses).
+cat > "$MODULES_DIR/unpackfs.conf" << 'CONF'
+---
+unpack:
+  - source: "/run/live/medium/live/filesystem.squashfs"
+    sourcefs: "squashfs"
+    destination: ""
+CONF
+
+# ── Module : partition (KPMcore — partitionnement guidé) ─────────────────────
+cat > "$MODULES_DIR/partition.conf" << 'CONF'
+---
+efiSystemPartition: "/boot/efi"
+efiSystemPartitionSize: "300M"
+efiSystemPartitionName: "EFI"
+defaultPartitionTableType:
+  - gpt
+  - msdos
+userSwapChoices:
+  - none
+  - small
+  - suspend
+  - file
+requiredStorage: 6.0
+CONF
+
+# ── Module : users ────────────────────────────────────────────────────────────
+cat > "$MODULES_DIR/users.conf" << 'CONF'
+---
+defaultGroups:
+  - name: users
+    state: create
+  - name: lp
+    state: create
+  - name: video
+    state: create
+  - name: network
+    state: create
+  - name: storage
+    state: create
+  - name: wheel
+    state: create
+  - name: sudo
+    state: create
+  - name: plugdev
+    state: create
+  - name: cdrom
+    state: create
+
+autologinGroup: autologin
+doAutologin: false
+sudoersGroup: sudo
+setRootPassword: true
+doReusePassword: false
+passwordRequirements:
+  nonempty: true
+  minLength: 4
+  maxLength: -1
+  libpwquality:
+    - minlen=4
+CONF
+
+# ── Module : bootloader ───────────────────────────────────────────────────────
+cat > "$MODULES_DIR/bootloader.conf" << 'CONF'
+---
+efiBootLoader: "grub"
+grubInstall: "grub-install"
+grubMkconfig: "grub-mkconfig"
+grubCfg: "/boot/grub/grub.cfg"
+grubProbe: "grub-probe"
+efiBootLoaderId: "AV-Scanner"
+installEFIFallback: true
+CONF
+
+# ── Module : services-systemd ─────────────────────────────────────────────────
+# Désactive sur le système installé les services live-only inutiles.
+# Active clamav-daemon pour qu'il se lance au boot sur le système installé.
+cat > "$MODULES_DIR/services-systemd.conf" << 'CONF'
+---
+disable:
+  - live-boot
+  - live-config
+  - live-config-components
+  - live-networkmanager
+
+enable:
+  - clamav-daemon
+  - NetworkManager
+CONF
+
+# ── Module : networkcfg ───────────────────────────────────────────────────────
+cat > "$MODULES_DIR/networkcfg.conf" << 'CONF'
+---
+backend: networkmanager
+CONF
+
+# ── Module : welcome ──────────────────────────────────────────────────────────
+cat > "$MODULES_DIR/welcome.conf" << 'CONF'
+---
+showSupportUrl:       false
+showKnownIssuesUrl:   false
+showReleaseNotesUrl:  false
+showDonateUrl:        false
+requirements:
+  requiredStorage:    6
+  requiredRam:        1.0
+  internet:           false
+  root:               true
+  screen:             false
+CONF
+
+# ── Lancement auto avec polkit (pas besoin de mot de passe root) ──────────────
+cat > /etc/polkit-1/rules.d/49-calamares.rules << 'POLKIT'
+polkit.addRule(function(action, subject) {
+    if (action.id.indexOf("org.freedesktop.calamares") === 0 &&
+        subject.isInGroup("sudo")) {
+        return polkit.Result.YES;
+    }
+});
+POLKIT
+
+echo ">>> [Hook Calamares] ✅ Configuration terminée."
+HOOK
+chmod +x config/hooks/normal/0350-calamares.hook.chroot
+ok "Hook Calamares créé"
 cat > config/hooks/normal/0400-permissions.hook.chroot << 'HOOK'
 #!/bin/bash
 set -euo pipefail
@@ -738,11 +992,15 @@ find /var/lib/clamav \( -name "*.ndb" -o -name "*.hdb" -o -name "*.hsb" \
 # Validation au moment du hook permissions — même algorithme que le hook 0150.
 # Boucle while : recommence depuis zéro après chaque suppression pour éviter
 # de faussement supprimer des fichiers innocents.
+# Important : on utilise un fichier temporaire vide, PAS /dev/null.
+# /dev/null est un fichier spécial rejeté par clamscan avec code 2 + "Not
+# supported file type", ce qui déclencherait un faux positif d'erreur de base.
 if command -v clamscan &>/dev/null; then
-    if ! clamscan --no-summary --database=/var/lib/clamav /dev/null &>/dev/null; then
+    _CVAL_TMP="$(mktemp /tmp/clamval_XXXXXX)"
+    if ! clamscan --no-summary --database=/var/lib/clamav "$_CVAL_TMP" &>/dev/null; then
         echo ">>> [Hook Perms] ⚠ Base invalide — isolation en cours…"
         CULPRITS_P=0
-        while ! clamscan --no-summary --database=/var/lib/clamav /dev/null &>/dev/null; do
+        while ! clamscan --no-summary --database=/var/lib/clamav "$_CVAL_TMP" &>/dev/null; do
             QDIR="$(mktemp -d /tmp/clamav_perms_quar_XXXXXX)"
             FOUND_P=false
             for f in /var/lib/clamav/*.ndb /var/lib/clamav/*.hdb /var/lib/clamav/*.hsb \
@@ -751,7 +1009,7 @@ if command -v clamscan &>/dev/null; then
                 [ -f "$f" ] || continue
                 BNAME=$(basename "$f")
                 mv "$f" "$QDIR/"
-                if clamscan --no-summary --database=/var/lib/clamav /dev/null &>/dev/null; then
+                if clamscan --no-summary --database=/var/lib/clamav "$_CVAL_TMP" &>/dev/null; then
                     echo "    Suppression : $BNAME (coupable)"
                     rm -f "$QDIR/$BNAME"
                     CULPRITS_P=$((CULPRITS_P + 1))
@@ -772,6 +1030,7 @@ if command -v clamscan &>/dev/null; then
         done
         [ "$CULPRITS_P" -gt 0 ] && echo ">>> [Hook Perms] ✅ Base assainie ($CULPRITS_P fichier(s) retiré(s))."
     fi
+    rm -f "$_CVAL_TMP"
 fi
 
 # YARA
@@ -794,6 +1053,119 @@ echo ">>> [Hook Permissions] OK ✅"
 HOOK
 chmod +x config/hooks/normal/0400-permissions.hook.chroot
 ok "Hook permissions créé"
+
+# ── Hook 4.5 : script post-installation exécuté après Calamares ───────────────
+# Ce script est lancé par un service systemd oneshot sur le SYSTÈME INSTALLÉ
+# (pas dans le live) au premier démarrage. Il s'assure que les bases ClamAV
+# et les règles YARA copiées depuis le live sont bien utilisées.
+step "Création du script de post-installation..."
+mkdir -p config/includes.chroot/usr/lib/antivirus-installer
+cat > config/includes.chroot/usr/lib/antivirus-installer/post-install.sh << 'POSTINSTALL'
+#!/bin/bash
+# =============================================================================
+# post-install.sh  –  Premier démarrage après installation sur disque.
+#
+# Tâches :
+#   1. Corriger les permissions ClamAV (les services sont maintenant actifs)
+#   2. Corriger les permissions YARA
+#   3. Reconfigurer l'autologin LightDM avec le compte créé par Calamares
+#      (le compte "scanner" du live n'existe plus — Calamares en crée un nouveau)
+#   4. Se désactiver (oneshot : ne tourne qu'une seule fois)
+# =============================================================================
+set -euo pipefail
+LOG="/var/log/antivirus-post-install.log"
+exec >> "$LOG" 2>&1
+echo "=== post-install.sh : $(date) ==="
+
+# ── 1. ClamAV ─────────────────────────────────────────────────────────────────
+echo ">> Permissions ClamAV..."
+mkdir -p /var/lib/clamav /var/log/clamav /var/run/clamav
+chown -R clamav:clamav /var/lib/clamav /var/log/clamav /var/run/clamav 2>/dev/null || true
+chmod 755 /var/lib/clamav /var/log/clamav /var/run/clamav
+find /var/lib/clamav -type f \( \
+    -name "*.cvd" -o -name "*.cld" -o -name "*.ndb" -o -name "*.hdb" \
+    -o -name "*.hsb" -o -name "*.db"  -o -name "*.ftm" -o -name "*.ldb" \
+    -o -name "*.cdb" -o -name "*.fp"  -o -name "*.ign2" \) \
+    -exec chown clamav:clamav {} \; -exec chmod 644 {} \; 2>/dev/null || true
+echo "   $(find /var/lib/clamav -type f | wc -l) fichier(s) dans /var/lib/clamav"
+
+# ── 2. YARA ───────────────────────────────────────────────────────────────────
+echo ">> Permissions YARA..."
+if [ -d /var/lib/yara-rules ]; then
+    chmod -R 755 /var/lib/yara-rules
+    YR=$(find /var/lib/yara-rules -name "*.yar" | wc -l)
+    echo "   $YR règle(s) YARA disponibles"
+fi
+
+# ── 3. Répertoire du scanner ──────────────────────────────────────────────────
+echo ">> Permissions scanner..."
+if [ -d /opt/usb-antivirus ]; then
+    chmod 644 /opt/usb-antivirus/*.py 2>/dev/null || true
+    chmod 755 /opt/usb-antivirus
+fi
+
+# ── 4. Reconfiguration autologin avec le compte utilisateur réel ──────────────
+# Calamares crée un compte dont le nom est inconnu ici.
+# On prend le premier utilisateur non-système (uid >= 1000) hors "nobody".
+REAL_USER=$(awk -F: '$3 >= 1000 && $1 != "nobody" {print $1; exit}' /etc/passwd)
+if [ -n "$REAL_USER" ]; then
+    echo ">> Autologin → $REAL_USER"
+    # LightDM
+    if [ -f /etc/lightdm/lightdm.conf ]; then
+        sed -i "s/^autologin-user=.*/autologin-user=$REAL_USER/" \
+            /etc/lightdm/lightdm.conf
+    fi
+    # sudo sans mot de passe pour le compte installé
+    echo "$REAL_USER ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/antivirus-user
+    chmod 0440 /etc/sudoers.d/antivirus-user
+    # Autostart du scanner
+    XFCE_AS="/home/$REAL_USER/.config/autostart"
+    mkdir -p "$XFCE_AS"
+    cp /home/scanner/.config/autostart/usb-antivirus.desktop "$XFCE_AS/" \
+        2>/dev/null || true
+    chown -R "$REAL_USER:$REAL_USER" "/home/$REAL_USER/.config" 2>/dev/null || true
+    # Wrapper usb-antivirus
+    if ! [ -f /usr/local/bin/usb-antivirus ]; then
+        cat > /usr/local/bin/usb-antivirus << 'WRAPPER'
+#!/bin/bash
+exec sudo -E python3 /opt/usb-antivirus/main.py "$@"
+WRAPPER
+        chmod 755 /usr/local/bin/usb-antivirus
+    fi
+else
+    echo "⚠ Aucun utilisateur uid >= 1000 trouvé — autologin non reconfiguré"
+fi
+
+# ── 5. Auto-désactivation du service ─────────────────────────────────────────
+echo ">> Désactivation du service post-install..."
+systemctl disable antivirus-post-install.service 2>/dev/null || true
+
+echo "=== post-install.sh : terminé ==="
+POSTINSTALL
+chmod 755 config/includes.chroot/usr/lib/antivirus-installer/post-install.sh
+
+# Service systemd oneshot pour le premier démarrage après installation
+cat > config/includes.chroot/etc/systemd/system/antivirus-post-install.service << 'EOF'
+[Unit]
+Description=Configuration post-installation USB Antivirus Scanner
+After=multi-user.target
+ConditionPathExists=/usr/lib/antivirus-installer/post-install.sh
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/antivirus-installer/post-install.sh
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Activé dans le multi-user.target.wants — il se désactive lui-même après exécution
+mkdir -p config/includes.chroot/etc/systemd/system/multi-user.target.wants
+ln -sf /etc/systemd/system/antivirus-post-install.service \
+    config/includes.chroot/etc/systemd/system/multi-user.target.wants/antivirus-post-install.service
+
+ok "Script post-installation créé"
 
 # =============================================================================
 # includes.chroot – Fichiers intégrés dans l'image
@@ -1144,10 +1516,10 @@ AlgorithmicDetection yes
 Bytecode yes
 BytecodeSecurity TrustSigned
 BytecodeTimeout 60000
-MaxScanSize 100M
-MaxFileSize 25M
+MaxScanSize 0
+MaxFileSize 0
 MaxRecursion 16
-MaxFiles 10000
+MaxFiles 0
 ExcludePath ^/proc/
 ExcludePath ^/sys/
 ExcludePath ^/dev/
@@ -1235,6 +1607,23 @@ Hidden=false
 X-GNOME-Autostart-enabled=true
 EOF
 
+# Raccourci bureau : lancer l'installateur graphique Calamares
+mkdir -p "config/includes.chroot/home/scanner/Desktop"
+cat > "config/includes.chroot/home/scanner/Desktop/install-to-disk.desktop" << 'EOF'
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Installer sur le disque
+GenericName=Installer le système
+Comment=Copie le système live (ClamAV + YARA + scanner) sur un disque dur ou SSD
+Exec=sudo -E calamares
+Icon=system-software-install
+Terminal=false
+Categories=System;
+X-XFCE-Source=file:///home/scanner/Desktop/install-to-disk.desktop
+EOF
+chmod +x "config/includes.chroot/home/scanner/Desktop/install-to-disk.desktop"
+
 # Entrée menu application
 mkdir -p config/includes.chroot/usr/share/applications
 cat > config/includes.chroot/usr/share/applications/usb-antivirus.desktop << 'EOF'
@@ -1283,6 +1672,17 @@ JOURNAUX
 =============================================================================
 EOF
 
+# Règle polkit pour Calamares (lancé sans mot de passe depuis le bureau)
+mkdir -p "config/includes.chroot/etc/polkit-1/rules.d"
+cat > "config/includes.chroot/etc/polkit-1/rules.d/49-calamares.rules" << 'EOF'
+polkit.addRule(function(action, subject) {
+    if (action.id.indexOf("org.freedesktop.calamares") === 0 &&
+        subject.isInGroup("sudo")) {
+        return polkit.Result.YES;
+    }
+});
+EOF
+
 ok "Tous les fichiers de configuration générés"
 
 # =============================================================================
@@ -1329,6 +1729,13 @@ echo "  YARA        : $YR_COUNT règle(s) signature-base incluses"
 echo "  Clavier     : AZERTY (fr)"
 echo "  Autologin   : scanner  (sudo sans mot de passe)"
 echo "  Code admin  : 0000  (À CHANGER au premier démarrage !)"
+echo ""
+echo "  MODES DE DÉMARRAGE :"
+echo "    • Live   : démarre directement le scanner (mode mémoire, rien écrit)"
+echo "    • Install: icône bureau 'Installer sur le disque' → Calamares"
+echo "               copie le système live entier (ClamAV + YARA + scanner)"
+echo "               sur le disque dur. Le service antivirus-post-install"
+echo "               reconfigure le compte au premier démarrage."
 echo ""
 echo "  Pour flasher sur une clé USB :"
 echo "    sudo dd if=$ISO_NAME of=/dev/sdX bs=4M status=progress"
