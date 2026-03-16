@@ -238,6 +238,24 @@ echo ">>> [Hook TP] Début des signatures tierces ClamAV…" | tee "$LOG"
 
 # ── Fonction de téléchargement + validation ───────────────────────────────────
 # Usage : download_sig <url> <fichier> <seuil_octets>
+
+# Vérifie qu'un fichier est bien une signature ClamAV et non une page HTML/HTTP.
+# Tous les formats tiers (.ndb .hdb .hsb .ldb .cdb .db .ftm .fp .ign2) sont du
+# texte brut : leur première ligne ne commence JAMAIS par '<' ou 'HTTP'.
+_is_valid_clamav_file() {
+    local FILE="$1"
+    local HEADER
+    HEADER=$(head -c 64 "$FILE" 2>/dev/null)
+    # Rejeter les réponses HTML/HTTP/JSON (pages d'erreur servies en 200 OK)
+    case "$HEADER" in
+        '<'*|'HTTP/'*|'{"'*|'<!DOCTYPE'*|'<!doctype'*)
+            return 1 ;;
+    esac
+    # Rejeter les fichiers entièrement vides (0 octet utile)
+    [[ -n "$HEADER" ]] || return 1
+    return 0
+}
+
 download_sig() {
     local URL="$1" FNAME="$2" MIN_SIZE="$3"
     local DEST="$DB_DIR/$FNAME"
@@ -249,24 +267,31 @@ download_sig() {
         local SIZE
         SIZE=$(stat -c%s "$TMP" 2>/dev/null || echo 0)
         if [[ "$SIZE" -ge "$MIN_SIZE" ]]; then
-            # sigtool --info ne reconnaît que les .cvd/.cld (bases officielles).
-            # Pour les .ndb/.hdb/.db/.ftm tiers, la vérification de taille suffit.
             local VALID=true
-            case "$FNAME" in
-                *.cvd|*.cld)
-                    if command -v sigtool &>/dev/null; then
-                        sigtool --info "$TMP" &>/dev/null || VALID=false
-                    fi
-                    ;;
-            esac
+            # Vérification contenu : rejeter les pages HTML/erreur
+            if ! _is_valid_clamav_file "$TMP"; then
+                echo "  ⚠ $FNAME contient du HTML/HTTP — page d'erreur masquée en 200 OK" | tee -a "$LOG"
+                VALID=false
+            fi
+            # Vérification sigtool pour les bases officielles uniquement
+            if $VALID; then
+                case "$FNAME" in
+                    *.cvd|*.cld)
+                        if command -v sigtool &>/dev/null; then
+                            sigtool --info "$TMP" &>/dev/null || {
+                                echo "  ⚠ $FNAME invalide selon sigtool — ignoré" | tee -a "$LOG"
+                                VALID=false
+                            }
+                        fi
+                        ;;
+                esac
+            fi
             if $VALID; then
                 mv "$TMP" "$DEST"
                 chmod 644 "$DEST"
                 chown clamav:clamav "$DEST" 2>/dev/null || true
                 echo "  ✅ $FNAME installé (${SIZE} octets)" | tee -a "$LOG"
                 return 0
-            else
-                echo "  ⚠ $FNAME invalide selon sigtool — ignoré" | tee -a "$LOG"
             fi
         else
             echo "  ⚠ $FNAME trop petit (${SIZE} < ${MIN_SIZE} octets) — ignoré" | tee -a "$LOG"
@@ -415,35 +440,47 @@ if [[ "$TP_INSTALLED" -gt 0 ]] && command -v clamscan &>/dev/null; then
     if timeout 90 clamscan --no-summary --database="$DB_DIR" /dev/null 2>/dev/null; then
         echo ">>> [Hook TP] ✅ Base complète chargée sans erreur." | tee -a "$LOG"
     else
-        echo ">>> [Hook TP] ⚠ Un fichier tiers empêche le chargement — isolation binaire…" | tee -a "$LOG"
-        QUARANTINE="$(mktemp -d /tmp/clamav_quar_XXXXXX)"
+        echo ">>> [Hook TP] ⚠ Fichier(s) tiers problématique(s) — isolation en cours…" | tee -a "$LOG"
+        # Algorithme correct : boucle while qui recommence depuis le début après
+        # chaque suppression. Sans ça, une fois le 1er coupable supprimé, tous
+        # les fichiers suivants passent le test et sont faussement supprimés.
         CULPRITS=0
-        # Déplacer les fichiers tiers un à un ; retester à chaque fois.
-        for f in "$DB_DIR"/*.ndb "$DB_DIR"/*.hdb "$DB_DIR"/*.hsb \
-                 "$DB_DIR"/*.db  "$DB_DIR"/*.ftm "$DB_DIR"/*.ldb \
-                 "$DB_DIR"/*.cdb "$DB_DIR"/*.fp; do
-            [[ -f "$f" ]] || continue
-            FNAME=$(basename "$f")
-            mv "$f" "$QUARANTINE/"
-            if timeout 60 clamscan --no-summary --database="$DB_DIR" /dev/null 2>/dev/null; then
-                # Le retrait de ce fichier a résolu le problème : c'est le coupable.
-                echo "    ❌ $FNAME défectueux — supprimé" | tee -a "$LOG"
-                rm -f "$QUARANTINE/$FNAME"
-                CULPRITS=$((CULPRITS + 1))
-            else
-                # Pas encore résolu : remettre le fichier et continuer.
-                mv "$QUARANTINE/$FNAME" "$DB_DIR/"
+        GIVE_UP=false
+        while ! timeout 90 clamscan --no-summary --database="$DB_DIR" /dev/null 2>/dev/null; do
+            QDIR="$(mktemp -d /tmp/clamav_quar_XXXXXX)"
+            FOUND=false
+            for f in "$DB_DIR"/*.ndb "$DB_DIR"/*.hdb "$DB_DIR"/*.hsb \
+                     "$DB_DIR"/*.db  "$DB_DIR"/*.ftm "$DB_DIR"/*.ldb \
+                     "$DB_DIR"/*.cdb "$DB_DIR"/*.fp; do
+                [[ -f "$f" ]] || continue
+                BNAME=$(basename "$f")
+                mv "$f" "$QDIR/"
+                if timeout 60 clamscan --no-summary --database="$DB_DIR" /dev/null 2>/dev/null; then
+                    # Sans ce fichier ça passe : c'est lui le coupable.
+                    echo "    ❌ $BNAME défectueux — supprimé" | tee -a "$LOG"
+                    rm -f "$QDIR/$BNAME"
+                    CULPRITS=$((CULPRITS + 1))
+                    FOUND=true
+                    break   # Recommencer le while depuis zéro
+                else
+                    # Innocent : le remettre en place.
+                    mv "$QDIR/$BNAME" "$DB_DIR/"
+                fi
+            done
+            rm -rf "$QDIR"
+            if ! $FOUND; then
+                # Un tour complet sans trouver de coupable = conflit multi-fichiers
+                # irrésoluble individuellement. Purge totale des fichiers tiers.
+                echo ">>> [Hook TP] ⚠ Conflit non isolable — purge des fichiers tiers." | tee -a "$LOG"
+                find "$DB_DIR" \( -name "*.ndb" -o -name "*.hdb" -o -name "*.hsb" \
+                    -o -name "*.db" -o -name "*.ftm" -o -name "*.ldb" \
+                    -o -name "*.cdb" -o -name "*.fp" \) -delete 2>/dev/null || true
+                GIVE_UP=true
+                break
             fi
         done
-        rm -rf "$QUARANTINE"
-        if [[ "$CULPRITS" -gt 0 ]]; then
-            echo ">>> [Hook TP] ✅ Base assainie ($CULPRITS fichier(s) retiré(s))." | tee -a "$LOG"
-        else
-            echo ">>> [Hook TP] ⚠ Impossible d'isoler le fichier problématique." | tee -a "$LOG"
-            echo "    Les bases officielles seront utilisées seules." | tee -a "$LOG"
-            find "$DB_DIR" \( -name "*.ndb" -o -name "*.hdb" -o -name "*.hsb" \
-                -o -name "*.db" -o -name "*.ftm" -o -name "*.ldb" \
-                -o -name "*.cdb" -o -name "*.fp" \) -delete 2>/dev/null || true
+        if ! $GIVE_UP; then
+            echo ">>> [Hook TP] ✅ Base assainie — $CULPRITS fichier(s) retiré(s)." | tee -a "$LOG"
         fi
     fi
 fi
@@ -698,26 +735,42 @@ find /var/lib/clamav \( -name "*.ndb" -o -name "*.hdb" -o -name "*.hsb" \
     -o -name "*.db" -o -name "*.ftm" -o -name "*.ldb" \
     -o -name "*.cdb" -o -name "*.fp" \) 2>/dev/null \
     | xargs chmod 644 2>/dev/null || true
-# Validation au moment du hook permissions
-# Même logique que le hook 0150 : jamais de test sur fichier unique.
+# Validation au moment du hook permissions — même algorithme que le hook 0150.
+# Boucle while : recommence depuis zéro après chaque suppression pour éviter
+# de faussement supprimer des fichiers innocents.
 if command -v clamscan &>/dev/null; then
     if ! clamscan --no-summary --database=/var/lib/clamav /dev/null &>/dev/null; then
-        echo ">>> [Hook Perms] ⚠ Base invalide — isolation binaire des fichiers tiers…"
-        QDIR="$(mktemp -d /tmp/clamav_perms_quar_XXXXXX)"
-        for f in /var/lib/clamav/*.ndb /var/lib/clamav/*.hdb /var/lib/clamav/*.hsb \
-                 /var/lib/clamav/*.db  /var/lib/clamav/*.ftm /var/lib/clamav/*.ldb \
-                 /var/lib/clamav/*.cdb /var/lib/clamav/*.fp; do
-            [ -f "$f" ] || continue
-            BNAME=$(basename "$f")
-            mv "$f" "$QDIR/"
-            if clamscan --no-summary --database=/var/lib/clamav /dev/null &>/dev/null; then
-                echo "    Suppression : $BNAME (coupable)"
-                rm -f "$QDIR/$BNAME"
-            else
-                mv "$QDIR/$BNAME" /var/lib/clamav/
+        echo ">>> [Hook Perms] ⚠ Base invalide — isolation en cours…"
+        CULPRITS_P=0
+        while ! clamscan --no-summary --database=/var/lib/clamav /dev/null &>/dev/null; do
+            QDIR="$(mktemp -d /tmp/clamav_perms_quar_XXXXXX)"
+            FOUND_P=false
+            for f in /var/lib/clamav/*.ndb /var/lib/clamav/*.hdb /var/lib/clamav/*.hsb \
+                     /var/lib/clamav/*.db  /var/lib/clamav/*.ftm /var/lib/clamav/*.ldb \
+                     /var/lib/clamav/*.cdb /var/lib/clamav/*.fp; do
+                [ -f "$f" ] || continue
+                BNAME=$(basename "$f")
+                mv "$f" "$QDIR/"
+                if clamscan --no-summary --database=/var/lib/clamav /dev/null &>/dev/null; then
+                    echo "    Suppression : $BNAME (coupable)"
+                    rm -f "$QDIR/$BNAME"
+                    CULPRITS_P=$((CULPRITS_P + 1))
+                    FOUND_P=true
+                    break
+                else
+                    mv "$QDIR/$BNAME" /var/lib/clamav/
+                fi
+            done
+            rm -rf "$QDIR"
+            if ! $FOUND_P; then
+                echo ">>> [Hook Perms] ⚠ Conflit non isolable — purge des fichiers tiers."
+                find /var/lib/clamav \( -name "*.ndb" -o -name "*.hdb" -o -name "*.hsb" \
+                    -o -name "*.db" -o -name "*.ftm" -o -name "*.ldb" \
+                    -o -name "*.cdb" -o -name "*.fp" \) -delete 2>/dev/null || true
+                break
             fi
         done
-        rm -rf "$QDIR"
+        [ "$CULPRITS_P" -gt 0 ] && echo ">>> [Hook Perms] ✅ Base assainie ($CULPRITS_P fichier(s) retiré(s))."
     fi
 fi
 
@@ -840,7 +893,20 @@ systemctl start clamav-freshclam 2>/dev/null || true
 # ── Signatures tierces ClamAV : pré-téléchargement sur la machine de build ────
 step "Téléchargement des signatures tierces ClamAV (machine de build)..."
 
-# Fonction de téléchargement HTTP avec log d'erreur visible
+# ── Helpers de téléchargement et de validation de contenu ────────────────────
+# Vérifie qu'un fichier est bien une signature ClamAV (texte brut) et non
+# une page HTML/HTTP retournée en 200 OK à la place du fichier réel.
+_is_valid_clamav_file() {
+    local FILE="$1"
+    local HEADER
+    HEADER=$(head -c 64 "$FILE" 2>/dev/null)
+    case "$HEADER" in
+        '<'*|'HTTP/'*|'{"'*|'<!DOCTYPE'*|'<!doctype'*) return 1 ;;
+    esac
+    [[ -n "$HEADER" ]] || return 1
+    return 0
+}
+
 _dl_tp() {
     local URL="$1" DEST="$2" MIN="$3"
     local TMP FNAME WGETLOG
@@ -851,6 +917,11 @@ _dl_tp() {
     if wget --timeout=30 --tries=2 -O "$TMP" "$URL" 2>"$WGETLOG"; then
         local SZ; SZ=$(stat -c%s "$TMP" 2>/dev/null || echo 0)
         if [[ "$SZ" -ge "$MIN" ]]; then
+            if ! _is_valid_clamav_file "$TMP"; then
+                warn "$FNAME : page HTML reçue à la place du fichier (200 OK trompeur) — ignoré"
+                rm -f "$TMP" "$WGETLOG"
+                return 1
+            fi
             mv "$TMP" "$DEST"; chmod 644 "$DEST"
             ok "$FNAME inclus ($(du -h "$DEST" | cut -f1))"
         else
