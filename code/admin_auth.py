@@ -186,7 +186,8 @@ class AdminPanel:
         # Avast
         on_update_avast_vps_online: Callable,
         on_import_avast_vps_usb:   Callable,
-        on_import_avast_license_usb: Callable,
+        on_import_avast_license_usb:  Callable,
+        on_import_avast_license_file: Callable,
         on_activate_avast_code:    Callable,
         on_refresh_avast_status:   Callable,
         # YARA
@@ -204,6 +205,7 @@ class AdminPanel:
             "avast_vps_online":      on_update_avast_vps_online,
             "avast_vps_usb":         on_import_avast_vps_usb,
             "avast_license_usb":     on_import_avast_license_usb,
+            "avast_license_file":    on_import_avast_license_file,
             "avast_activate":        on_activate_avast_code,
             "avast_refresh":         on_refresh_avast_status,
             "yara_online":           on_update_yara_online,
@@ -304,7 +306,7 @@ class AdminPanel:
         tab = ttk.Frame(nb, padding=16)
         nb.add(tab, text="🔐 Avast")
 
-        ttk.Label(tab, text="Gestion d'Avast for Linux",
+        ttk.Label(tab, text="Gestion d'Avast Business for Linux",
                   font=("Arial", 11, "bold")).pack(anchor=tk.W, pady=(0, 4))
 
         # ── Statut ────────────────────────────────────────────────────────────
@@ -323,18 +325,20 @@ class AdminPanel:
         self._refresh_avast_status_display()
 
         # ── Licence ───────────────────────────────────────────────────────────
-        lic_frame = ttk.LabelFrame(tab, text="Licence", padding=8)
+        lic_frame = ttk.LabelFrame(tab, text="Licence Business", padding=8)
         lic_frame.pack(fill=tk.X, pady=(0, 8))
 
+        # ── Sous-section A : code d'activation ───────────────────────────────
         ttk.Label(
             lic_frame,
-            text="Code d'activation (requiert Internet) :",
-            foreground="#444"
-        ).grid(row=0, column=0, sticky=tk.W, pady=2)
+            text="A — Code d'activation (Internet requis) :"
+                 "   Requiert le paquet avast-license (outil avastlic).",
+            justify=tk.LEFT, foreground="#444"
+        ).grid(row=0, column=0, columnspan=3, sticky=tk.W, pady=(0, 4))
 
         code_var = tk.StringVar()
         code_entry = ttk.Entry(lic_frame, textvariable=code_var,
-                               width=32, font=("Courier", 10))
+                               width=30, font=("Courier", 10))
         code_entry.grid(row=1, column=0, sticky=tk.W, pady=2, padx=(0, 6))
 
         def _activate():
@@ -342,29 +346,83 @@ class AdminPanel:
             if not code:
                 messagebox.showwarning(
                     "Code vide",
-                    "Entrez un code d'activation Avast.",
+                    "Entrez un code d'activation Avast Business.",
                     parent=tab.winfo_toplevel()
                 )
                 return
             self._cb["avast_activate"](code)
 
         ttk.Button(lic_frame, text="🔑  Activer",
-                   command=_activate, width=14).grid(row=1, column=1, padx=4)
+                   command=_activate, width=13).grid(row=1, column=1, padx=4)
 
         ttk.Separator(lic_frame, orient=tk.HORIZONTAL).grid(
-            row=2, column=0, columnspan=2, sticky=tk.EW, pady=8
+            row=2, column=0, columnspan=3, sticky=tk.EW, pady=8
         )
 
+        # ── Sous-section B : import USB ───────────────────────────────────────
         ttk.Label(
             lic_frame,
-            text="Hors-ligne : importez le fichier license.avastlic\n"
-                 "depuis la racine d'une clé USB.",
+            text="B — Fichier license.avastlic depuis une clé USB :",
             justify=tk.LEFT, foreground="#444"
-        ).grid(row=3, column=0, columnspan=2, sticky=tk.W)
+        ).grid(row=3, column=0, columnspan=3, sticky=tk.W, pady=(0, 4))
 
-        ttk.Button(lic_frame, text="🔌  Importer licence (USB)",
+        ttk.Button(lic_frame, text="🔌  Importer depuis USB",
                    command=self._cb["avast_license_usb"],
-                   width=26).grid(row=4, column=0, sticky=tk.W, pady=(4, 0))
+                   width=24).grid(row=4, column=0, sticky=tk.W, pady=(0, 4))
+
+        ttk.Separator(lic_frame, orient=tk.HORIZONTAL).grid(
+            row=5, column=0, columnspan=3, sticky=tk.EW, pady=8
+        )
+
+        # ── Sous-section C : parcourir le système de fichiers ─────────────────
+        ttk.Label(
+            lic_frame,
+            text="C — Fichier license.avastlic depuis le système de fichiers :",
+            justify=tk.LEFT, foreground="#444"
+        ).grid(row=6, column=0, columnspan=3, sticky=tk.W, pady=(0, 4))
+
+        self._avast_lic_path_var = tk.StringVar(value="Aucun fichier sélectionné")
+        ttk.Label(lic_frame, textvariable=self._avast_lic_path_var,
+                  foreground="navy", font=("Courier", 8),
+                  wraplength=360).grid(row=7, column=0, columnspan=2,
+                                       sticky=tk.W, pady=2)
+
+        def _browse_license():
+            from tkinter import filedialog
+            path = filedialog.askopenfilename(
+                parent=tab.winfo_toplevel(),
+                title="Sélectionner le fichier de licence Avast",
+                filetypes=[("Licence Avast", "*.avastlic"),
+                           ("Tous les fichiers", "*.*")],
+                initialdir=os.path.expanduser("~"),
+            )
+            if path:
+                self._avast_lic_path_var.set(path)
+
+        def _import_browsed():
+            path = self._avast_lic_path_var.get()
+            if not path or path == "Aucun fichier sélectionné":
+                messagebox.showwarning(
+                    "Aucun fichier",
+                    "Utilisez 'Parcourir…' pour sélectionner un fichier .avastlic.",
+                    parent=tab.winfo_toplevel()
+                )
+                return
+            if not os.path.isfile(path):
+                messagebox.showerror(
+                    "Fichier introuvable",
+                    f"Le fichier n'existe pas :\n{path}",
+                    parent=tab.winfo_toplevel()
+                )
+                return
+            self._cb["avast_license_file"](path)
+
+        btn_row = ttk.Frame(lic_frame)
+        btn_row.grid(row=8, column=0, columnspan=3, sticky=tk.W, pady=(2, 0))
+        ttk.Button(btn_row, text="📂  Parcourir…",
+                   command=_browse_license, width=16).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(btn_row, text="⬇  Installer ce fichier",
+                   command=_import_browsed, width=20).pack(side=tk.LEFT)
 
         # ── Base VPS ──────────────────────────────────────────────────────────
         vps_frame = ttk.LabelFrame(tab, text="Base VPS (définitions de virus)", padding=8)
@@ -391,15 +449,16 @@ class AdminPanel:
             eng = ScanEngine()
             if not eng.is_avast_installed():
                 self._avast_status_var.set(
-                    "❌ Avast non installé\n"
-                    "   apt install avast  (dépôt repo.avcdn.net requis)"
+                    "❌ Avast Business non installé\n"
+                    "   Dépôt : https://repo.avcdn.net\n"
+                    "   Licence requise : https://www.avast.com/business/linux"
                 )
                 return
             if not eng.is_avast_licensed():
                 self._avast_status_var.set(
-                    "✅ Avast installé\n"
-                    "⚠  Aucune licence — utilisez les boutons ci-dessous\n"
-                    "   pour activer via un code ou importer un fichier .avastlic"
+                    "✅ Avast Business installé\n"
+                    "⚠  Licence requise pour scanner — sans licence Avast\n"
+                    "   refusera les scans (code 126). Activez via les boutons."
                 )
                 return
             from config import AVAST_LICENSE_PATH
@@ -410,8 +469,8 @@ class AdminPanel:
             except OSError:
                 date = "?"
             self._avast_status_var.set(
-                f"✅ Avast installé et licencié\n"
-                f"   Licence importée le : {date}"
+                f"✅ Avast Business installé et licencié\n"
+                f"   Licence active depuis le : {date}"
             )
         except Exception as e:
             self._avast_status_var.set(f"Erreur de vérification : {e}")

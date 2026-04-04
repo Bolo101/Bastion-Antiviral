@@ -77,6 +77,66 @@ deb http://deb.debian.org/debian bookworm main contrib non-free non-free-firmwar
 deb-src http://deb.debian.org/debian bookworm main contrib non-free non-free-firmware
 EOF
 
+# ── Dépôt Avast (sources persistantes dans l'image finale) ───────────────────
+# Procédure officielle Avast Business for Linux :
+#   1. Clé stockée en ASCII armored (.asc) via curl | tee  (PAS gpg --dearmor)
+#   2. DIST détecté automatiquement — debian-bookworm supporté nativement
+#   3. signed-by pointe sur le fichier .asc
+# live-build copie config/archives/*.list.chroot → /etc/apt/sources.list.d/
+# Le hook 0250 gère la clé .asc directement (plus fiable que *.key.chroot).
+step "Configuration du dépôt Avast (config/archives)..."
+
+AVAST_GPG_URL="https://repo.avcdn.net/linux-av/doc/avast-gpg-key.asc"
+AVAST_KEY_DEST="/etc/apt/trusted.gpg.d/avast.asc"   # ASCII armored, pas binaire
+
+# Détection de la distribution (identique à la procédure officielle Avast)
+AVAST_DIST=$(. /etc/os-release 2>/dev/null; echo "${ID}-${VERSION_CODENAME}" 2>/dev/null || echo "debian-bookworm")
+
+# Vérifie que le dépôt Avast supporte cette distribution
+case "$AVAST_DIST" in
+    debian-buster|debian-bullseye|debian-bookworm|    ubuntu-bionic|ubuntu-focal|ubuntu-jammy|ubuntu-noble)
+        ok "Distribution Avast supportée : $AVAST_DIST" ;;
+    *)
+        warn "Distribution '$AVAST_DIST' non reconnue — utilisation de debian-bookworm"
+        AVAST_DIST="debian-bookworm" ;;
+esac
+
+# Pré-téléchargement de la clé pour s'assurer qu'elle est disponible au build
+# Note : la clé est téléchargée en ASCII armored (.asc) — format recommandé par Avast
+TMP_ASC="$(mktemp /tmp/avast_key_XXXXXX.asc)"
+if curl -fsSL --max-time 30 --retry 2 "$AVAST_GPG_URL" -o "$TMP_ASC" 2>/dev/null    && [[ -s "$TMP_ASC" ]]; then
+    # Vérification basique que c'est bien une clé GPG ASCII armored
+    if grep -q "BEGIN PGP PUBLIC KEY BLOCK" "$TMP_ASC" 2>/dev/null; then
+        ok "Clé GPG Avast vérifiée (ASCII armored)"
+        # Le hook 0250 installera cette clé via curl | tee (procédure officielle)
+    else
+        warn "Fichier téléchargé ne ressemble pas à une clé GPG — le hook tentera quand même"
+    fi
+
+    # .list.chroot : sera placé dans /etc/apt/sources.list.d/avast.list dans l'image
+    cat > config/archives/avast.list.chroot << AVAST_LIST
+# Avast Business Antivirus for Linux
+# Dépôt officiel     : https://repo.avcdn.net
+# Clé ASCII armored  : $AVAST_KEY_DEST
+# Distribution       : $AVAST_DIST
+deb [signed-by=$AVAST_KEY_DEST] https://repo.avcdn.net/linux-av/deb $AVAST_DIST release
+AVAST_LIST
+    ok "Dépôt Avast → config/archives/avast.list.chroot ($AVAST_DIST)"
+    rm -f "$TMP_ASC"
+else
+    warn "Impossible de joindre repo.avcdn.net — dépôt Avast non préconfigurés"
+    warn "Le hook 0250 tentera l'installation au moment du build (connexion requise)"
+    warn "Installation manuelle post-déploiement :"
+    warn "  curl -s https://repo.avcdn.net/linux-av/doc/avast-gpg-key.asc \"
+    warn "    | sudo tee /etc/apt/trusted.gpg.d/avast.asc"
+    warn "  echo 'deb [signed-by=/etc/apt/trusted.gpg.d/avast.asc]"
+    warn "    https://repo.avcdn.net/linux-av/deb \$(. /etc/os-release;"
+    warn "    echo \$ID-\$VERSION_CODENAME) release' \"
+    warn "    | sudo tee /etc/apt/sources.list.d/avast.list"
+    warn "  sudo apt update && sudo apt install avast avast-fss avast-rest avast-license"
+    rm -f "$TMP_ASC"
+fi
+
 # ── Liste des paquets ─────────────────────────────────────────────────────────
 step "Définition des paquets..."
 mkdir -p config/package-lists
@@ -221,199 +281,208 @@ chmod +x config/hooks/normal/0100-clamav-db.hook.chroot
 ok "Hook ClamAV créé"
 
 # ── Hook 1.5 : signatures tierces ClamAV ─────────────────────────────────────
-step "Création du hook signatures tierces ClamAV..."
+step "Création du hook signatures tierces ClamAV (validation par fichier)..."
 cat > config/hooks/normal/0150-clamav-thirdparty.hook.chroot << 'HOOK'
 #!/bin/bash
 # =============================================================================
 # Hook 0150 – Téléchargement des signatures tierces ClamAV
 #
-# Sources intégrées :
+# Stratégie de validation : chaque fichier est validé immédiatement après
+# son installation dans DB_DIR en testant le RÉPERTOIRE COMPLET avec clamscan.
+# Si l'ajout du fichier casse le chargement, il est supprimé avant de passer
+# au suivant. Cela élimine les conflits dès leur apparition sans algorithme
+# d'isolation post-hoc.
+#
+# Sources :
 #   Sanesecurity  – phishing, malwares, spam (màj horaire)
 #   InterServer   – signatures généralistes
 #   URLhaus       – URLs malveillantes actives (abuse.ch)
-#
-# Toutes les signatures sont déposées dans /var/lib/clamav/ aux côtés des
-# bases officielles. ClamAV les charge automatiquement depuis ce répertoire.
-# Un fichier corrompu ou trop petit est supprimé : clamscan doit pouvoir
-# démarrer même si un téléchargement échoue.
 # =============================================================================
-set -uo pipefail      # pas de -e : on ne veut pas stopper sur un wget raté
+set -uo pipefail   # pas de -e : on ne bloque pas le build sur un wget raté
 
 DB_DIR="/var/lib/clamav"
 LOG="/var/log/clamav-thirdparty.log"
 mkdir -p "$DB_DIR"
 
+TP_OK=0
+TP_SKIP=0
+
 echo ">>> [Hook TP] Début des signatures tierces ClamAV…" | tee "$LOG"
 
-# ── Fonction de téléchargement + validation ───────────────────────────────────
-# Usage : download_sig <url> <fichier> <seuil_octets>
+# ── Détection clamscan ────────────────────────────────────────────────────────
+if ! command -v clamscan &>/dev/null; then
+    echo ">>> [Hook TP] clamscan introuvable — validation impossible, skip." | tee -a "$LOG"
+    exit 0
+fi
 
-# Vérifie qu'un fichier est bien une signature ClamAV et non une page HTML/HTTP.
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+# Vérifie qu'un fichier est une signature ClamAV valide et non une page HTML.
 # Tous les formats tiers (.ndb .hdb .hsb .ldb .cdb .db .ftm .fp .ign2) sont du
-# texte brut : leur première ligne ne commence JAMAIS par '<' ou 'HTTP'.
-_is_valid_clamav_file() {
+# texte brut : leur première ligne ne commence jamais par '<' ou 'HTTP'.
+_is_valid_content() {
     local FILE="$1"
     local HEADER
     HEADER=$(head -c 64 "$FILE" 2>/dev/null)
-    # Rejeter les réponses HTML/HTTP/JSON (pages d'erreur servies en 200 OK)
     case "$HEADER" in
-        '<'*|'HTTP/'*|'{"'*|'<!DOCTYPE'*|'<!doctype'*)
-            return 1 ;;
+        '<'*|'HTTP/'*|'{"'*|'<!DOCTYPE'*|'<!doctype'*) return 1 ;;
     esac
-    # Rejeter les fichiers entièrement vides (0 octet utile)
     [[ -n "$HEADER" ]] || return 1
     return 0
 }
 
-download_sig() {
-    local URL="$1" FNAME="$2" MIN_SIZE="$3"
+# _db_ok : teste que le RÉPERTOIRE COMPLET se charge sans erreur (timeout 60s).
+# Utilise /dev/null comme cible de scan fictive — code 0 ou 1 = base OK.
+_db_ok() {
+    local OUT
+    OUT=$(timeout 60 clamscan --no-summary --database="$DB_DIR" /dev/null 2>&1)
+    local RC=$?
+    # rc=0 propre, rc=1 détection (normal sur /dev/null parfois), rc=2 erreur base
+    if [[ $RC -eq 2 ]]; then
+        # Cherche des erreurs réelles de chargement de base dans la sortie
+        if echo "$OUT" | grep -qiE "error loading|can't load|invalid|corrupt|can't open"; then
+            return 1
+        fi
+    fi
+    return 0
+}
+
+# install_and_validate <url> <fname> <min_bytes>
+# Télécharge, vérifie le contenu, installe dans DB_DIR, valide la base complète.
+# Supprime le fichier si la validation échoue. Retourne 0 si installé, 1 sinon.
+install_and_validate() {
+    local URL="$1" FNAME="$2" MIN_SIZE="${3:-64}"
     local DEST="$DB_DIR/$FNAME"
     local TMP
     TMP="$(mktemp /tmp/clamtp_XXXXXX)"
 
-    echo "  Téléchargement de $FNAME …" | tee -a "$LOG"
-    if wget -q --timeout=30 --tries=3 -O "$TMP" "$URL" 2>>"$LOG"; then
-        local SIZE
-        SIZE=$(stat -c%s "$TMP" 2>/dev/null || echo 0)
-        if [[ "$SIZE" -ge "$MIN_SIZE" ]]; then
-            local VALID=true
-            # Vérification contenu : rejeter les pages HTML/erreur
-            if ! _is_valid_clamav_file "$TMP"; then
-                echo "  ⚠ $FNAME contient du HTML/HTTP — page d'erreur masquée en 200 OK" | tee -a "$LOG"
-                VALID=false
-            fi
-            # Vérification sigtool pour les bases officielles uniquement
-            if $VALID; then
-                case "$FNAME" in
-                    *.cvd|*.cld)
-                        if command -v sigtool &>/dev/null; then
-                            sigtool --info "$TMP" &>/dev/null || {
-                                echo "  ⚠ $FNAME invalide selon sigtool — ignoré" | tee -a "$LOG"
-                                VALID=false
-                            }
-                        fi
-                        ;;
-                esac
-            fi
-            if $VALID; then
-                mv "$TMP" "$DEST"
-                chmod 644 "$DEST"
-                chown clamav:clamav "$DEST" 2>/dev/null || true
-                echo "  ✅ $FNAME installé (${SIZE} octets)" | tee -a "$LOG"
-                return 0
-            fi
-        else
-            echo "  ⚠ $FNAME trop petit (${SIZE} < ${MIN_SIZE} octets) — ignoré" | tee -a "$LOG"
-        fi
-    else
-        echo "  ⚠ Échec téléchargement $FNAME (réseau ?)" | tee -a "$LOG"
+    echo "  ⬇  $FNAME …" | tee -a "$LOG"
+
+    if ! wget -q --timeout=30 --tries=3 -O "$TMP" "$URL" 2>>"$LOG"; then
+        echo "  ⚠ $FNAME : échec réseau — ignoré" | tee -a "$LOG"
+        rm -f "$TMP"; return 1
     fi
-    rm -f "$TMP"
-    return 1
+
+    local SIZE
+    SIZE=$(stat -c%s "$TMP" 2>/dev/null || echo 0)
+
+    if [[ "$SIZE" -lt "$MIN_SIZE" ]]; then
+        echo "  ⚠ $FNAME : fichier trop petit (${SIZE} < ${MIN_SIZE} o) — ignoré" | tee -a "$LOG"
+        rm -f "$TMP"; return 1
+    fi
+
+    if ! _is_valid_content "$TMP"; then
+        echo "  ⚠ $FNAME : contenu invalide (HTML/erreur serveur) — ignoré" | tee -a "$LOG"
+        rm -f "$TMP"; return 1
+    fi
+
+    # Installer dans DB_DIR
+    mv "$TMP" "$DEST"
+    chmod 644 "$DEST"
+    chown clamav:clamav "$DEST" 2>/dev/null || true
+
+    # Valider la base COMPLÈTE avec ce fichier en place
+    if _db_ok; then
+        echo "  ✅ $FNAME installé et validé (${SIZE} o)" | tee -a "$LOG"
+        TP_OK=$((TP_OK + 1))
+        return 0
+    else
+        echo "  ⚠ $FNAME incompatible avec la base (conflit de format) — supprimé" | tee -a "$LOG"
+        rm -f "$DEST"
+        TP_SKIP=$((TP_SKIP + 1))
+        return 1
+    fi
 }
 
 # ── Sanesecurity ──────────────────────────────────────────────────────────────
-# Distribution officielle : rsync://rsync.sanesecurity.net/sanesecurity
-# Fallback HTTP : http://ftp.swin.edu.au/sanesecurity/ (miroir Swinburne Univ.)
-# NB : malware.expert.db/.hdb retirés (absents de la liste officielle).
-# Signatures incluses : uniquement celles listées sur sanesecurity.com/usage/signatures/
+# Liste des signatures validées depuis https://sanesecurity.com/usage/signatures/
+# Chaque fichier est téléchargé et validé individuellement — les conflits sont
+# éliminés au fur et à mesure sans purge globale.
 echo ">>> [Hook TP] Sanesecurity…" | tee -a "$LOG"
 
-# Liste complète établie depuis https://mirror.ihost.md/?dir=clamav/sanesecurity
-# NB : ne pas utiliser winnow_phish_complete.ndb ET winnow_phish_complete_url.ndb ensemble.
-#      On prend la variante _url (URLs complètes, FP plus faible).
 SANE_FILES=(
-    # Requis
     sanesecurity.ftm  sigwhitelist.ign2
-    # Sanesecurity propres
     junk.ndb    jurlbl.ndb   jurlbla.ndb  lott.ndb
     phish.ndb   rogue.hdb    scam.ndb     blurl.ndb
     spamimg.hdb spamattach.hdb spam.ldb   shelter.ldb
     spear.ndb   spearl.ndb   badmacro.ndb
     malwarehash.hsb   hackingteam.hsb
-    # Foxhole
     foxhole_generic.cdb  foxhole_filename.cdb  foxhole_js.cdb
     foxhole_js.ndb       foxhole_all.cdb        foxhole_all.ndb
     foxhole_mail.cdb     foxhole_links.ldb
-    # MiscreantPunch
     MiscreantPunch099-Low.ldb  MiscreantPunch099-INFO-Low.ldb
-    # Porcupine
     porcupine.ndb  phishtank.ndb  porcupine.hsb
-    # bofhland
     bofhland_cracked_URL.ndb   bofhland_malware_URL.ndb
     bofhland_phishing_URL.ndb  bofhland_malware_attach.hdb
-    # OITC winnow (winnow_phish_complete_url seul, pas les deux variantes)
     winnow_malware.hdb           winnow_malware_links.ndb
     winnow_spam_complete.ndb     winnow_phish_complete_url.ndb
     winnow.complex.patterns.ldb  winnow_extended_malware.hdb
     winnow_extended_malware_links.ndb  winnow.attachments.hdb
-    # doppelstern / crdfam / scamnailer / malware.expert
     doppelstern.ndb   doppelstern.hdb   doppelstern-phishtank.ndb
     crdfam.clamav.hdb scamnailer.ndb
     malware.expert.ndb  malware.expert.hdb  malware.expert.ldb
     malware.expert.fp
 )
 
-SANE_OK=false
+SANE_BASE_URL=""
 
-# Méthode 1 : rsync (méthode officielle recommandée par sanesecurity.com)
-# --no-recursive : copie uniquement les fichiers du répertoire racine du module.
-# Sans --no-recursive les filtres --include peuvent être silencieusement ignorés.
+# Méthode 1 : rsync (méthode officielle Sanesecurity — copie d'abord dans un dossier temp,
+# puis validation individuelle de chaque fichier avant installation définitive)
 if command -v rsync &>/dev/null; then
-    echo "  Tentative rsync://rsync.sanesecurity.net/sanesecurity …" | tee -a "$LOG"
+    echo "  rsync://rsync.sanesecurity.net/sanesecurity …" | tee -a "$LOG"
     RSYNC_TMP="$(mktemp -d /tmp/sanesec_rsync_XXXXXX)"
     if rsync --timeout=30 --contimeout=15 --no-recursive -q \
-        rsync://rsync.sanesecurity.net/sanesecurity/ "$RSYNC_TMP/" \
-        2>>"$LOG"; then
-        RSYNC_COUNT=$(ls "$RSYNC_TMP" 2>/dev/null | wc -l)
-        if [[ "$RSYNC_COUNT" -gt 0 ]]; then
-            for fname in "${SANE_FILES[@]}"; do
-                if [[ -f "$RSYNC_TMP/$fname" ]]; then
-                    SZ=$(stat -c%s "$RSYNC_TMP/$fname" 2>/dev/null || echo 0)
-                    if [[ "$SZ" -ge 64 ]]; then
-                        mv "$RSYNC_TMP/$fname" "$DB_DIR/$fname"
-                        chmod 644 "$DB_DIR/$fname"
-                        chown clamav:clamav "$DB_DIR/$fname" 2>/dev/null || true
+        rsync://rsync.sanesecurity.net/sanesecurity/ "$RSYNC_TMP/" 2>>"$LOG" \
+       && [[ $(ls "$RSYNC_TMP" 2>/dev/null | wc -l) -gt 0 ]]; then
+        echo "  rsync OK — validation individuelle de chaque fichier…" | tee -a "$LOG"
+        for fname in "${SANE_FILES[@]}"; do
+            if [[ -f "$RSYNC_TMP/$fname" ]]; then
+                SZ=$(stat -c%s "$RSYNC_TMP/$fname" 2>/dev/null || echo 0)
+                if [[ "$SZ" -ge 64 ]] && _is_valid_content "$RSYNC_TMP/$fname"; then
+                    DEST="$DB_DIR/$fname"
+                    cp "$RSYNC_TMP/$fname" "$DEST"
+                    chmod 644 "$DEST"; chown clamav:clamav "$DEST" 2>/dev/null || true
+                    if _db_ok; then
                         echo "  ✅ $fname (rsync, ${SZ}o)" | tee -a "$LOG"
+                        TP_OK=$((TP_OK + 1))
+                    else
+                        echo "  ⚠ $fname incompatible — supprimé" | tee -a "$LOG"
+                        rm -f "$DEST"
+                        TP_SKIP=$((TP_SKIP + 1))
                     fi
                 fi
-            done
-            SANE_OK=true
-            echo "  ✅ Sanesecurity rsync OK ($RSYNC_COUNT fichiers reçus)" | tee -a "$LOG"
-        else
-            echo "  ⚠ rsync exit 0 mais 0 fichier — fallback HTTP" | tee -a "$LOG"
-        fi
+            fi
+        done
+        SANE_BASE_URL="rsync"
     else
-        echo "  ⚠ rsync Sanesecurity inaccessible." | tee -a "$LOG"
+        echo "  ⚠ rsync Sanesecurity inaccessible — fallback HTTP" | tee -a "$LOG"
     fi
     rm -rf "$RSYNC_TMP"
 fi
 
-# Méthode 2 : HTTP (mirror.ihost.md — miroir public vérifié)
-if ! $SANE_OK; then
+# Méthode 2 : HTTP fallback
+if [[ -z "$SANE_BASE_URL" ]]; then
     echo "  Fallback HTTP Sanesecurity…" | tee -a "$LOG"
     for SANE_HTTP in \
         "https://mirror.ihost.md/clamav/sanesecurity" \
         "https://ftp.swin.edu.au/sanesecurity"; do
         if wget --timeout=15 --tries=1 -q --spider "$SANE_HTTP/sanesecurity.ftm" 2>/dev/null; then
-            SANE_OK=true
+            SANE_BASE_URL="$SANE_HTTP"
             echo "  Miroir joignable : $SANE_HTTP" | tee -a "$LOG"
             for fname in "${SANE_FILES[@]}"; do
-                download_sig "$SANE_HTTP/$fname" "$fname" 64 || true
+                install_and_validate "$SANE_HTTP/$fname" "$fname" 64 || true
             done
             break
-        else
-            echo "  ⚠ $SANE_HTTP inaccessible" | tee -a "$LOG"
         fi
     done
 fi
 
-$SANE_OK || echo "  ⚠ Aucune source Sanesecurity joignable." | tee -a "$LOG"
+[[ -n "$SANE_BASE_URL" ]] || echo "  ⚠ Sanesecurity inaccessible — ignoré." | tee -a "$LOG"
 
-# ── InterServer (nouvelle URL — sigs.interserver.net) ─────────────────────────
+# ── InterServer ───────────────────────────────────────────────────────────────
 echo ">>> [Hook TP] InterServer…" | tee -a "$LOG"
-download_sig "http://sigs.interserver.net/interserver256.hdb" "interserver256.hdb" 500 || true
-download_sig "http://sigs.interserver.net/topline.db"          "topline.db"          500 || true
+install_and_validate "http://sigs.interserver.net/interserver256.hdb" "interserver256.hdb" 500 || true
+install_and_validate "http://sigs.interserver.net/topline.db"          "topline.db"          500 || true
 
 # ── URLhaus (abuse.ch) ────────────────────────────────────────────────────────
 echo ">>> [Hook TP] URLhaus…" | tee -a "$LOG"
@@ -421,88 +490,33 @@ URLHAUS_OK=false
 for _url in \
     "https://urlhaus.abuse.ch/downloads/urlhaus.ndb" \
     "https://curbengh.github.io/malware-filter/urlhaus-filter-clam.ndb"; do
-    if download_sig "$_url" "urlhaus-filter.ndb" 1000; then
+    if install_and_validate "$_url" "urlhaus-filter.ndb" 1000; then
         URLHAUS_OK=true; break
     fi
 done
-$URLHAUS_OK || echo "  ⚠ URLhaus inaccessible — signature ignorée." | tee -a "$LOG"
+$URLHAUS_OK || echo "  ⚠ URLhaus inaccessible — ignoré." | tee -a "$LOG"
 
-
-# ── Bilan et test de chargement ───────────────────────────────────────────────
-TP_INSTALLED=$(find "$DB_DIR" \( \
-    -name "*.ndb" -o -name "*.hdb" -o -name "*.hsb" \
-    -o -name "*.db"  -o -name "*.ftm" -o -name "*.ldb" \
-    -o -name "*.cdb" -o -name "*.fp" \
-    \) 2>/dev/null | wc -l)
-echo ">>> [Hook TP] $TP_INSTALLED fichier(s) tiers installé(s)." | tee -a "$LOG"
-
-# Validation uniquement si des fichiers tiers sont présents.
-# IMPORTANT : on ne teste JAMAIS chaque fichier tiers en isolation :
-#   clamscan --database="fichier_unique.ndb" échoue systématiquement
-#   sans les bases officielles chargées en parallèle (code 2, faux positif).
-# Stratégie : test du répertoire complet (officiel + tiers). Si ça échoue,
-#   isolation binaire — on déplace les fichiers tiers un à un hors du DB_DIR
-#   et on reteste le répertoire complet. Quand le test repasse, le dernier
-#   fichier déplacé est le coupable ; on le supprime et on remet les autres.
-if [[ "$TP_INSTALLED" -gt 0 ]] && command -v clamscan &>/dev/null; then
-    echo ">>> [Hook TP] Validation base complète (timeout 90s)…" | tee -a "$LOG"
-    if timeout 90 clamscan --no-summary --database="$DB_DIR" /dev/null 2>/dev/null; then
-        echo ">>> [Hook TP] ✅ Base complète chargée sans erreur." | tee -a "$LOG"
-    else
-        echo ">>> [Hook TP] ⚠ Fichier(s) tiers problématique(s) — isolation en cours…" | tee -a "$LOG"
-        # Algorithme correct : boucle while qui recommence depuis le début après
-        # chaque suppression. Sans ça, une fois le 1er coupable supprimé, tous
-        # les fichiers suivants passent le test et sont faussement supprimés.
-        CULPRITS=0
-        GIVE_UP=false
-        while ! timeout 90 clamscan --no-summary --database="$DB_DIR" /dev/null 2>/dev/null; do
-            QDIR="$(mktemp -d /tmp/clamav_quar_XXXXXX)"
-            FOUND=false
-            for f in "$DB_DIR"/*.ndb "$DB_DIR"/*.hdb "$DB_DIR"/*.hsb \
-                     "$DB_DIR"/*.db  "$DB_DIR"/*.ftm "$DB_DIR"/*.ldb \
-                     "$DB_DIR"/*.cdb "$DB_DIR"/*.fp; do
-                [[ -f "$f" ]] || continue
-                BNAME=$(basename "$f")
-                mv "$f" "$QDIR/"
-                if timeout 60 clamscan --no-summary --database="$DB_DIR" /dev/null 2>/dev/null; then
-                    # Sans ce fichier ça passe : c'est lui le coupable.
-                    echo "    ❌ $BNAME défectueux — supprimé" | tee -a "$LOG"
-                    rm -f "$QDIR/$BNAME"
-                    CULPRITS=$((CULPRITS + 1))
-                    FOUND=true
-                    break   # Recommencer le while depuis zéro
-                else
-                    # Innocent : le remettre en place.
-                    mv "$QDIR/$BNAME" "$DB_DIR/"
-                fi
-            done
-            rm -rf "$QDIR"
-            if ! $FOUND; then
-                # Un tour complet sans trouver de coupable = conflit multi-fichiers
-                # irrésoluble individuellement. Purge totale des fichiers tiers.
-                echo ">>> [Hook TP] ⚠ Conflit non isolable — purge des fichiers tiers." | tee -a "$LOG"
-                find "$DB_DIR" \( -name "*.ndb" -o -name "*.hdb" -o -name "*.hsb" \
-                    -o -name "*.db" -o -name "*.ftm" -o -name "*.ldb" \
-                    -o -name "*.cdb" -o -name "*.fp" \) -delete 2>/dev/null || true
-                GIVE_UP=true
-                break
-            fi
-        done
-        if ! $GIVE_UP; then
-            echo ">>> [Hook TP] ✅ Base assainie — $CULPRITS fichier(s) retiré(s)." | tee -a "$LOG"
-        fi
-    fi
-fi
-
+# ── Bilan final ───────────────────────────────────────────────────────────────
 TP_FINAL=$(find "$DB_DIR" \( \
     -name "*.ndb" -o -name "*.hdb" -o -name "*.hsb" \
     -o -name "*.db"  -o -name "*.ftm" -o -name "*.ldb" \
-    -o -name "*.cdb" -o -name "*.fp" \
+    -o -name "*.cdb" -o -name "*.fp"  -o -name "*.ign2" \
     \) 2>/dev/null | wc -l)
-echo ">>> [Hook TP] Terminé — $TP_FINAL fichier(s) tiers actifs." | tee -a "$LOG"
+
+echo ">>> [Hook TP] ✅ Terminé : $TP_OK installés, $TP_SKIP rejetés, $TP_FINAL fichier(s) tiers actifs." | tee -a "$LOG"
+
+# Vérification finale de cohérence
+if ! _db_ok; then
+    echo ">>> [Hook TP] ❌ La base ne se charge toujours pas — purge totale des fichiers tiers." | tee -a "$LOG"
+    find "$DB_DIR" \( -name "*.ndb" -o -name "*.hdb" -o -name "*.hsb" \
+        -o -name "*.db" -o -name "*.ftm" -o -name "*.ldb" \
+        -o -name "*.cdb" -o -name "*.fp" -o -name "*.ign2" \) \
+        -delete 2>/dev/null || true
+    echo ">>> [Hook TP] Purge effectuée. ClamAV fonctionnera avec les bases officielles seules." | tee -a "$LOG"
+fi
 HOOK
 chmod +x config/hooks/normal/0150-clamav-thirdparty.hook.chroot
-ok "Hook signatures tierces ClamAV créé"
+ok "Hook signatures tierces ClamAV (validation par fichier) créé"
 
 # ── Hook 2 : téléchargement règles YARA ──────────────────────────────────────
 step "Création du hook YARA..."
@@ -562,115 +576,167 @@ HOOK
 chmod +x config/hooks/normal/0200-yara-rules.hook.chroot
 ok "Hook YARA créé"
 
-# ── Hook 2.5 : installation Avast for Linux ───────────────────────────────────
-step "Création du hook d'installation Avast..."
+# ── Hook 2.5 : installation Avast Business for Linux ─────────────────────────
+# Procédure officielle Avast (https://repo.avcdn.net) :
+#   1. DIST détecté via . /etc/os-release → $ID-$VERSION_CODENAME
+#      debian-bookworm est désormais supporté nativement (plus besoin du mapping bullseye)
+#   2. Clé en ASCII armored (.asc) via curl | tee — pas gpg --dearmor
+#   3. sources.list avec signed-by=/etc/apt/trusted.gpg.d/avast.asc
+#   4. Paquets : avast (moteur) + avast-fss (file shield) + avast-rest (API REST)
+#                + avast-license (outil avastlic pour activation par code)
+step "Création du hook d'installation Avast Business (procédure officielle)..."
 cat > config/hooks/normal/0250-avast-install.hook.chroot << 'HOOK'
 #!/bin/bash
 # ============================================================================
 # Hook 0250 : Installation d'Avast Business Antivirus for Linux
 #
-# Ce hook est exécuté dans le chroot pendant lb build.
-# Il configure le dépôt Avast, installe le paquet, désactive le service
-# au boot (la licence et le démarrage sont gérés par le panneau Admin).
+# Procédure officielle Avast (extrait de la documentation) :
+#   DIST=$(. /etc/os-release; echo "$ID-$VERSION_CODENAME")
+#   echo "deb https://repo.avcdn.net/linux-av/deb $DIST release" \
+#     > /etc/apt/sources.list.d/avast.list
+#   curl -s https://repo.avcdn.net/linux-av/doc/avast-gpg-key.asc \
+#     | tee /etc/apt/trusted.gpg.d/avast.asc
+#   apt update && apt install avast avast-fss avast-rest avast-license
 #
-# Aucune licence n'est incluse dans l'image : l'administrateur doit
-# l'importer via le panneau Admin (code d'activation ou fichier .avastlic
-# sur clé USB).
+# Distributions supportées : debian-buster/bullseye/bookworm,
+#   ubuntu-bionic/focal/jammy/noble
+#
+# Une licence Business est requise. L'administrateur l'active via le
+# panneau Admin (code d'activation ou fichier .avastlic USB/parcourir).
 # ============================================================================
-set -euo pipefail
+set -uo pipefail
 LOG="/var/log/avast-install.log"
-echo ">>> [Hook Avast] Début de l'installation..." | tee -a "$LOG"
+echo ">>> [Hook Avast] Début (procédure officielle)…" | tee "$LOG"
 
-# ── Détection de la distribution ──────────────────────────────────────────
-. /etc/os-release
-DIST_ID="${ID}"           # debian | ubuntu
-DIST_CODENAME="${VERSION_CODENAME}"  # bookworm | bullseye | jammy …
+# ── Déjà installé ? ──────────────────────────────────────────────────────────
+if command -v avast &>/dev/null || command -v scan &>/dev/null; then
+    echo ">>> [Hook Avast] Avast déjà présent — skip." | tee -a "$LOG"
+    exit 0
+fi
 
-# Mapping vers les noms de dépôts supportés par Avast
-case "${DIST_ID}-${DIST_CODENAME}" in
-    debian-bookworm)  AVAST_DIST="debian-bullseye" ;;  # Bookworm: utilise bullseye (compat)
-    debian-bullseye)  AVAST_DIST="debian-bullseye" ;;
-    debian-buster)    AVAST_DIST="debian-buster"   ;;
-    ubuntu-jammy)     AVAST_DIST="ubuntu-jammy"    ;;
-    ubuntu-focal)     AVAST_DIST="ubuntu-focal"    ;;
-    ubuntu-bionic)    AVAST_DIST="ubuntu-bionic"   ;;
-    *)                AVAST_DIST="debian-bullseye"  ;;  # fallback
+# ── Pré-requis ───────────────────────────────────────────────────────────────
+apt-get install -y --no-install-recommends     ca-certificates curl apt-transport-https >>"$LOG" 2>&1     || { echo ">>> [Hook Avast] ⚠ Pré-requis manquants." | tee -a "$LOG"; exit 0; }
+
+# ── Détection de la distribution (procédure officielle Avast) ────────────────
+DIST=$(. /etc/os-release; echo "${ID}-${VERSION_CODENAME}")
+echo ">>> [Hook Avast] Distribution détectée : $DIST" | tee -a "$LOG"
+
+# Validation contre la liste supportée
+case "$DIST" in
+    debian-buster|debian-bullseye|debian-bookworm|    ubuntu-bionic|ubuntu-focal|ubuntu-jammy|ubuntu-noble)
+        echo ">>> [Hook Avast] Distribution supportée." | tee -a "$LOG" ;;
+    *)
+        echo ">>> [Hook Avast] ⚠ Distribution '$DIST' non reconnue — essai avec debian-bookworm."             | tee -a "$LOG"
+        DIST="debian-bookworm" ;;
 esac
 
-echo ">>> [Hook Avast] Distribution détectée : ${DIST_ID}-${DIST_CODENAME} → dépôt : ${AVAST_DIST}" | tee -a "$LOG"
+# ── Dépôt APT ────────────────────────────────────────────────────────────────
+ASC_DEST="/etc/apt/trusted.gpg.d/avast.asc"
+LIST="/etc/apt/sources.list.d/avast.list"
+GPG_URL="https://repo.avcdn.net/linux-av/doc/avast-gpg-key.asc"
 
-# ── Vérification si déjà installé ─────────────────────────────────────────
-if command -v avast &>/dev/null; then
-    echo ">>> [Hook Avast] Avast déjà installé — skip." | tee -a "$LOG"
+# Étape 1 : clé ASCII armored via curl | tee (procédure officielle — PAS gpg --dearmor)
+if [[ ! -s "$ASC_DEST" ]]; then
+    echo ">>> [Hook Avast] Installation de la clé → $ASC_DEST" | tee -a "$LOG"
+    if curl -fsSL --max-time 30 --retry 3 "$GPG_URL" | tee "$ASC_DEST" >>"$LOG" 2>&1        && grep -q "BEGIN PGP PUBLIC KEY BLOCK" "$ASC_DEST" 2>/dev/null; then
+        chmod 644 "$ASC_DEST"
+        echo ">>> [Hook Avast] ✅ Clé ASCII armored installée." | tee -a "$LOG"
+    else
+        echo ">>> [Hook Avast] ⚠ Impossible d'obtenir la clé GPG (réseau ?)." | tee -a "$LOG"
+        echo "    Avast ne sera PAS installé dans cette image (non bloquant)." | tee -a "$LOG"
+        rm -f "$ASC_DEST"
+        exit 0
+    fi
+else
+    echo ">>> [Hook Avast] Clé déjà présente : $ASC_DEST" | tee -a "$LOG"
+fi
+
+# Étape 2 : sources.list avec signed-by pointant sur le .asc
+if [[ ! -f "$LIST" ]]; then
+    echo "deb [signed-by=$ASC_DEST] https://repo.avcdn.net/linux-av/deb $DIST release"         > "$LIST"
+    echo ">>> [Hook Avast] Dépôt ajouté : $LIST" | tee -a "$LOG"
+    cat "$LIST" | tee -a "$LOG"
+else
+    echo ">>> [Hook Avast] Dépôt déjà configuré : $LIST" | tee -a "$LOG"
+fi
+
+# ── apt-get update ───────────────────────────────────────────────────────────
+echo ">>> [Hook Avast] apt-get update…" | tee -a "$LOG"
+apt-get update -qq >>"$LOG" 2>&1 || {
+    echo ">>> [Hook Avast] ⚠ apt-get update a échoué — vérifiez la connexion." | tee -a "$LOG"
+}
+
+# ── Installation des paquets Avast ───────────────────────────────────────────
+# avast         : moteur de scan principal
+# avast-fss     : file system shield (protection temps réel)
+# avast-rest    : API REST pour intégrations
+# avast-license : outil avastlic pour activer via code d'activation
+echo ">>> [Hook Avast] Installation : avast avast-fss avast-rest avast-license…" | tee -a "$LOG"
+AVAST_INSTALLED=false
+if apt-get install -y --no-install-recommends         avast avast-fss avast-rest avast-license >>"$LOG" 2>&1; then
+    echo ">>> [Hook Avast] ✅ Paquets Avast installés." | tee -a "$LOG"
+    AVAST_INSTALLED=true
+elif apt-get install -y --no-install-recommends avast avast-license >>"$LOG" 2>&1; then
+    # Fallback si avast-fss ou avast-rest non disponibles
+    echo ">>> [Hook Avast] ✅ avast + avast-license installés (avast-fss/rest optionnels)."         | tee -a "$LOG"
+    AVAST_INSTALLED=true
+else
+    echo ">>> [Hook Avast] ⚠ Échec d'installation du paquet avast." | tee -a "$LOG"
+    tail -20 "$LOG" | grep -v "^>>>" | tee -a /dev/stderr || true
+    echo "    L'image sera fonctionnelle sans Avast (ClamAV + YARA opérationnels)."         | tee -a "$LOG"
     exit 0
 fi
 
-# ── Pré-requis ──────────────────────────────────────────────────────────────
-apt-get install -y --no-install-recommends     ca-certificates curl gnupg apt-transport-https 2>>"$LOG"     || { echo ">>> [Hook Avast] ⚠ Pré-requis manquants — skip installation." | tee -a "$LOG"; exit 0; }
+if $AVAST_INSTALLED; then
+    # Lister les binaires installés
+    for BIN in avast scan avastlic; do
+        PATH_BIN=$(command -v "$BIN" 2>/dev/null || true)
+        [[ -n "$PATH_BIN" ]] && echo ">>> [Hook Avast] Binaire : $PATH_BIN" | tee -a "$LOG"
+    done
 
-# ── Clé GPG Avast ──────────────────────────────────────────────────────────
-echo ">>> [Hook Avast] Import de la clé GPG Avast..." | tee -a "$LOG"
-GPG_KEY_URL="https://repo.avcdn.net/linux-av/doc/avast-gpg-key.asc"
-GPG_DEST="/etc/apt/trusted.gpg.d/avast.gpg"
-
-if curl -fsSL --max-time 30 --retry 3         "$GPG_KEY_URL" 2>>"$LOG"         | gpg --dearmor -o "$GPG_DEST" 2>>"$LOG"; then
-    chmod 644 "$GPG_DEST"
-    echo ">>> [Hook Avast] Clé GPG importée." | tee -a "$LOG"
-else
-    echo ">>> [Hook Avast] ⚠ Impossible d'importer la clé GPG (réseau ?)." | tee -a "$LOG"
-    echo ">>> [Hook Avast] Avast ne sera PAS installé dans cette image." | tee -a "$LOG"
-    exit 0   # Non bloquant : l'image fonctionne sans Avast
+    # Désactivation du service au boot (géré par le panneau Admin)
+    systemctl disable avast.target >>"$LOG" 2>&1 || true
+    systemctl disable avast        >>"$LOG" 2>&1 || true
+    echo ">>> [Hook Avast] Service avast désactivé au boot." | tee -a "$LOG"
 fi
 
-# ── Dépôt Avast ────────────────────────────────────────────────────────────
-echo "deb https://repo.avcdn.net/linux-av/deb ${AVAST_DIST} release"     > /etc/apt/sources.list.d/avast.list
-echo ">>> [Hook Avast] Dépôt ajouté : ${AVAST_DIST}" | tee -a "$LOG"
-
-# ── Installation ───────────────────────────────────────────────────────────
-echo ">>> [Hook Avast] apt-get update + install avast..." | tee -a "$LOG"
-if apt-get update -qq 2>>"$LOG"    && apt-get install -y --no-install-recommends avast 2>>"$LOG"; then
-    echo ">>> [Hook Avast] ✅ Avast installé avec succès." | tee -a "$LOG"
-else
-    echo ">>> [Hook Avast] ⚠ Échec de l'installation (paquet non disponible ?)." | tee -a "$LOG"
-    echo ">>> [Hook Avast] L'image sera fonctionnelle sans Avast." | tee -a "$LOG"
-    # Nettoyage partiel
-    rm -f /etc/apt/sources.list.d/avast.list "$GPG_DEST" 2>/dev/null || true
-    exit 0
-fi
-
-# ── Désactivation du service (géré par le panneau Admin) ──────────────────
-echo ">>> [Hook Avast] Désactivation du service avast au boot..." | tee -a "$LOG"
-systemctl disable avast.target 2>>"$LOG" || true
-systemctl disable avast        2>>"$LOG" || true
-
-# ── Création du répertoire de licence (vide — l'admin importe la sienne) ──
+# ── Répertoire de licence ─────────────────────────────────────────────────────
 mkdir -p /etc/avast
 chmod 755 /etc/avast
-echo ">>> [Hook Avast] Répertoire /etc/avast créé (en attente de licence)." | tee -a "$LOG"
 
-# ── Note d'information pour l'administrateur ──────────────────────────────
-cat > /etc/avast/LICENCE_REQUISE.txt << 'INFO'
+cat > /etc/avast/README_LICENCE.txt << 'INFO'
 Avast Business Antivirus for Linux est installé mais PAS activé.
 
-Pour activer Avast, ouvrez le Panneau d'administration et :
+Une licence Business est requise pour utiliser le moteur de scan.
+Sans licence, avast/scan refuse de scanner (code 126).
 
-  Option A – Code d'activation (requiert Internet) :
-    Onglet [🔐 Avast] → entrez votre code d'activation → [Activer]
+Comment activer la licence (3 méthodes) :
 
-  Option B – Fichier de licence hors-ligne :
-    1. Copiez license.avastlic à la racine d'une clé USB
-    2. Onglet [🔐 Avast] → [Importer licence (USB)]
+  Méthode A — Code d'activation (requiert Internet, via le panneau Admin) :
+    Onglet [🔐 Avast] → entrez le code d'activation → [🔑 Activer]
+    (utilise l'outil avastlic du paquet avast-license)
 
-Le fichier license.avastlic peut être téléchargé depuis :
-  https://www.avast.com/business/linux
-  ou via l'outil avastlic avec votre code d'activation.
+  Méthode B — Fichier .avastlic depuis une clé USB :
+    Copiez license.avastlic à la racine d'une clé USB
+    Onglet [🔐 Avast] → [🔌 Importer licence (USB)]
+
+  Méthode C — Fichier .avastlic depuis le système de fichiers :
+    Onglet [🔐 Avast] → [📂 Parcourir…] → sélectionnez le fichier
+
+  En ligne de commande :
+    sudo cp /chemin/vers/license.avastlic /etc/avast/license.avastlic
+    # ou via avastlic :
+    avastlic -o ~/license.avastlic -c CODE_ACTIVATION
+    sudo cp ~/license.avastlic /etc/avast/license.avastlic
+
+Licence Avast Business Linux : https://www.avast.com/business/linux
 INFO
-chmod 644 /etc/avast/LICENCE_REQUISE.txt
+chmod 644 /etc/avast/README_LICENCE.txt
 
-echo ">>> [Hook Avast] Configuration terminée. Licence requise au premier démarrage." | tee -a "$LOG"
+echo ">>> [Hook Avast] ✅ Installation terminée. Licence requise — voir /etc/avast/README_LICENCE.txt"     | tee -a "$LOG"
 HOOK
 chmod +x config/hooks/normal/0250-avast-install.hook.chroot
-ok "Hook Avast créé"
+ok "Hook Avast Business (procédure officielle) créé"
 
 # ── Hook 3 : configuration système ────────────────────────────────────────────
 step "Création du hook système..."

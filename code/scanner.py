@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Tuple
 
 from config import (
+    CLAMAV_DB_DIR,
     YARA_RULES_DIR,
     AVAST_LICENSE_PATH,
     AVAST_BIN_PATHS,
@@ -149,17 +150,17 @@ class ScanEngine:
         return None
 
     def avast_status_summary(self) -> str:
-        """Résumé court de l'état d'Avast pour la barre de statut de la GUI."""
+        """Résumé court de l'état d'Avast Business pour la barre de statut."""
         if not self.is_avast_installed():
-            return "❌  Avast : non installé"
+            return "❌  Avast Business : non installé"
         if not self.is_avast_licensed():
-            return "⚠   Avast : installé — licence manquante"
+            return "⚠   Avast Business : installé — licence requise pour scanner"
         try:
             mtime = os.path.getmtime(AVAST_LICENSE_PATH)
             date  = time.strftime("%Y-%m-%d", time.localtime(mtime))
-            return f"✅  Avast : prêt  (licence : {date})"
+            return f"✅  Avast Business : prêt  (licence : {date})"
         except OSError:
-            return "✅  Avast : prêt"
+            return "✅  Avast Business : prêt"
 
     # ── Détection : YARA ──────────────────────────────────────────────────────
 
@@ -257,7 +258,8 @@ class ScanEngine:
             os.close(fd)
 
             r = subprocess.run(
-                ["clamscan", "--no-summary", tmp_path],
+                ["clamscan", "--no-summary",
+                 f"--database={CLAMAV_DB_DIR}", tmp_path],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, timeout=60
             )
@@ -337,6 +339,8 @@ class ScanEngine:
             "clamscan",
             "--recursive",
             "--stdout",
+            f"--database={CLAMAV_DB_DIR}",  # charge TOUTES les sigs du répertoire,
+                                             # officielles ET tierces (.ndb/.hdb/.ldb…)
             "--max-filesize=0",
             "--max-scansize=0",
             "--max-files=0",
@@ -453,7 +457,12 @@ class ScanEngine:
     def _scan_avast(self, targets: List[str], remove: bool,
                     result: ScanResult, cb: ProgressCB) -> None:
         """
-        Lance le scan Avast via la commande `scan` (CLI de l'agent Avast Linux).
+        Lance le scan Avast Business via la commande `scan` (CLI Avast Linux).
+
+        Avast Business for Linux est la seule version disponible sur Linux.
+        Une licence Business active est requise pour scanner — sans licence
+        le binaire démarre mais refuse le scan (code 126 ou message d'erreur).
+        On tente dans tous les cas et on remonte l'erreur précisément.
 
         Format de sortie Avast :
           Fichier sain    :  /chemin/fichier [+]
@@ -466,14 +475,6 @@ class ScanEngine:
                 cb(msg, "warning")
             return
 
-        if not self.is_avast_licensed():
-            msg = ("⚠ Avast : licence manquante — moteur ignoré.\n"
-                   "Importez une licence depuis le panneau Administration.")
-            result.errors.append(msg)
-            if cb:
-                cb(msg, "warning")
-            return
-
         avast_bin = self.get_avast_scan_binary()
         if not avast_bin:
             msg = "⚠ Avast : binaire de scan introuvable."
@@ -481,6 +482,14 @@ class ScanEngine:
             if cb:
                 cb(msg, "warning")
             return
+
+        # Licence requise pour Avast Business for Linux.
+        # On avertit mais on tente quand même le scan — certaines versions
+        # tolèrent un scan partiel ; d'autres retournent code 126.
+        licensed = self.is_avast_licensed()
+        if not licensed and cb:
+            cb("⚠ Avast : licence Business manquante — le scan risque d'être refusé."
+               "  Activez une licence depuis le panneau Administration.", "warning")
 
         # Construction de la commande
         # `scan` est le CLI dédié ; s'il n'est pas disponible, on utilise
@@ -500,6 +509,7 @@ class ScanEngine:
         if cb:
             cb("Avast : démarrage de l'analyse…", "info")
 
+        rc = -99
         try:
             self._proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -512,6 +522,17 @@ class ScanEngine:
                     break
                 self._parse_avast(line.rstrip(), result, cb)
             self._proc.wait()
+            rc = self._proc.returncode
+
+            # Code 126 = scan refusé par Avast Business (licence manquante)
+            if rc == 126:
+                msg = ("⚠ Avast Business : scan refusé (code 126) — licence requise.\n"
+                       "  Obtenez une licence sur https://www.avast.com/business/linux\n"
+                       "  et activez-la depuis le panneau Administration.")
+                result.errors.append(msg)
+                if cb:
+                    cb(msg, "warning")
+                return
 
             if cb:
                 cb(f"Avast : analyse terminée ({result.scanned_avast} fichier(s)).",

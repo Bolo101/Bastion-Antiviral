@@ -367,16 +367,21 @@ class VirusScannerGUI:
             count_str = (f"  |  {count:,} signatures".replace(",", "\u202f")
                          if count else "")
 
-            # Statut des bases tierces
+            # Statut des bases tierces — utilise total_count (liste + fichiers extra)
             tp          = self.db.get_third_party_sig_status()
-            n_installed = len(tp["installed"])
-            n_missing   = len(tp["missing"])
-            if n_missing == 0 and n_installed > 0:
-                tp_str = f"  |  {n_installed} bases tierces ✅"
-            elif n_installed > 0:
-                tp_str = f"  |  {n_installed}/{n_installed + n_missing} bases tierces ⚠"
-            else:
+            n_total     = tp.get("total_count", 0)
+            n_listed    = len(tp["installed"])
+            n_expected  = len(tp["installed"]) + len(tp["missing"])
+            n_extra     = len(tp.get("extra", []))
+            if n_total == 0:
                 tp_str = "  |  bases tierces absentes ❌"
+            elif len(tp["missing"]) == 0:
+                tp_str = f"  |  {n_total} bases tierces ✅"
+            else:
+                # Affiche "présents/attendus" en ne comptant que ceux de la liste connue
+                tp_str = f"  |  {n_listed}/{n_expected} bases tierces ▲"
+                if n_extra:
+                    tp_str += f" (+{n_extra} extra)"
 
             if st == "OK":
                 clamav_text = f"✅  ClamAV  (màj : {lu}){count_str}{tp_str}"
@@ -736,8 +741,9 @@ class VirusScannerGUI:
             # Avast
             on_update_avast_vps_online  = self._admin_avast_vps_online,
             on_import_avast_vps_usb     = self._admin_avast_vps_usb,
-            on_import_avast_license_usb = self._admin_avast_license_usb,
-            on_activate_avast_code      = self._admin_avast_activate_code,
+            on_import_avast_license_usb  = self._admin_avast_license_usb,
+            on_import_avast_license_file = self._admin_avast_license_file,
+            on_activate_avast_code       = self._admin_avast_activate_code,
             on_refresh_avast_status     = self._refresh_status,
             # YARA
             on_update_yara_online     = self._admin_yara_online,
@@ -859,13 +865,31 @@ class VirusScannerGUI:
             on_done = lambda ok, msg: self._refresh_status()
         )
 
+    def _admin_avast_license_file(self, path: str) -> None:
+        """Import d'un fichier .avastlic sélectionné via le dialogue Parcourir."""
+        import os as _os
+        if not _os.path.isfile(path):
+            from tkinter import messagebox as _mb
+            _mb.showerror("Fichier introuvable",
+                          f"Le fichier n'existe pas :\n{path}",
+                          parent=self.root)
+            return
+        self._log(f"Import de la licence Avast depuis : {path}", "info")
+        self._run_background(
+            task    = lambda cb: self.db.import_avast_license_from_file(path,
+                                                                         progress_cb=cb),
+            label   = "Import licence Avast",
+            on_done = lambda ok, msg: self._refresh_status()
+        )
+
     def _admin_avast_vps_online(self) -> None:
         if not self.engine.is_avast_installed():
             messagebox.showerror(
-                "Avast non installé",
-                "Avast n'est pas installé sur ce système.\n\n"
-                "Consultez https://www.avast.com/business/linux\n"
-                "ou utilisez le dépôt repo.avcdn.net.",
+                "Avast Business non installé",
+                "Avast Business for Linux n'est pas installé.\n\n"
+                "Seule la version Business est disponible sur Linux.\n"
+                "Licence et dépôt : https://www.avast.com/business/linux\n"
+                "Dépôt APT : https://repo.avcdn.net",
                 parent=self.root
             )
             return

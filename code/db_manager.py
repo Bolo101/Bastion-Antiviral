@@ -36,66 +36,220 @@ from log_handler import log_error, log_info, log_warning
 ProgressCB = Optional[Callable[[str], None]]
 
 # ── Sources de signatures tierces téléchargeables gratuitement ────────────────
-# Chaque entrée : url, nom de fichier local dans CLAMAV_DB_DIR, description courte.
+# Noms de fichiers IDENTIQUES à ceux installés par le hook 0150 de l'ISO build.
+# Miroir HTTP Sanesecurity : mirror.ihost.md (vérifié opérationnel)
+# Fallback                 : ftp.swin.edu.au/sanesecurity
+_SANE = "https://mirror.ihost.md/clamav/sanesecurity"
+_SANE2 = "https://ftp.swin.edu.au/sanesecurity"
+
 THIRD_PARTY_SIGNATURES: List[Dict] = [
-    # abuse.ch / URLhaus – URLs malveillantes actives
-    {
-        "name": "URLhaus",
-        "url":  "https://urlhaus-filter.abuse.ch/urlhaus-filter-clam.ndb",
-        "file": "urlhaus-filter.ndb",
-        "desc": "URLs malveillantes actives (abuse.ch / URLhaus)",
-    },
-    # Sanesecurity – phishing, scam, spam, macros, rogues
-    {
-        "name": "Sanesecurity – phishing",
-        "url":  "https://mirror.sanewall.org/sanesecurity/phish.ndb",
-        "file": "sanesecurity-phish.ndb",
-        "desc": "Hameçonnage (Sanesecurity)",
-    },
-    {
-        "name": "Sanesecurity – scam",
-        "url":  "https://mirror.sanewall.org/sanesecurity/scam.ndb",
-        "file": "sanesecurity-scam.ndb",
-        "desc": "Arnaques (Sanesecurity)",
-    },
-    {
-        "name": "Sanesecurity – junk",
-        "url":  "https://mirror.sanewall.org/sanesecurity/junk.ndb",
-        "file": "sanesecurity-junk.ndb",
-        "desc": "Spam / courrier indésirable (Sanesecurity)",
-    },
-    {
-        "name": "Sanesecurity – sigpack",
-        "url":  "https://mirror.sanewall.org/sanesecurity/sigpack.ndb",
-        "file": "sanesecurity-sigpack.ndb",
-        "desc": "Pack de signatures génériques (Sanesecurity)",
-    },
-    {
-        "name": "Sanesecurity – malware (hdb)",
-        "url":  "https://mirror.sanewall.org/sanesecurity/malware.expert.hdb",
-        "file": "sanesecurity-malware.hdb",
-        "desc": "Hashes de malwares (Sanesecurity)",
-    },
-    {
-        "name": "Sanesecurity – malware (db)",
-        "url":  "https://mirror.sanewall.org/sanesecurity/malware.expert.db",
-        "file": "sanesecurity-malware.db",
-        "desc": "Base malwares généraliste (Sanesecurity)",
-    },
-    {
-        "name": "Sanesecurity – FTM",
-        "url":  "https://mirror.sanewall.org/sanesecurity/sanesecurity.ftm",
-        "file": "sanesecurity.ftm",
-        "desc": "Magic file types (Sanesecurity)",
-    },
-    # InterServer – base complémentaire généraliste
-    {
-        "name": "InterServer",
-        "url":  "https://www.interserver.net/virus-l/interserver.ndb",
-        "file": "interserver.ndb",
-        "desc": "Signatures génériques InterServer",
-    },
+    # ── URLhaus (abuse.ch) ────────────────────────────────────────────────────
+    {"name": "URLhaus",                 "file": "urlhaus-filter.ndb",
+     "url":  "https://urlhaus.abuse.ch/downloads/urlhaus.ndb",
+     "url2": "https://curbengh.github.io/malware-filter/urlhaus-filter-clam.ndb",
+     "desc": "URLs malveillantes actives (abuse.ch)", "min_bytes": 1000},
+
+    # ── InterServer ──────────────────────────────────────────────────────────
+    {"name": "InterServer hashes",      "file": "interserver256.hdb",
+     "url":  "http://sigs.interserver.net/interserver256.hdb",
+     "desc": "Hashes SHA-256 (InterServer)", "min_bytes": 500},
+    {"name": "InterServer topline",     "file": "topline.db",
+     "url":  "http://sigs.interserver.net/topline.db",
+     "desc": "Signatures topline (InterServer)", "min_bytes": 500},
+
+    # ── Sanesecurity – fichiers requis ────────────────────────────────────────
+    {"name": "Sanesecurity FTM",        "file": "sanesecurity.ftm",
+     "url":  f"{_SANE}/sanesecurity.ftm",
+     "desc": "Magic file types (Sanesecurity)", "min_bytes": 64},
+    {"name": "Sanesecurity whitelist",  "file": "sigwhitelist.ign2",
+     "url":  f"{_SANE}/sigwhitelist.ign2",
+     "desc": "Liste blanche (Sanesecurity)", "min_bytes": 64},
+
+    # ── Sanesecurity – phishing / spam ────────────────────────────────────────
+    {"name": "Sanesecurity phish",      "file": "phish.ndb",
+     "url":  f"{_SANE}/phish.ndb",
+     "desc": "Hameçonnage (Sanesecurity)", "min_bytes": 64},
+    {"name": "Sanesecurity junk",       "file": "junk.ndb",
+     "url":  f"{_SANE}/junk.ndb",
+     "desc": "Spam générique (Sanesecurity)", "min_bytes": 64},
+    {"name": "Sanesecurity jurlbl",     "file": "jurlbl.ndb",
+     "url":  f"{_SANE}/jurlbl.ndb",
+     "desc": "URLs de junk (Sanesecurity)", "min_bytes": 64},
+    {"name": "Sanesecurity jurlbla",    "file": "jurlbla.ndb",
+     "url":  f"{_SANE}/jurlbla.ndb",
+     "desc": "URLs de junk avancées (Sanesecurity)", "min_bytes": 64},
+    {"name": "Sanesecurity lott",       "file": "lott.ndb",
+     "url":  f"{_SANE}/lott.ndb",
+     "desc": "Loteries / arnaques (Sanesecurity)", "min_bytes": 64},
+    {"name": "Sanesecurity scam",       "file": "scam.ndb",
+     "url":  f"{_SANE}/scam.ndb",
+     "desc": "Arnaques (Sanesecurity)", "min_bytes": 64},
+    {"name": "Sanesecurity blurl",      "file": "blurl.ndb",
+     "url":  f"{_SANE}/blurl.ndb",
+     "desc": "URLs blacklistées (Sanesecurity)", "min_bytes": 64},
+    {"name": "Sanesecurity spam.ldb",   "file": "spam.ldb",
+     "url":  f"{_SANE}/spam.ldb",
+     "desc": "Signatures logiques spam (Sanesecurity)", "min_bytes": 64},
+    {"name": "Sanesecurity shelter",    "file": "shelter.ldb",
+     "url":  f"{_SANE}/shelter.ldb",
+     "desc": "Fichiers suspects hébergés (Sanesecurity)", "min_bytes": 64},
+    {"name": "Sanesecurity spear",      "file": "spear.ndb",
+     "url":  f"{_SANE}/spear.ndb",
+     "desc": "Spear-phishing (Sanesecurity)", "min_bytes": 64},
+    {"name": "Sanesecurity spearl",     "file": "spearl.ndb",
+     "url":  f"{_SANE}/spearl.ndb",
+     "desc": "Spear-phishing liens (Sanesecurity)", "min_bytes": 64},
+    {"name": "Sanesecurity badmacro",   "file": "badmacro.ndb",
+     "url":  f"{_SANE}/badmacro.ndb",
+     "desc": "Macros malveillantes (Sanesecurity)", "min_bytes": 64},
+
+    # ── Sanesecurity – malwares / hashes ──────────────────────────────────────
+    {"name": "Sanesecurity rogue",      "file": "rogue.hdb",
+     "url":  f"{_SANE}/rogue.hdb",
+     "desc": "Rogues / faux AV (Sanesecurity)", "min_bytes": 64},
+    {"name": "Sanesecurity spamimg",    "file": "spamimg.hdb",
+     "url":  f"{_SANE}/spamimg.hdb",
+     "desc": "Images spam (Sanesecurity)", "min_bytes": 64},
+    {"name": "Sanesecurity spamattach", "file": "spamattach.hdb",
+     "url":  f"{_SANE}/spamattach.hdb",
+     "desc": "Pièces jointes spam (Sanesecurity)", "min_bytes": 64},
+    {"name": "Sanesecurity malwarehash","file": "malwarehash.hsb",
+     "url":  f"{_SANE}/malwarehash.hsb",
+     "desc": "Hashes SHA-256 malwares (Sanesecurity)", "min_bytes": 64},
+    {"name": "Sanesecurity hackingteam","file": "hackingteam.hsb",
+     "url":  f"{_SANE}/hackingteam.hsb",
+     "desc": "Outils Hacking Team (Sanesecurity)", "min_bytes": 64},
+
+    # ── Sanesecurity – Foxhole ────────────────────────────────────────────────
+    {"name": "Foxhole generic",         "file": "foxhole_generic.cdb",
+     "url":  f"{_SANE}/foxhole_generic.cdb",
+     "desc": "Fichiers génériques suspects (Foxhole)", "min_bytes": 64},
+    {"name": "Foxhole filename",        "file": "foxhole_filename.cdb",
+     "url":  f"{_SANE}/foxhole_filename.cdb",
+     "desc": "Noms de fichiers suspects (Foxhole)", "min_bytes": 64},
+    {"name": "Foxhole JS (cdb)",        "file": "foxhole_js.cdb",
+     "url":  f"{_SANE}/foxhole_js.cdb",
+     "desc": "JavaScript suspects (Foxhole)", "min_bytes": 64},
+    {"name": "Foxhole JS (ndb)",        "file": "foxhole_js.ndb",
+     "url":  f"{_SANE}/foxhole_js.ndb",
+     "desc": "JavaScript malveillants (Foxhole)", "min_bytes": 64},
+    {"name": "Foxhole all (cdb)",       "file": "foxhole_all.cdb",
+     "url":  f"{_SANE}/foxhole_all.cdb",
+     "desc": "Tous types suspects (Foxhole)", "min_bytes": 64},
+    {"name": "Foxhole all (ndb)",       "file": "foxhole_all.ndb",
+     "url":  f"{_SANE}/foxhole_all.ndb",
+     "desc": "Tous types suspects ndb (Foxhole)", "min_bytes": 64},
+    {"name": "Foxhole mail",            "file": "foxhole_mail.cdb",
+     "url":  f"{_SANE}/foxhole_mail.cdb",
+     "desc": "Pièces jointes mail (Foxhole)", "min_bytes": 64},
+    {"name": "Foxhole links",           "file": "foxhole_links.ldb",
+     "url":  f"{_SANE}/foxhole_links.ldb",
+     "desc": "Liens malveillants (Foxhole)", "min_bytes": 64},
+
+    # ── Sanesecurity – MiscreantPunch ─────────────────────────────────────────
+    {"name": "MiscreantPunch Low",      "file": "MiscreantPunch099-Low.ldb",
+     "url":  f"{_SANE}/MiscreantPunch099-Low.ldb",
+     "desc": "Faible taux de FP (MiscreantPunch)", "min_bytes": 64},
+    {"name": "MiscreantPunch INFO",     "file": "MiscreantPunch099-INFO-Low.ldb",
+     "url":  f"{_SANE}/MiscreantPunch099-INFO-Low.ldb",
+     "desc": "Informatif faible FP (MiscreantPunch)", "min_bytes": 64},
+
+    # ── Sanesecurity – Porcupine ──────────────────────────────────────────────
+    {"name": "Porcupine ndb",           "file": "porcupine.ndb",
+     "url":  f"{_SANE}/porcupine.ndb",
+     "desc": "Malwares (Porcupine)", "min_bytes": 64},
+    {"name": "Porcupine hsb",           "file": "porcupine.hsb",
+     "url":  f"{_SANE}/porcupine.hsb",
+     "desc": "Hashes malwares (Porcupine)", "min_bytes": 64},
+    {"name": "PhishTank",               "file": "phishtank.ndb",
+     "url":  f"{_SANE}/phishtank.ndb",
+     "desc": "URLs phishing vérifiées (PhishTank)", "min_bytes": 64},
+
+    # ── Sanesecurity – bofhland ───────────────────────────────────────────────
+    {"name": "bofhland cracked URL",    "file": "bofhland_cracked_URL.ndb",
+     "url":  f"{_SANE}/bofhland_cracked_URL.ndb",
+     "desc": "URLs de warez/crack (bofhland)", "min_bytes": 64},
+    {"name": "bofhland malware URL",    "file": "bofhland_malware_URL.ndb",
+     "url":  f"{_SANE}/bofhland_malware_URL.ndb",
+     "desc": "URLs malware (bofhland)", "min_bytes": 64},
+    {"name": "bofhland phishing URL",   "file": "bofhland_phishing_URL.ndb",
+     "url":  f"{_SANE}/bofhland_phishing_URL.ndb",
+     "desc": "URLs phishing (bofhland)", "min_bytes": 64},
+    {"name": "bofhland malware attach", "file": "bofhland_malware_attach.hdb",
+     "url":  f"{_SANE}/bofhland_malware_attach.hdb",
+     "desc": "Pièces jointes malware (bofhland)", "min_bytes": 64},
+
+    # ── Sanesecurity – winnow (OITC) ──────────────────────────────────────────
+    {"name": "winnow malware",          "file": "winnow_malware.hdb",
+     "url":  f"{_SANE}/winnow_malware.hdb",
+     "desc": "Hashes malwares (winnow)", "min_bytes": 64},
+    {"name": "winnow malware links",    "file": "winnow_malware_links.ndb",
+     "url":  f"{_SANE}/winnow_malware_links.ndb",
+     "desc": "Liens malwares (winnow)", "min_bytes": 64},
+    {"name": "winnow spam",             "file": "winnow_spam_complete.ndb",
+     "url":  f"{_SANE}/winnow_spam_complete.ndb",
+     "desc": "Spam complet (winnow)", "min_bytes": 64},
+    {"name": "winnow phish URL",        "file": "winnow_phish_complete_url.ndb",
+     "url":  f"{_SANE}/winnow_phish_complete_url.ndb",
+     "desc": "URLs phishing (winnow)", "min_bytes": 64},
+    {"name": "winnow patterns",         "file": "winnow.complex.patterns.ldb",
+     "url":  f"{_SANE}/winnow.complex.patterns.ldb",
+     "desc": "Patterns complexes (winnow)", "min_bytes": 64},
+    {"name": "winnow ext malware",      "file": "winnow_extended_malware.hdb",
+     "url":  f"{_SANE}/winnow_extended_malware.hdb",
+     "desc": "Malwares étendus (winnow)", "min_bytes": 64},
+    {"name": "winnow ext links",        "file": "winnow_extended_malware_links.ndb",
+     "url":  f"{_SANE}/winnow_extended_malware_links.ndb",
+     "desc": "Liens malwares étendus (winnow)", "min_bytes": 64},
+    {"name": "winnow attachments",      "file": "winnow.attachments.hdb",
+     "url":  f"{_SANE}/winnow.attachments.hdb",
+     "desc": "Pièces jointes (winnow)", "min_bytes": 64},
+
+    # ── Sanesecurity – doppelstern / crdfam / scamnailer ─────────────────────
+    {"name": "doppelstern ndb",         "file": "doppelstern.ndb",
+     "url":  f"{_SANE}/doppelstern.ndb",
+     "desc": "Malwares (doppelstern)", "min_bytes": 64},
+    {"name": "doppelstern hdb",         "file": "doppelstern.hdb",
+     "url":  f"{_SANE}/doppelstern.hdb",
+     "desc": "Hashes (doppelstern)", "min_bytes": 64},
+    {"name": "doppelstern phishtank",   "file": "doppelstern-phishtank.ndb",
+     "url":  f"{_SANE}/doppelstern-phishtank.ndb",
+     "desc": "PhishTank (doppelstern)", "min_bytes": 64},
+    {"name": "crdfam",                  "file": "crdfam.clamav.hdb",
+     "url":  f"{_SANE}/crdfam.clamav.hdb",
+     "desc": "Fraude carte bancaire (crdfam)", "min_bytes": 64},
+    {"name": "scamnailer",              "file": "scamnailer.ndb",
+     "url":  f"{_SANE}/scamnailer.ndb",
+     "desc": "Scams (scamnailer)", "min_bytes": 64},
+
+    # ── Sanesecurity – malware.expert ─────────────────────────────────────────
+    {"name": "malware.expert ndb",      "file": "malware.expert.ndb",
+     "url":  f"{_SANE}/malware.expert.ndb",
+     "desc": "Malwares (malware.expert)", "min_bytes": 64},
+    {"name": "malware.expert hdb",      "file": "malware.expert.hdb",
+     "url":  f"{_SANE}/malware.expert.hdb",
+     "desc": "Hashes malwares (malware.expert)", "min_bytes": 64},
+    {"name": "malware.expert ldb",      "file": "malware.expert.ldb",
+     "url":  f"{_SANE}/malware.expert.ldb",
+     "desc": "Logique malwares (malware.expert)", "min_bytes": 64},
+    {"name": "malware.expert fp",       "file": "malware.expert.fp",
+     "url":  f"{_SANE}/malware.expert.fp",
+     "desc": "Faux-positifs (malware.expert)", "min_bytes": 64},
 ]
+
+# Extensions reconnues comme signatures tierces ClamAV
+_THIRD_PARTY_EXTS = frozenset([
+    ".ndb", ".ndu", ".hdb", ".hdu", ".hsb", ".hsu",
+    ".mdb", ".mdu", ".msb", ".msu", ".ldb", ".ldu",
+    ".cdb", ".db",  ".ftm", ".fp",  ".sfp",
+    ".ign", ".ign2",".pdb", ".wdb", ".gdb", ".crb",
+])
+
+# Bases officielles à ne pas comptabiliser comme tierces
+_OFFICIAL_FILES = frozenset([
+    "main.cvd", "main.cld", "daily.cvd", "daily.cld",
+    "bytecode.cvd", "bytecode.cld",
+])
 
 
 def _run(cmd: List[str], timeout: int = 60) -> Tuple[int, str, str]:
@@ -286,60 +440,109 @@ class DBManager:
             progress_cb: ProgressCB = None) -> Tuple[bool, str]:
         """
         Télécharge les signatures ClamAV tierces définies dans THIRD_PARTY_SIGNATURES
-        et les installe dans CLAMAV_DB_DIR.
+        et les installe dans CLAMAV_DB_DIR, en validant chaque fichier individuellement.
 
-        Pour chaque source :
-          - Téléchargement via urllib dans un fichier temporaire
-          - Vérification que le fichier n'est pas vide
-          - Copie atomique vers CLAMAV_DB_DIR avec les bons droits
-          - En cas d'échec individuel, on continue avec les autres sources
+        Pour chaque signature :
+          1. Téléchargement via urllib (avec fallback sur url2 si présent)
+          2. Vérification contenu (taille minimum + non-HTML)
+          3. Copie atomique dans CLAMAV_DB_DIR
+          4. Validation immédiate : clamscan --database=$DB_DIR sur le répertoire
+             complet — si le nouveau fichier casse le chargement, il est supprimé
 
         Retourne (True, résumé) si au moins une signature a été installée.
         """
-        os.makedirs(CLAMAV_DB_DIR, exist_ok=True)
+        import shutil as _shutil
 
-        installed:  List[str] = []
-        failed:     List[str] = []
+        os.makedirs(CLAMAV_DB_DIR, exist_ok=True)
+        clamav_ok = _shutil.which("clamscan") is not None
+
+        installed: List[str] = []
+        rejected:  List[str] = []
+        failed:    List[str] = []
+
+        def _is_valid_content(path: str) -> bool:
+            try:
+                with open(path, "rb") as f:
+                    header = f.read(64)
+                if not header:
+                    return False
+                # Rejeter pages HTML/HTTP/JSON servies en 200 OK
+                h = header[:16]
+                if h.startswith(b"<") or h.startswith(b"HTTP/") or h.startswith(b'{"'):
+                    return False
+                return True
+            except Exception:
+                return False
+
+        def _db_loads_ok() -> bool:
+            """Teste que le répertoire complet se charge sans erreur."""
+            if not clamav_ok:
+                return True   # pas de clamscan → on accepte sans valider
+            import tempfile as _tmpmod
+            try:
+                fd2, probe = _tmpmod.mkstemp(prefix="clamav_probe_", suffix=".tmp")
+                os.close(fd2)
+                r = subprocess.run(
+                    ["clamscan", "--no-summary",
+                     f"--database={CLAMAV_DB_DIR}", probe],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, timeout=60
+                )
+                os.unlink(probe)
+                if r.returncode == 2:
+                    combined = r.stdout + r.stderr
+                    return not any(k in combined for k in
+                                   ("Error loading", "Can't load", "Invalid",
+                                    "Corrupt", "corrupt", "Can't open"))
+                return True
+            except Exception:
+                return True
+
+        def _fetch(url: str, suffix: str) -> Optional[str]:
+            tmp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                        delete=False, suffix=suffix, dir="/tmp") as tmp:
+                    tmp_path = tmp.name
+                urllib.request.urlretrieve(url, tmp_path)
+                return tmp_path
+            except Exception:
+                if tmp_path and os.path.exists(tmp_path):
+                    try:
+                        os.unlink(tmp_path)
+                    except Exception:
+                        pass
+                return None
 
         for sig in THIRD_PARTY_SIGNATURES:
-            name = sig["name"]
-            url  = sig["url"]
-            dest = os.path.join(CLAMAV_DB_DIR, sig["file"])
+            name      = sig["name"]
+            dest      = os.path.join(CLAMAV_DB_DIR, sig["file"])
+            min_bytes = sig.get("min_bytes", 64)
+            suffix    = os.path.splitext(sig["file"])[1]
 
             if progress_cb:
                 progress_cb(f"⬇  {name} …")
 
-            try:
-                with tempfile.NamedTemporaryFile(
-                        delete=False,
-                        suffix=os.path.splitext(sig["file"])[1],
-                        dir="/tmp") as tmp:
-                    tmp_path = tmp.name
-
-                def _hook(blocks: int, block_size: int, total: int) -> None:
-                    if total > 0 and progress_cb:
-                        pct = min(100, blocks * block_size * 100 // total)
-                        progress_cb(f"   {name} : {pct}%")
-
-                urllib.request.urlretrieve(url, tmp_path, _hook)
-
-                size = os.path.getsize(tmp_path)
-                if size < 64:
-                    raise ValueError(f"fichier trop petit ({size} octets) — source indisponible ?")
-
-                shutil.move(tmp_path, dest)
-                os.chmod(dest, 0o644)
-                _run(["chown", "clamav:clamav", dest], timeout=5)
-
-                size_kb = size / 1024
-                log_info(f"Signature tierce installée : {sig['file']}  ({size_kb:.0f} Ko)")
-                installed.append(f"{sig['file']} ({size_kb:.0f} Ko)")
+            # ── Téléchargement (URL principale + fallback) ────────────────────
+            tmp_path = _fetch(sig["url"], suffix)
+            if tmp_path is None and "url2" in sig:
                 if progress_cb:
-                    progress_cb(f"   ✅ {name} : {size_kb:.0f} Ko installé")
+                    progress_cb(f"   ↩ fallback URL pour {name}…")
+                tmp_path = _fetch(sig["url2"], suffix)
 
-            except urllib.error.URLError as e:
-                reason = getattr(e, "reason", str(e))
-                msg = f"   ⚠ {name} : erreur réseau – {reason}"
+            if tmp_path is None:
+                msg = f"   ⚠ {name} : inaccessible (réseau ?)"
+                log_warning(msg)
+                failed.append(name)
+                if progress_cb:
+                    progress_cb(msg)
+                continue
+
+            size = os.path.getsize(tmp_path)
+
+            # ── Validation contenu ────────────────────────────────────────────
+            if size < min_bytes or not _is_valid_content(tmp_path):
+                msg = f"   ⚠ {name} : contenu invalide ({size} o)"
                 log_warning(msg)
                 failed.append(name)
                 if progress_cb:
@@ -348,15 +551,28 @@ class DBManager:
                     os.unlink(tmp_path)
                 except Exception:
                     pass
+                continue
 
-            except Exception as e:
-                msg = f"   ⚠ {name} : {e}"
+            # ── Installation atomique ─────────────────────────────────────────
+            shutil.move(tmp_path, dest)
+            os.chmod(dest, 0o644)
+            _run(["chown", "clamav:clamav", dest], timeout=5)
+
+            # ── Validation base complète ──────────────────────────────────────
+            if _db_loads_ok():
+                size_kb = size / 1024
+                log_info(f"Signature tierce installée : {sig['file']} ({size_kb:.0f} Ko)")
+                installed.append(f"{sig['file']} ({size_kb:.0f} Ko)")
+                if progress_cb:
+                    progress_cb(f"   ✅ {name} : {size_kb:.0f} Ko")
+            else:
+                msg = f"   ⚠ {name} : conflit de format — supprimé"
                 log_warning(msg)
-                failed.append(name)
+                rejected.append(name)
                 if progress_cb:
                     progress_cb(msg)
                 try:
-                    os.unlink(tmp_path)
+                    os.unlink(dest)
                 except Exception:
                     pass
 
@@ -371,6 +587,9 @@ class DBManager:
         if installed:
             lines.append(f"✅ {len(installed)} signature(s) installée(s) :")
             lines.extend(f"   • {f}" for f in installed)
+        if rejected:
+            lines.append(f"⚠ {len(rejected)} fichier(s) rejeté(s) (conflit ClamAV) :")
+            lines.extend(f"   • {r}" for r in rejected)
         if failed:
             lines.append(f"⚠ {len(failed)} source(s) inaccessible(s) :")
             lines.extend(f"   • {f}" for f in failed)
@@ -378,7 +597,8 @@ class DBManager:
         summary = "\n".join(lines) if lines else "Aucune signature traitée."
         success = len(installed) > 0
         (log_info if success else log_error)(
-            f"Signatures tierces : {len(installed)} OK, {len(failed)} échoué(s)"
+            f"Signatures tierces : {len(installed)} OK, "
+            f"{len(rejected)} rejetés, {len(failed)} échoués"
         )
         return success, summary
 
@@ -391,6 +611,10 @@ class DBManager:
         Retourne None si clamscan n'est pas disponible ou en cas d'erreur.
         Ce compteur est la seule source fiable pour savoir si les bases tierces
         sont réellement prises en compte.
+
+        Note : --database force le chargement de TOUT le contenu de CLAMAV_DB_DIR,
+        y compris les .ndb/.hdb/.ldb tiers — sans cette option, clamscan peut
+        utiliser son chemin compilé par défaut et ignorer les signatures tierces.
         """
         import tempfile, shutil
         if not shutil.which("clamscan"):
@@ -401,7 +625,7 @@ class DBManager:
             fd, tmp_path = tempfile.mkstemp(prefix="clamav_count_", suffix=".tmp")
             os.close(fd)
             r = subprocess.run(
-                ["clamscan", tmp_path],
+                ["clamscan", f"--database={CLAMAV_DB_DIR}", tmp_path],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, timeout=60
             )
@@ -424,12 +648,33 @@ class DBManager:
 
     def get_third_party_sig_status(self) -> Dict:
         """
-        Retourne un dict décrivant l'état des signatures tierces installées :
-          installed  – liste de (nom_fichier, taille_Ko, date)
-          missing    – liste des noms de fichiers attendus mais absents
-          total_size – taille totale en Ko
+        Retourne l'état des signatures tierces en deux passes :
+
+        1. Passe liste : vérifie chaque fichier de THIRD_PARTY_SIGNATURES
+           (installed / missing).
+        2. Passe répertoire : compte les fichiers tiers supplémentaires présents
+           dans CLAMAV_DB_DIR mais absents de la liste (ex. fichiers installés
+           manuellement ou via USB).
+
+        Clés du dict :
+          installed   – [{name, file, size_kb, date}]  fichiers de la liste présents
+          missing     – [name]                          fichiers de la liste absents
+          extra       – [{file, size_kb, date}]         fichiers tiers hors-liste
+          total_size  – taille totale en Ko (liste + extra)
+          total_count – nombre total de fichiers tiers présents
         """
-        result: Dict = {"installed": [], "missing": [], "total_size": 0}
+        # Noms attendus par la liste (pour ne pas les compter deux fois)
+        expected_files = {sig["file"] for sig in THIRD_PARTY_SIGNATURES}
+
+        result: Dict = {
+            "installed":   [],
+            "missing":     [],
+            "extra":       [],
+            "total_size":  0,
+            "total_count": 0,
+        }
+
+        # ── Passe 1 : vérification de la liste connue ─────────────────────────
         for sig in THIRD_PARTY_SIGNATURES:
             dest = os.path.join(CLAMAV_DB_DIR, sig["file"])
             if os.path.exists(dest):
@@ -441,11 +686,36 @@ class DBManager:
                         {"name": sig["name"], "file": sig["file"],
                          "size_kb": size_kb, "date": mtime}
                     )
-                    result["total_size"] += size_kb
+                    result["total_size"]  += size_kb
+                    result["total_count"] += 1
                 except OSError:
                     result["missing"].append(sig["name"])
             else:
                 result["missing"].append(sig["name"])
+
+        # ── Passe 2 : fichiers tiers non référencés dans la liste ─────────────
+        if os.path.isdir(CLAMAV_DB_DIR):
+            for fname in sorted(os.listdir(CLAMAV_DB_DIR)):
+                if fname in _OFFICIAL_FILES or fname in expected_files:
+                    continue
+                ext = os.path.splitext(fname)[1].lower()
+                if ext not in _THIRD_PARTY_EXTS:
+                    continue
+                fpath = os.path.join(CLAMAV_DB_DIR, fname)
+                if not os.path.isfile(fpath):
+                    continue
+                try:
+                    st      = os.stat(fpath)
+                    size_kb = st.st_size / 1024
+                    mtime   = time.strftime("%Y-%m-%d", time.localtime(st.st_mtime))
+                    result["extra"].append(
+                        {"file": fname, "size_kb": size_kb, "date": mtime}
+                    )
+                    result["total_size"]  += size_kb
+                    result["total_count"] += 1
+                except OSError:
+                    pass
+
         return result
 
     def find_clamav_on_usb(self) -> List[str]:
