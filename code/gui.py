@@ -12,10 +12,13 @@ Administration (protégée par code) :
   • Licence Avast (activation par code / import USB) + VPS (en ligne / USB)
   • Règles YARA (GitHub / USB)
   • Planification crontab
+  • Journaux : export vers USB, purge
   • Changement du code admin
+  • Arrêt de la station (poweroff)
 """
 
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -26,7 +29,8 @@ from typing import List, Optional
 from admin_auth import AdminAuthManager, AdminPanel
 from config import YARA_RULES_DIR
 from db_manager import DBManager
-from log_handler import generate_session_pdf, log_error, log_info, log_warning
+from log_handler import (export_logs_to_path, generate_session_pdf,
+                          log_error, log_info, log_warning, purge_logs)
 from scanner import ScanEngine, ScanResult
 from usb_manager import UsbManager, UsbPartition
 
@@ -132,15 +136,17 @@ class VirusScannerGUI:
     def _build_usb_panel(self, parent: tk.Frame) -> None:
         frm = self._lframe(parent, "Clés USB / Disques amovibles", fill=tk.BOTH, expand=False)
 
-        cols = ("device", "label", "size", "fstype", "status")
+        # Colonnes : device, label, size, fstype, uuid, status
+        cols = ("device", "label", "size", "fstype", "uuid", "status")
         self.usb_tree = ttk.Treeview(frm, columns=cols, show="headings",
                                       height=5, selectmode="browse")
         for cid, heading, width in [
-            ("device", "Périphérique", 100),
-            ("label",  "Étiquette",     90),
-            ("size",   "Taille",        60),
-            ("fstype", "FS",            60),
-            ("status", "État",         180),
+            ("device", "Périphérique",  100),
+            ("label",  "Étiquette",      80),
+            ("size",   "Taille",         55),
+            ("fstype", "FS",             55),
+            ("uuid",   "UUID",          145),
+            ("status", "État",          160),
         ]:
             self.usb_tree.heading(cid, text=heading)
             self.usb_tree.column(cid, width=width, minwidth=30, anchor=tk.W)
@@ -194,7 +200,6 @@ class VirusScannerGUI:
         tk.Label(engines_row, text="Moteurs :", bg="#16213e", fg="#e0e0e0",
                  width=10, anchor=tk.E).pack(side=tk.LEFT)
 
-        # ClamAV (toujours coché, désactivable pour tests uniquement)
         self.use_clamav_var = tk.BooleanVar(value=True)
         tk.Checkbutton(engines_row, text="ClamAV",
                        variable=self.use_clamav_var,
@@ -202,7 +207,6 @@ class VirusScannerGUI:
                        selectcolor="#0f3460", activebackground="#16213e",
                        font=("Arial", 9)).pack(side=tk.LEFT, padx=6)
 
-        # Avast
         self.use_avast_var = tk.BooleanVar(value=False)
         self._avast_chk = tk.Checkbutton(engines_row, text="Avast",
                                           variable=self.use_avast_var,
@@ -212,7 +216,6 @@ class VirusScannerGUI:
                                           font=("Arial", 9))
         self._avast_chk.pack(side=tk.LEFT, padx=6)
 
-        # YARA
         self.use_yara_var = tk.BooleanVar(value=True)
         tk.Checkbutton(engines_row, text="YARA",
                        variable=self.use_yara_var,
@@ -348,8 +351,6 @@ class VirusScannerGUI:
     # ══════════════════════════════════════════════════════════════════════════
 
     def _refresh_status(self) -> None:
-        """Lance le rafraîchissement du statut en arrière-plan (clamscan peut
-        prendre quelques secondes pour charger toutes les bases)."""
         threading.Thread(target=self._refresh_status_worker, daemon=True).start()
 
     def _refresh_status_worker(self) -> None:
@@ -362,12 +363,10 @@ class VirusScannerGUI:
             lu      = info.get("last_update", "?")
             missing = info.get("missing", [])
 
-            # Compteur de signatures (toutes bases confondues) — appel bloquant
             count = self.db.get_known_virus_count()
             count_str = (f"  |  {count:,} signatures".replace(",", "\u202f")
                          if count else "")
 
-            # Statut des bases tierces — utilise total_count (liste + fichiers extra)
             tp          = self.db.get_third_party_sig_status()
             n_total     = tp.get("total_count", 0)
             n_listed    = len(tp["installed"])
@@ -378,7 +377,6 @@ class VirusScannerGUI:
             elif len(tp["missing"]) == 0:
                 tp_str = f"  |  {n_total} bases tierces ✅"
             else:
-                # Affiche "présents/attendus" en ne comptant que ceux de la liste connue
                 tp_str = f"  |  {n_listed}/{n_expected} bases tierces ▲"
                 if n_extra:
                     tp_str += f" (+{n_extra} extra)"
@@ -415,7 +413,6 @@ class VirusScannerGUI:
             else:
                 yara_text = f"⚠   YARA ({method}) : aucune règle installée"
 
-        # ── Mise à jour UI (thread-safe) ───────────────────────────────────────
         def _apply():
             self.clamav_status_var.set(clamav_text)
             self.avast_status_var.set(avast_text)
@@ -444,7 +441,7 @@ class VirusScannerGUI:
 
         if not self._usb_partitions:
             self.usb_tree.insert("", tk.END,
-                                  values=("—", "—", "—", "—",
+                                  values=("—", "—", "—", "—", "—",
                                           "Aucune clé USB détectée"))
             return
 
@@ -460,8 +457,12 @@ class VirusScannerGUI:
                 tag    = "unmount"
 
             iid = self.usb_tree.insert("", tk.END, iid=p.device,
-                                        values=(p.device, p.label or "—",
-                                                p.size, p.fstype, status),
+                                        values=(p.device,
+                                                p.label or "—",
+                                                p.size,
+                                                p.fstype,
+                                                p.uuid or "—",
+                                                status),
                                         tags=(tag,))
             if p.device == selected_dev:
                 reselect = iid
@@ -474,10 +475,25 @@ class VirusScannerGUI:
         if not dev:
             self.usb_info_var.set("")
             return
-        mp = self.usb.get_mountpoint(dev)
-        self.usb_info_var.set(
-            f"Point de montage : {mp}" if mp else f"{dev} — non monté"
-        )
+        # Récupère la partition sélectionnée pour afficher l'UUID complet
+        partition = next((p for p in self._usb_partitions if p.device == dev), None)
+        mp   = self.usb.get_mountpoint(dev)
+        uuid = partition.uuid if partition else self.usb.get_uuid(dev)
+
+        parts = []
+        if uuid:
+            parts.append(f"UUID : {uuid}")
+        if mp:
+            parts.append(f"Montage : {mp}")
+        else:
+            parts.append(f"{dev} — non monté")
+
+        self.usb_info_var.set("  |  ".join(parts))
+
+        # Journalise l'UUID lors de la sélection (une fois, sans spam)
+        if uuid and getattr(self, "_last_logged_uuid", None) != dev:
+            self._last_logged_uuid = dev
+            log_info(f"Périphérique USB sélectionné : {dev}  UUID={uuid}")
 
     def _selected_usb(self) -> Optional[str]:
         sel = self.usb_tree.selection()
@@ -538,7 +554,6 @@ class VirusScannerGUI:
         if self.is_scanning:
             return
 
-        # Vérifications moteurs
         if not self.engine.is_clamav_installed() and not self.use_avast_var.get():
             messagebox.showerror(
                 "Aucun moteur actif",
@@ -551,7 +566,6 @@ class VirusScannerGUI:
         if not self.engine.is_clamav_installed():
             self._log("⚠ ClamAV non installé — analyse ClamAV ignorée.", "warning")
 
-        # Avertissement Avast sans licence
         if self.use_avast_var.get() and self.engine.is_avast_installed():
             if not self.engine.is_avast_licensed():
                 if not messagebox.askyesno(
@@ -563,7 +577,6 @@ class VirusScannerGUI:
                 ):
                     return
 
-        # Sélection USB
         dev = self._selected_usb()
         if not dev:
             messagebox.showwarning(
@@ -573,7 +586,6 @@ class VirusScannerGUI:
             )
             return
 
-        # Montage si nécessaire
         mp = self.usb.get_mountpoint(dev)
         if not mp:
             if not messagebox.askyesno(
@@ -604,7 +616,6 @@ class VirusScannerGUI:
             ):
                 return
 
-        # Lance le scan
         self.is_scanning = True
         self.scan_btn.configure(state=tk.DISABLED, bg="#555")
         self.stop_btn.configure(state=tk.NORMAL, bg="#e94560")
@@ -619,7 +630,14 @@ class VirusScannerGUI:
             "Avast"  if self.use_avast_var.get()  else None,
             "YARA"   if self.use_yara_var.get()   else None,
         ]))
-        self._log(f"Démarrage de l'analyse : {dev} → {mp}  [{engines_str}]", "info")
+
+        # Récupère l'UUID pour l'inclure dans le log de démarrage
+        partition = next((p for p in self._usb_partitions if p.device == dev), None)
+        uuid_str  = f"  UUID={partition.uuid}" if partition and partition.uuid else ""
+        self._log(
+            f"Démarrage de l'analyse : {dev}{uuid_str} → {mp}  [{engines_str}]",
+            "info"
+        )
 
         targets = self._get_scan_targets(dev, mp)
 
@@ -634,13 +652,12 @@ class VirusScannerGUI:
             self._log(f"Mode rapide : {mountpoint}")
             return [mountpoint]
 
-        import subprocess as _sp
         targets = []
         try:
             p   = self._find_partition(device)
-            out = _sp.check_output(
+            out = subprocess.check_output(
                 ["lsblk", "-no", "NAME", f"/dev/{p}"],
-                text=True, stderr=_sp.PIPE
+                text=True, stderr=subprocess.PIPE
             )
             for line in out.strip().splitlines()[1:]:
                 part = "/dev/" + line.strip().lstrip("├─└─").strip()
@@ -748,7 +765,11 @@ class VirusScannerGUI:
             # YARA
             on_update_yara_online     = self._admin_yara_online,
             on_import_yara_usb        = self._admin_yara_usb,
+            # Journaux
+            on_export_logs_usb        = self._admin_export_logs_usb,
+            on_purge_logs             = self._admin_purge_logs,
             # Système
+            on_poweroff               = self._admin_poweroff,
             on_quit                   = self._quit,
         )
         panel.show()
@@ -817,7 +838,6 @@ class VirusScannerGUI:
     # ── Actions admin Avast ───────────────────────────────────────────────────
 
     def _admin_avast_activate_code(self, code: str) -> None:
-        """Appelé depuis l'onglet Avast du panneau admin avec le code saisi."""
         self._log(f"Activation du code Avast {code[:4]}****…", "info")
         self._run_background(
             task    = lambda cb: self.db.activate_avast_with_code(code, progress_cb=cb),
@@ -841,7 +861,6 @@ class VirusScannerGUI:
         if len(files) == 1:
             chosen = files[0]
         else:
-            # Si plusieurs fichiers trouvés, utiliser le plus récent
             chosen = max(files, key=os.path.getmtime)
             names  = "\n".join(f"• {f}" for f in files)
             if not messagebox.askyesno(
@@ -866,13 +885,10 @@ class VirusScannerGUI:
         )
 
     def _admin_avast_license_file(self, path: str) -> None:
-        """Import d'un fichier .avastlic sélectionné via le dialogue Parcourir."""
-        import os as _os
-        if not _os.path.isfile(path):
-            from tkinter import messagebox as _mb
-            _mb.showerror("Fichier introuvable",
-                          f"Le fichier n'existe pas :\n{path}",
-                          parent=self.root)
+        if not os.path.isfile(path):
+            messagebox.showerror("Fichier introuvable",
+                                  f"Le fichier n'existe pas :\n{path}",
+                                  parent=self.root)
             return
         self._log(f"Import de la licence Avast depuis : {path}", "info")
         self._run_background(
@@ -919,7 +935,6 @@ class VirusScannerGUI:
             parent=self.root
         ):
             return
-        # Importer le premier fichier trouvé (ou le plus récent)
         chosen = max(files, key=os.path.getmtime)
         self._run_background(
             task    = lambda cb: self.db.import_avast_vps_from_usb(chosen,
@@ -964,6 +979,186 @@ class VirusScannerGUI:
             label   = "YARA import USB",
             on_done = lambda ok, msg: self._refresh_status()
         )
+
+    # ── Actions admin Journaux ────────────────────────────────────────────────
+
+    def _admin_export_logs_usb(self) -> None:
+        """
+        Exporte les logs vers un support USB :
+         1. Liste les partitions USB disponibles.
+         2. Demande à l'utilisateur de sélectionner une partition.
+         3. Monte en RW (ou utilise un montage existant).
+         4. Ouvre un sélecteur de dossier dans le point de montage.
+         5. Copie les fichiers de log.
+         6. Restitue l'état du montage (démontage ou remontage RO).
+        """
+        from tkinter import filedialog
+
+        partitions = self.usb.list_partitions()
+        if not partitions:
+            messagebox.showwarning(
+                "Aucune clé USB",
+                "Aucun support USB détecté.\n\n"
+                "Insérez une clé USB de destination et réessayez.",
+                parent=self.root
+            )
+            return
+
+        # ── Sélection de la partition cible ───────────────────────────────────
+        if len(partitions) == 1:
+            target = partitions[0]
+        else:
+            # Dialogue de sélection simple
+            sel_win  = tk.Toplevel(self.root)
+            sel_win.title("Sélectionner le support d'export")
+            sel_win.resizable(False, False)
+            sel_win.grab_set()
+            sel_win.transient(self.root)
+
+            w, h = 480, 260
+            px = self.root.winfo_rootx() + (self.root.winfo_width()  - w) // 2
+            py = self.root.winfo_rooty() + (self.root.winfo_height() - h) // 2
+            sel_win.geometry(f"{w}x{h}+{px}+{py}")
+
+            ttk.Label(sel_win,
+                      text="Choisissez le support USB de destination :",
+                      font=("Arial", 10, "bold"),
+                      padding=12).pack(anchor=tk.W)
+
+            lb_var  = tk.StringVar()
+            lb_frame = ttk.Frame(sel_win, padding=(12, 0))
+            lb_frame.pack(fill=tk.BOTH, expand=True)
+            lb = tk.Listbox(lb_frame, selectmode=tk.SINGLE, font=("Courier", 9),
+                            height=6)
+            for p in partitions:
+                mp  = self.usb.get_mountpoint(p.device) or "non monté"
+                uuid_short = p.short_uuid
+                lb.insert(tk.END,
+                           f"{p.device}  {p.size}  {p.fstype}  "
+                           f"UUID:{uuid_short}  [{mp}]")
+            lb.pack(fill=tk.BOTH, expand=True)
+            lb.selection_set(0)
+
+            chosen: list = [None]
+
+            def _ok():
+                idx = lb.curselection()
+                if idx:
+                    chosen[0] = partitions[idx[0]]
+                sel_win.destroy()
+
+            def _cancel():
+                sel_win.destroy()
+
+            btn_row = ttk.Frame(sel_win, padding=8)
+            btn_row.pack()
+            ttk.Button(btn_row, text="✓ Sélectionner",
+                       command=_ok, width=16).pack(side=tk.LEFT, padx=4)
+            ttk.Button(btn_row, text="✕ Annuler",
+                       command=_cancel, width=12).pack(side=tk.LEFT, padx=4)
+
+            sel_win.wait_window()
+            target = chosen[0]
+            if target is None:
+                return
+
+        self._log(f"Montage RW de {target.device} pour export des logs…", "info")
+
+        # ── Montage RW ────────────────────────────────────────────────────────
+        ok, msg, mp, action = self.usb.mount_for_export(
+            target.device,
+            progress_cb=lambda m: self._log(m, "info")
+        )
+        if not ok:
+            self._log(f"❌ {msg}", "threat")
+            messagebox.showerror("Erreur de montage", msg, parent=self.root)
+            return
+
+        self._log(f"✅ {msg}", "ok")
+        self._refresh_usb()
+
+        try:
+            # ── Sélection du dossier de destination ───────────────────────────
+            dest_dir = filedialog.askdirectory(
+                parent      = self.root,
+                title       = "Sélectionner le dossier de destination sur USB",
+                initialdir  = mp,
+                mustexist   = False,
+            )
+
+            if not dest_dir:
+                self._log("Export annulé par l'utilisateur.", "info")
+                return
+
+            # Vérifie que le dossier cible est bien sur le support monté
+            if not dest_dir.startswith(mp):
+                if not messagebox.askyesno(
+                    "Dossier hors du support USB",
+                    f"Le dossier sélectionné n'est pas sur {mp}.\n\n"
+                    f"Continuer l'export vers :\n{dest_dir} ?",
+                    parent=self.root
+                ):
+                    return
+
+            # Crée le dossier si besoin
+            try:
+                os.makedirs(dest_dir, exist_ok=True)
+            except OSError as e:
+                messagebox.showerror("Erreur",
+                                      f"Impossible de créer le dossier :\n{e}",
+                                      parent=self.root)
+                return
+
+            # ── Copie des logs ─────────────────────────────────────────────────
+            self._log(f"Export des logs vers {dest_dir}…", "info")
+            ok_exp, msg_exp = export_logs_to_path(dest_dir)
+            tag = "ok" if ok_exp else "threat"
+            self._log(f"{'✅' if ok_exp else '❌'} {msg_exp}", tag)
+
+            if ok_exp:
+                messagebox.showinfo("Export terminé", msg_exp, parent=self.root)
+            else:
+                messagebox.showerror("Erreur d'export", msg_exp, parent=self.root)
+
+        finally:
+            # ── Restitution de l'état du montage (quoi qu'il arrive) ──────────
+            self.usb.restore_after_export(target.device, action)
+            self._log(f"Support USB {target.device} restitué (action={action}).", "info")
+            self._refresh_usb()
+
+    def _admin_purge_logs(self) -> None:
+        """Purge tous les fichiers de log (appelé depuis l'onglet Journaux)."""
+        ok, msg = purge_logs()
+        tag = "ok" if ok else "threat"
+        self._log(f"{'✅' if ok else '❌'} {msg}", tag)
+        if not ok:
+            messagebox.showerror("Erreur de purge", msg, parent=self.root)
+
+    # ── Action Arrêt ──────────────────────────────────────────────────────────
+
+    def _admin_poweroff(self) -> None:
+        """
+        Éteint la station :
+          1. Démonte tous les supports USB gérés.
+          2. Ferme l'interface.
+          3. Lance 'poweroff'.
+        """
+        self._log("Arrêt demandé par l'administrateur — démontage des supports USB…",
+                  "warning")
+        self.usb.umount_all()
+        log_info("Arrêt système initié.")
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+        try:
+            subprocess.run(["poweroff"], check=False)
+        except Exception as e:
+            # Fallback : shutdown
+            try:
+                subprocess.run(["shutdown", "-h", "now"], check=False)
+            except Exception:
+                pass
 
     # ── Worker générique en arrière-plan ──────────────────────────────────────
 

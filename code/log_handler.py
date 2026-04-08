@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
-"""log_handler.py – Journalisation et export PDF."""
+"""log_handler.py – Journalisation avec rotation par volumétrie et export PDF/USB."""
 
 import logging
 import os
+import shutil
 import sys
 from datetime import datetime
-from typing import List
+from logging.handlers import RotatingFileHandler
+from typing import List, Tuple
 
 from config import LOG_FILE
+
+# ── Paramètres de rotation ─────────────────────────────────────────────────────
+_LOG_MAX_BYTES  = 5 * 1024 * 1024   # 5 Mo par fichier
+_LOG_BACKUP_CNT = 5                  # 5 archives conservées
 
 # ── Configuration du logger ────────────────────────────────────────────────────
 logging.basicConfig(
@@ -18,7 +24,13 @@ logger = logging.getLogger("virusscanner")
 logger.setLevel(logging.INFO)
 
 try:
-    _fh = logging.FileHandler(LOG_FILE)
+    _fh = RotatingFileHandler(
+        LOG_FILE,
+        maxBytes=_LOG_MAX_BYTES,
+        backupCount=_LOG_BACKUP_CNT,
+        encoding="utf-8",
+        delay=False,
+    )
     _fh.setLevel(logging.INFO)
     _fh.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
     logger.addHandler(_fh)
@@ -30,6 +42,101 @@ except PermissionError:
 def log_info(msg: str)    -> None: logger.info(msg)
 def log_error(msg: str)   -> None: logger.error(msg)
 def log_warning(msg: str) -> None: logger.warning(msg)
+
+
+# ── Gestion des fichiers de log ────────────────────────────────────────────────
+
+def get_log_files() -> List[str]:
+    """
+    Retourne la liste des fichiers de log existants :
+    le fichier actif + les archives de rotation (.1 … .N).
+    """
+    files: List[str] = []
+    if os.path.exists(LOG_FILE):
+        files.append(LOG_FILE)
+    for i in range(1, _LOG_BACKUP_CNT + 1):
+        rotated = f"{LOG_FILE}.{i}"
+        if os.path.exists(rotated):
+            files.append(rotated)
+    return files
+
+
+def get_log_size_info() -> str:
+    """
+    Retourne une chaîne lisible décrivant la volumétrie des logs,
+    ex. : "3 fichier(s)  –  4,2 Mo"
+    """
+    files = get_log_files()
+    total = sum(os.path.getsize(f) for f in files)
+    mb    = total / (1024 * 1024)
+    size_str = f"{mb:.1f} Mo" if mb >= 1.0 else f"{total // 1024} Ko"
+    return f"{len(files)} fichier(s)  –  {size_str}"
+
+
+def purge_logs() -> Tuple[bool, str]:
+    """
+    Supprime tous les fichiers de log (actif + archives de rotation).
+    Recrée ensuite le fichier actif vide pour que le handler RotatingFileHandler
+    puisse continuer d'écrire sans erreur.
+    Retourne (ok, message).
+    """
+    deleted: List[str] = []
+    errors:  List[str] = []
+
+    for path in get_log_files():
+        try:
+            os.remove(path)
+            deleted.append(path)
+        except OSError as e:
+            errors.append(f"{os.path.basename(path)}: {e}")
+
+    # Recréer le fichier principal vide
+    try:
+        with open(LOG_FILE, "w", encoding="utf-8") as _f:
+            pass
+    except OSError:
+        pass
+
+    if errors:
+        return False, "Erreurs lors de la purge : " + " ; ".join(errors)
+
+    n = len(deleted)
+    # On relogue APRÈS la purge pour avoir une trace
+    log_info(f"Purge des logs effectuée : {n} fichier(s) supprimé(s).")
+    return True, f"{n} fichier(s) de log supprimé(s) avec succès."
+
+
+def export_logs_to_path(dest_dir: str) -> Tuple[bool, str]:
+    """
+    Copie tous les fichiers de log (actif + archives) dans dest_dir.
+    Chaque fichier est préfixé d'un horodatage pour éviter les collisions.
+    Retourne (ok, message).
+    """
+    if not os.path.isdir(dest_dir):
+        return False, f"Répertoire de destination introuvable : {dest_dir}"
+
+    files = get_log_files()
+    if not files:
+        return False, "Aucun fichier de log à exporter."
+
+    ts     = datetime.now().strftime("%Y%m%d_%H%M%S")
+    copied: List[str] = []
+    errors: List[str] = []
+
+    for src in files:
+        basename = os.path.basename(src)
+        dst      = os.path.join(dest_dir, f"{ts}_{basename}")
+        try:
+            shutil.copy2(src, dst)
+            copied.append(dst)
+        except OSError as e:
+            errors.append(f"{basename}: {e}")
+
+    if errors:
+        return False, "Erreurs lors de la copie : " + " ; ".join(errors)
+
+    log_info(f"Export des logs vers {dest_dir} : {len(copied)} fichier(s) copié(s).")
+    return True, f"{len(copied)} fichier(s) exporté(s) dans :\n{dest_dir}"
 
 
 # ── Export PDF (bibliothèques standard uniquement) ────────────────────────────

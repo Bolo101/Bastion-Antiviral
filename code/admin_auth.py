@@ -2,13 +2,15 @@
 """admin_auth.py – Authentification et panneau d'administration.
 
 Onglets du panneau :
-  🛡 ClamAV     – mise à jour base (en ligne / USB)
-  🔐 Avast      – licence (activation par code, import .avastlic USB)
-                  + base VPS (en ligne / USB)
-  🔍 YARA       – règles signature-base (GitHub / USB)
+  🛡 ClamAV       – mise à jour base (en ligne / USB)
+  🔐 Avast        – licence (activation par code, import .avastlic USB)
+                    + base VPS (en ligne / USB)
+  🔍 YARA         – règles signature-base (GitHub / USB)
   ⏰ Planification – crontab freshclam
-  🔑 Sécurité   – changement du code admin
-  🚪 Quitter    – fermeture propre
+  📋 Journaux     – export vers USB, purge des logs
+  🔑 Sécurité     – changement du code admin
+  ⏻  Arrêt        – poweroff de la station
+  🚪 Quitter      – fermeture propre de l'application
 """
 
 import hashlib
@@ -193,7 +195,11 @@ class AdminPanel:
         # YARA
         on_update_yara_online:     Callable,
         on_import_yara_usb:        Callable,
+        # Journaux
+        on_export_logs_usb:        Callable,
+        on_purge_logs:             Callable,
         # Système
+        on_poweroff:               Callable,
         on_quit:                   Callable,
     ) -> None:
         self._parent = parent
@@ -210,6 +216,9 @@ class AdminPanel:
             "avast_refresh":         on_refresh_avast_status,
             "yara_online":           on_update_yara_online,
             "yara_usb":              on_import_yara_usb,
+            "export_logs_usb":       on_export_logs_usb,
+            "purge_logs":            on_purge_logs,
+            "poweroff":              on_poweroff,
             "quit":                  on_quit,
         }
 
@@ -240,7 +249,7 @@ class AdminPanel:
         dlg.grab_set()
         dlg.transient(self._parent)
 
-        w, h = 620, 520
+        w, h = 640, 540
         px = self._parent.winfo_rootx() + (self._parent.winfo_width()  - w) // 2
         py = self._parent.winfo_rooty() + (self._parent.winfo_height() - h) // 2
         dlg.geometry(f"{w}x{h}+{px}+{py}")
@@ -252,7 +261,9 @@ class AdminPanel:
         self._tab_avast(nb)
         self._tab_yara(nb)
         self._tab_cron(nb)
+        self._tab_logs(nb)
         self._tab_security(nb)
+        self._tab_poweroff(nb, dlg)
         self._tab_quit(nb, dlg)
 
         ttk.Button(dlg, text="Fermer", command=dlg.destroy).pack(pady=6)
@@ -328,7 +339,6 @@ class AdminPanel:
         lic_frame = ttk.LabelFrame(tab, text="Licence Business", padding=8)
         lic_frame.pack(fill=tk.X, pady=(0, 8))
 
-        # ── Sous-section A : code d'activation ───────────────────────────────
         ttk.Label(
             lic_frame,
             text="A — Code d'activation (Internet requis) :"
@@ -359,7 +369,6 @@ class AdminPanel:
             row=2, column=0, columnspan=3, sticky=tk.EW, pady=8
         )
 
-        # ── Sous-section B : import USB ───────────────────────────────────────
         ttk.Label(
             lic_frame,
             text="B — Fichier license.avastlic depuis une clé USB :",
@@ -374,7 +383,6 @@ class AdminPanel:
             row=5, column=0, columnspan=3, sticky=tk.EW, pady=8
         )
 
-        # ── Sous-section C : parcourir le système de fichiers ─────────────────
         ttk.Label(
             lic_frame,
             text="C — Fichier license.avastlic depuis le système de fichiers :",
@@ -462,10 +470,10 @@ class AdminPanel:
                 )
                 return
             from config import AVAST_LICENSE_PATH
-            import time, os
+            import time as _time
             try:
                 mtime = os.path.getmtime(AVAST_LICENSE_PATH)
-                date  = time.strftime("%Y-%m-%d", time.localtime(mtime))
+                date  = _time.strftime("%Y-%m-%d", _time.localtime(mtime))
             except OSError:
                 date = "?"
             self._avast_status_var.set(
@@ -561,6 +569,109 @@ class AdminPanel:
         ttk.Button(row3, text="✓ Appliquer",  command=_apply,  width=16).pack(side=tk.LEFT, padx=4)
         ttk.Button(row3, text="🗑 Supprimer", command=_remove, width=16).pack(side=tk.LEFT, padx=4)
 
+    # ── Onglet Journaux ────────────────────────────────────────────────────────
+
+    def _tab_logs(self, nb: ttk.Notebook) -> None:
+        tab = ttk.Frame(nb, padding=16)
+        nb.add(tab, text="📋 Journaux")
+
+        ttk.Label(tab, text="Gestion des journaux d'activité",
+                  font=("Arial", 11, "bold")).pack(anchor=tk.W, pady=(0, 6))
+
+        # ── Volumétrie actuelle ────────────────────────────────────────────────
+        info_frame = ttk.LabelFrame(tab, text="Volumétrie", padding=8)
+        info_frame.pack(fill=tk.X, pady=(0, 10))
+
+        from log_handler import get_log_size_info, LOG_FILE as _LOG_FILE
+        self._log_size_var = tk.StringVar(value=get_log_size_info())
+
+        size_row = ttk.Frame(info_frame)
+        size_row.pack(fill=tk.X)
+        ttk.Label(size_row, text="Fichier principal :").pack(side=tk.LEFT)
+        ttk.Label(size_row, text=_LOG_FILE,
+                  foreground="navy", font=("Courier", 9)).pack(side=tk.LEFT, padx=6)
+
+        vol_row = ttk.Frame(info_frame)
+        vol_row.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(vol_row, text="Taille totale (rotation incluse) :").pack(side=tk.LEFT)
+        ttk.Label(vol_row, textvariable=self._log_size_var,
+                  foreground="navy", font=("Courier", 9)).pack(side=tk.LEFT, padx=6)
+
+        def _refresh_size():
+            from log_handler import get_log_size_info
+            self._log_size_var.set(get_log_size_info())
+
+        ttk.Button(info_frame, text="↺  Actualiser",
+                   command=_refresh_size, width=14).pack(anchor=tk.W, pady=(6, 0))
+
+        ttk.Label(info_frame,
+                  text=f"Rotation : fichiers de 5 Mo max, 5 archives conservées.",
+                  foreground="#666", font=("Arial", 8)).pack(anchor=tk.W, pady=(4, 0))
+
+        # ── Export vers support externe ────────────────────────────────────────
+        export_frame = ttk.LabelFrame(tab, text="Export vers support externe", padding=8)
+        export_frame.pack(fill=tk.X, pady=(0, 10))
+
+        ttk.Label(
+            export_frame,
+            text="Monte une clé USB en écriture, vous permet de sélectionner\n"
+                 "un répertoire de destination, copie les logs, puis démonte\n"
+                 "automatiquement le support.",
+            justify=tk.LEFT, foreground="#444"
+        ).pack(anchor=tk.W, pady=(0, 8))
+
+        export_status_var = tk.StringVar()
+        export_status_lbl = ttk.Label(export_frame, textvariable=export_status_var,
+                                       wraplength=440)
+        export_status_lbl.pack(anchor=tk.W, pady=(0, 4))
+
+        def _do_export():
+            export_status_var.set("Export en cours…")
+            export_status_lbl.configure(foreground="blue")
+            tab.update_idletasks()
+            self._cb["export_logs_usb"]()
+            _refresh_size()
+            export_status_var.set("")
+
+        ttk.Button(export_frame, text="💾  Exporter les logs vers USB",
+                   command=_do_export, width=32).pack(anchor=tk.W)
+
+        # ── Purge ─────────────────────────────────────────────────────────────
+        purge_frame = ttk.LabelFrame(tab, text="Purge des logs", padding=8)
+        purge_frame.pack(fill=tk.X)
+
+        ttk.Label(
+            purge_frame,
+            text="⚠  Supprime définitivement tous les fichiers de log\n"
+                 "   (fichier actif + archives de rotation).\n"
+                 "   Une confirmation sera demandée avant l'opération.",
+            justify=tk.LEFT, foreground="#8B0000"
+        ).pack(anchor=tk.W, pady=(0, 8))
+
+        purge_status_var = tk.StringVar()
+        purge_status_lbl = ttk.Label(purge_frame, textvariable=purge_status_var,
+                                      wraplength=440)
+        purge_status_lbl.pack(anchor=tk.W, pady=(0, 4))
+
+        def _do_purge():
+            result = messagebox.askyesno(
+                "⚠  Confirmer la purge",
+                "Cette opération supprime DÉFINITIVEMENT\n"
+                "tous les journaux d'activité.\n\n"
+                "Êtes-vous certain de vouloir continuer ?",
+                icon="warning",
+                parent=tab.winfo_toplevel()
+            )
+            if not result:
+                return
+            self._cb["purge_logs"]()
+            _refresh_size()
+            purge_status_lbl.configure(foreground="green")
+            purge_status_var.set("✅ Purge effectuée.")
+
+        ttk.Button(purge_frame, text="🗑  Purger tous les logs",
+                   command=_do_purge, width=24).pack(anchor=tk.W)
+
     # ── Onglet Sécurité ────────────────────────────────────────────────────────
 
     def _tab_security(self, nb: ttk.Notebook) -> None:
@@ -605,6 +716,47 @@ class AdminPanel:
                       text="⚠  Code par défaut (0000) – changez-le maintenant !",
                       foreground="red", font=("Arial", 9, "bold")).grid(
                 row=6, column=0, columnspan=2, pady=4)
+
+    # ── Onglet Arrêt ──────────────────────────────────────────────────────────
+
+    def _tab_poweroff(self, nb: ttk.Notebook, dlg: tk.Toplevel) -> None:
+        tab = ttk.Frame(nb, padding=16)
+        nb.add(tab, text="⏻ Arrêt")
+
+        ttk.Label(tab, text="Arrêt de la station",
+                  font=("Arial", 11, "bold")).pack(pady=(0, 8))
+
+        ttk.Label(
+            tab,
+            text="Éteint complètement la station de travail.\n\n"
+                 "Avant l'arrêt :\n"
+                 "  • Les clés USB gérées par l'application sont démontées proprement.\n"
+                 "  • L'application est fermée.\n"
+                 "  • La commande system 'poweroff' est exécutée.\n\n"
+                 "⚠  Assurez-vous d'avoir sauvegardé votre travail.",
+            justify=tk.LEFT,
+            foreground="#444"
+        ).pack(anchor=tk.W, pady=(0, 16))
+
+        def _do_poweroff():
+            confirm = messagebox.askyesno(
+                "⏻  Confirmer l'arrêt",
+                "Voulez-vous vraiment éteindre la station ?\n\n"
+                "L'application sera fermée et la machine arrêtée.",
+                icon="warning",
+                parent=dlg
+            )
+            if not confirm:
+                return
+            dlg.destroy()
+            self._cb["poweroff"]()
+
+        ttk.Button(
+            tab,
+            text="⏻  Éteindre la station",
+            command=_do_poweroff,
+            width=26
+        ).pack(pady=8)
 
     # ── Onglet Quitter ────────────────────────────────────────────────────────
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""usb_manager.py – Détection et montage en lecture seule des clés USB."""
+"""usb_manager.py – Détection, montage RO/RW et démontage des clés USB."""
 
 import json
 import os
@@ -31,7 +31,7 @@ class UsbPartition:
 
     def __init__(self, device: str, parent: str, label: str,
                  size: str, fstype: str, mountpoint: Optional[str],
-                 managed: bool) -> None:
+                 managed: bool, uuid: str = "") -> None:
         self.device     = device
         self.parent     = parent
         self.label      = label
@@ -39,20 +39,30 @@ class UsbPartition:
         self.fstype     = fstype
         self.mountpoint = mountpoint
         self.managed    = managed
+        self.uuid       = uuid          # UUID blkid (ex. "1A2B-3C4D" ou UUID ext4)
 
     @property
     def display_name(self) -> str:
         label = f" [{self.label}]" if self.label else ""
         return f"{self.device}{label}  {self.size}  {self.fstype}"
 
+    @property
+    def short_uuid(self) -> str:
+        """UUID tronqué pour affichage compact (max 13 chars)."""
+        if not self.uuid:
+            return "—"
+        return self.uuid if len(self.uuid) <= 13 else self.uuid[:13] + "…"
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 class UsbManager:
-    """Détecte, monte (RO) et démonte les périphériques USB."""
+    """Détecte, monte (RO/RW) et démonte les périphériques USB."""
 
     def __init__(self) -> None:
-        # {device: mount_point} – montages gérés par nous
+        # {device: mount_point} – montages RO gérés par nous
         self._managed: Dict[str, str] = {}
+        # {device: mount_point} – montages RW temporaires (export)
+        self._managed_rw: Dict[str, str] = {}
 
     # ── Énumération ───────────────────────────────────────────────────────────
 
@@ -99,7 +109,21 @@ class UsbManager:
             fstype=node.get("fstype") or "inconnu",
             mountpoint=mp,
             managed=dev in self._managed,
+            uuid=self.get_uuid(dev),
         )
+
+    # ── UUID ──────────────────────────────────────────────────────────────────
+
+    def get_uuid(self, device: str) -> str:
+        """
+        Retourne l'UUID du périphérique via blkid.
+        Retourne une chaîne vide si introuvable.
+        """
+        rc, out, _ = _run(
+            ["blkid", "-s", "UUID", "-o", "value", device],
+            timeout=10
+        )
+        return out.strip() if rc == 0 else ""
 
     # ── Montage (lecture seule) ───────────────────────────────────────────────
 
@@ -108,12 +132,15 @@ class UsbManager:
         """
         Monte le périphérique en lecture seule.
         Si déjà monté en RW par le système, le remonte en RO.
+        Logue l'UUID du périphérique lors du montage.
         """
         current_mp = self._current_mountpoint(device)
 
         if current_mp:
             if self._is_ro(device, current_mp):
                 self._managed[device] = current_mp
+                uuid = self.get_uuid(device)
+                log_info(f"USB déjà monté RO : {device}  UUID={uuid or '?'}  → {current_mp}")
                 return True, f"Déjà monté en lecture seule sur {current_mp}"
             # Remontage en lecture seule
             if progress_cb:
@@ -121,7 +148,8 @@ class UsbManager:
             rc, _, err = _run(["mount", "-o", "remount,ro", current_mp], timeout=20)
             if rc == 0:
                 self._managed[device] = current_mp
-                log_info(f"USB remonté RO : {device} → {current_mp}")
+                uuid = self.get_uuid(device)
+                log_info(f"USB remonté RO : {device}  UUID={uuid or '?'}  → {current_mp}")
                 return True, f"{device} remonté en lecture seule sur {current_mp}"
             log_error(f"Remontage RO échoué pour {device} : {err.strip()}")
             return False, f"Impossible de remonter en lecture seule : {err.strip()}"
@@ -143,7 +171,8 @@ class UsbManager:
         rc, out, err = _run(["mount", "-o", "ro"] + extra + [device, mp], timeout=30)
         if rc == 0:
             self._managed[device] = mp
-            log_info(f"USB monté RO : {device} → {mp}")
+            uuid = self.get_uuid(device)
+            log_info(f"USB monté RO : {device}  UUID={uuid or '?'}  → {mp}")
             return True, f"{device} monté en lecture seule sur {mp}"
 
         try:
@@ -153,6 +182,93 @@ class UsbManager:
         err_clean = err.strip() or out.strip()
         log_error(f"Montage échoué {device} : {err_clean}")
         return False, f"Échec du montage : {err_clean}"
+
+    # ── Montage RW temporaire (export de logs) ────────────────────────────────
+
+    def mount_for_export(self, device: str,
+                         progress_cb: ProgressCB = None) -> Tuple[bool, str, Optional[str], str]:
+        """
+        Monte le périphérique en lecture/écriture pour permettre l'export de logs.
+
+        Cas possibles :
+          • Non monté            → nouveau montage RW à /mnt/avscan_export_<dev>
+          • Déjà monté RW        → utilise le point de montage existant (pas de démontage)
+          • Déjà monté RO par nous → remonte en RW temporairement
+
+        Retourne (ok, message, mountpoint, action)
+        où action ∈ {"mounted_rw", "remounted_rw", "existing_rw", "error"}
+        """
+        current_mp = self._current_mountpoint(device)
+
+        # ── Cas 1 : déjà monté RW ─────────────────────────────────────────────
+        if current_mp and not self._is_ro(device, current_mp):
+            uuid = self.get_uuid(device)
+            log_info(f"USB utilisé pour export (déjà RW) : {device}  UUID={uuid or '?'}  → {current_mp}")
+            return True, f"Utilisation du montage existant : {current_mp}", current_mp, "existing_rw"
+
+        # ── Cas 2 : déjà monté RO → remontage RW ─────────────────────────────
+        if current_mp and self._is_ro(device, current_mp):
+            if progress_cb:
+                progress_cb(f"Remontage RW temporaire de {device}…")
+            rc, _, err = _run(["mount", "-o", "remount,rw", current_mp], timeout=20)
+            if rc == 0:
+                uuid = self.get_uuid(device)
+                log_info(f"USB remonté RW (export) : {device}  UUID={uuid or '?'}  → {current_mp}")
+                return True, f"{device} remonté RW pour export.", current_mp, "remounted_rw"
+            log_error(f"Remontage RW échoué pour {device} : {err.strip()}")
+            return False, f"Impossible de remonter en RW : {err.strip()}", None, "error"
+
+        # ── Cas 3 : non monté → montage RW ───────────────────────────────────
+        dev_name = device.replace("/dev/", "").replace("/", "_")
+        mp = os.path.join(USB_MOUNT_BASE, f"export_{dev_name}")
+        try:
+            os.makedirs(mp, exist_ok=True)
+        except OSError as e:
+            return False, f"Impossible de créer le point de montage : {e}", None, "error"
+
+        if progress_cb:
+            progress_cb(f"Montage RW de {device} → {mp}…")
+
+        fstype = self._detect_fstype(device)
+        extra  = ["-t", fstype] if fstype in ("vfat", "exfat", "ntfs", "ntfs3") else []
+
+        rc, out, err = _run(["mount", "-o", "rw"] + extra + [device, mp], timeout=30)
+        if rc == 0:
+            self._managed_rw[device] = mp
+            uuid = self.get_uuid(device)
+            log_info(f"USB monté RW (export) : {device}  UUID={uuid or '?'}  → {mp}")
+            return True, f"{device} monté RW pour export.", mp, "mounted_rw"
+
+        try:
+            os.rmdir(mp)
+        except OSError:
+            pass
+        err_clean = err.strip() or out.strip()
+        log_error(f"Montage RW échoué {device} : {err_clean}")
+        return False, f"Échec du montage RW : {err_clean}", None, "error"
+
+    def restore_after_export(self, device: str, action: str) -> None:
+        """
+        Restaure l'état du montage après un export de logs.
+        - "mounted_rw"   → démonte le point de montage temporaire
+        - "remounted_rw" → remet en lecture seule
+        - "existing_rw"  → ne fait rien
+        """
+        if action == "mounted_rw":
+            mp = self._managed_rw.pop(device, None)
+            if mp:
+                _run(["umount", mp], timeout=20)
+                try:
+                    os.rmdir(mp)
+                except OSError:
+                    pass
+                log_info(f"Démontage export RW : {device}")
+        elif action == "remounted_rw":
+            mp = self._managed.get(device) or self._current_mountpoint(device)
+            if mp:
+                _run(["mount", "-o", "remount,ro", mp], timeout=20)
+                log_info(f"Remontage RO après export : {device} → {mp}")
+        # "existing_rw" ou "error" : rien à faire
 
     # ── Démontage ─────────────────────────────────────────────────────────────
 
@@ -185,6 +301,8 @@ class UsbManager:
     def umount_all(self) -> None:
         for dev in list(self._managed):
             self.umount(dev)
+        for dev in list(self._managed_rw):
+            self.restore_after_export(dev, "mounted_rw")
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
