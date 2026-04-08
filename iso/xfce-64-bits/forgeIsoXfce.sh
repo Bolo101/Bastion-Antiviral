@@ -1971,130 +1971,28 @@ ok "Hook 9999-bootmenu (syslinux + GRUB EFI) créé"
 step "Lancement de la build live-build (20-40 min)..."
 lb build 2>&1 | tee /tmp/lb-build.log
 
-# ── Récupération de l'ISO ─────────────────────────────────────────────────────
-step "Récupération de l'ISO générée..."
-BUILT_ISO=""
-for candidate in live-image-amd64.hybrid.iso live-image-amd64.iso; do
-    [[ -f "$candidate" ]] && { BUILT_ISO="$candidate"; break; }
-done
-[[ -n "$BUILT_ISO" ]] || err "ISO introuvable après la build. Consultez /tmp/lb-build.log"
-ok "ISO brute : $BUILT_ISO ($(du -h "$BUILT_ISO" | cut -f1))"
-
-# ── Comptage des fichiers intégrés (avant lb clean) ──────────────────────────
-ISO_SIZE=$(du -h "$BUILT_ISO" | cut -f1)
+# ── Comptage des fichiers intégrés (avant lb clean qui efface le chroot) ──────
 CV_COUNT=$(find "config/includes.chroot/var/lib/clamav" \( -name "*.cvd" -o -name "*.cld" \) 2>/dev/null | wc -l)
 TP_COUNT=$(find "config/includes.chroot/var/lib/clamav" \( -name "*.ndb" -o -name "*.hdb" -o -name "*.hsb" \
     -o -name "*.db" -o -name "*.ftm" -o -name "*.ldb" \
     -o -name "*.cdb" -o -name "*.fp" \) 2>/dev/null | wc -l)
 YR_COUNT=$(find "config/includes.chroot/var/lib/yara-rules/signature-base" -name "*.yar" 2>/dev/null | wc -l)
 
-# =============================================================================
-# Patch post-build via xorriso (filet de sécurité)
-# Patche isolinux.cfg, live.cfg ET grub.cfg dans l'ISO finale scellée.
-# Garantit les menus de boot même si lb_binary a régénéré ses configs.
-# =============================================================================
-step "Patch post-build des menus de boot via xorriso..."
+# ── Récupération de l'ISO ─────────────────────────────────────────────────────
+step "Récupération de l'ISO générée..."
+ISO_FOUND=""
+for candidate in live-image-amd64.hybrid.iso live-image-amd64.iso binary.hybrid.iso; do
+    [[ -f "$candidate" ]] && { ISO_FOUND="$candidate"; break; }
+done
+[[ -n "$ISO_FOUND" ]] || err "ISO introuvable après la build. Consultez /tmp/lb-build.log"
+ok "ISO : $ISO_FOUND ($(du -h "$ISO_FOUND" | cut -f1))"
 
-PATCH_DIR=$(mktemp -d)
-trap 'rm -rf "$PATCH_DIR"' EXIT
-
-# ── Génération des fichiers de remplacement ───────────────────────────────────
-cat > "$PATCH_DIR/isolinux.cfg" << SYSLINUX
-UI vesamenu.c32
-DEFAULT live
-TIMEOUT 150
-PROMPT 0
-
-MENU TITLE USB Antivirus Scanner v1.0 - Menu de demarrage
-
-LABEL live
-  MENU LABEL > Demarrer en mode Live (OpenBox kiosque)
-  MENU DEFAULT
-  KERNEL /live/vmlinuz
-  APPEND initrd=/live/initrd.img ${BOOT_PARAMS}
-
-LABEL install
-  MENU LABEL > Installer sur le disque (kiosque persistant)
-  KERNEL /live/vmlinuz
-  APPEND initrd=/live/initrd.img ${BOOT_PARAMS} installer=1
-
-LABEL live-safe
-  MENU LABEL > Demarrer en mode Live - Sans echec (nomodeset)
-  KERNEL /live/vmlinuz
-  APPEND initrd=/live/initrd.img ${BOOT_PARAMS} nomodeset
-SYSLINUX
-
-echo "# replaced by custom boot menu" > "$PATCH_DIR/live.cfg"
-
-cat > "$PATCH_DIR/grub.cfg" << GRUBMENU
-set default=0
-set timeout=15
-
-if [ x\$feature_all_video_module = xy ]; then
-  insmod all_video
-fi
-
-menuentry "Demarrer en mode Live (OpenBox kiosque)" {
-  linux /live/vmlinuz ${BOOT_PARAMS}
-  initrd /live/initrd.img
-}
-
-menuentry "Installer sur le disque (kiosque persistant)" {
-  linux /live/vmlinuz ${BOOT_PARAMS} installer=1
-  initrd /live/initrd.img
-}
-
-menuentry "Demarrer en mode Live - Sans echec (nomodeset)" {
-  linux /live/vmlinuz ${BOOT_PARAMS} nomodeset
-  initrd /live/initrd.img
-}
-GRUBMENU
-
-# ── Inventaire des chemins dans l'ISO ─────────────────────────────────────────
-ISO_FILES=$(xorriso -indev "$BUILT_ISO" -find / -type f 2>/dev/null | grep '^/' || true)
-ISO_ISOL_CFG=$(echo "$ISO_FILES" | grep -i 'isolinux\.cfg$'          | head -1)
-ISO_LIVE_CFG=$(echo "$ISO_FILES" | grep -i '/isolinux/live\.cfg$'    | head -1)
-ISO_GRUB_CFG=$(echo "$ISO_FILES" | grep -i 'boot/grub/grub\.cfg$'    | head -1)
-[ -z "$ISO_ISOL_CFG" ] && ISO_ISOL_CFG="/isolinux/isolinux.cfg"
-[ -z "$ISO_LIVE_CFG" ] && ISO_LIVE_CFG="/isolinux/live.cfg"
-[ -z "$ISO_GRUB_CFG" ] && ISO_GRUB_CFG="/boot/grub/grub.cfg"
-ok "isolinux.cfg : $ISO_ISOL_CFG  |  grub.cfg : $ISO_GRUB_CFG"
-
-# ── Application du patch xorriso ─────────────────────────────────────────────
-PATCHED_ISO="$PATCH_DIR/patched.iso"
-xorriso \
-    -indev  "$BUILT_ISO" \
-    -outdev "$PATCHED_ISO" \
-    -boot_image any replay \
-    -map "$PATCH_DIR/isolinux.cfg" "$ISO_ISOL_CFG" \
-    -map "$PATCH_DIR/live.cfg"     "$ISO_LIVE_CFG" \
-    -map "$PATCH_DIR/grub.cfg"     "$ISO_GRUB_CFG"
-
-# ── Vérification taille ───────────────────────────────────────────────────────
-ORIG_SIZE=$(stat -c%s "$BUILT_ISO")
-PATCH_SIZE=$(stat -c%s "$PATCHED_ISO" 2>/dev/null || echo 0)
-if [ "$PATCH_SIZE" -lt $(( ORIG_SIZE / 2 )) ]; then
-    warn "ISO patchée anormalement petite ($PATCH_SIZE vs $ORIG_SIZE) — utilisation de l'originale"
-    cp "$BUILT_ISO" "$PATCH_DIR/patched.iso" || true
-fi
-ok "ISO patchée : $PATCH_SIZE octets (originale : $ORIG_SIZE)"
-
-# ── Vérification grub.cfg ────────────────────────────────────────────────────
-VERIFY="$PATCH_DIR/verify_grub.cfg"
-xorriso -indev "$PATCHED_ISO" -osirrox on -extract "$ISO_GRUB_CFG" "$VERIFY" 2>/dev/null || true
-if [[ -f "$VERIFY" ]] && grep -q "installer=1" "$VERIFY"; then
-    ok "grub.cfg : entrée installer=1 confirmée"
-else
-    warn "grub.cfg : entrée installer=1 non trouvée (hook binary suffit)"
-fi
-
-mv "$PATCHED_ISO" "$BUILT_ISO"
-ok "Patch xorriso appliqué"
+ISO_SIZE=$(du -h "$ISO_FOUND" | cut -f1)
 
 # ── Renommage final ───────────────────────────────────────────────────────────
 step "Finalisation..."
-mv "$BUILT_ISO" "$ISO_NAME"
-ok "ISO : $ISO_NAME"
+mv "$ISO_FOUND" "$ISO_NAME"
+ok "ISO finale : $ISO_NAME"
 
 # ── Nettoyage ─────────────────────────────────────────────────────────────────
 step "Nettoyage..."
