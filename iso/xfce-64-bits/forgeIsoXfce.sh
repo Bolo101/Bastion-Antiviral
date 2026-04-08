@@ -1,18 +1,22 @@
 #!/bin/bash
-# =============================================================================
-# forgeIsoXfce.sh  –  Génère une ISO live Debian Bookworm / XFCE
-#                     avec le scanner antiviral USB (ClamAV + YARA)
-#
-# Pré-requis sur la machine de build :
-#   sudo apt install live-build wget curl python3 unzip
-#
-# Structure attendue du projet :
-#   ../code/        → les 8 fichiers Python du scanner
-#   ../database/    → (optionnel) fichiers .cvd/.yar pré-téléchargés
-#
-# Exécution :
-#   chmod +x forgeIsoXfce.sh && sudo ./forgeIsoXfce.sh
-# =============================================================================
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  forgeIsoXfce.sh  –  ISO live Debian Bookworm  /  OpenBox + LightDM         ║
+# ║                       Scanner antiviral USB  (ClamAV + YARA + Avast)        ║
+# ║                                                                              ║
+# ║  Entrée 1 : Live       → OpenBox kiosque  (usb-antivirus)                   ║
+# ║  Entrée 2 : Installer  → rsync sur disque + session installée kiosque       ║
+# ║  Entrée 3 : Live Safe  → Live + nomodeset                                   ║
+# ║                                                                              ║
+# ║  Pré-requis sur la machine de build :                                       ║
+# ║    sudo apt install live-build xorriso syslinux wget curl python3 unzip     ║
+# ║                                                                              ║
+# ║  Structure du projet :                                                       ║
+# ║    ../code/      → les 8 fichiers Python du scanner                         ║
+# ║    ../database/  → (optionnel) .cvd/.yar pré-téléchargés                   ║
+# ║                                                                              ║
+# ║  Exécution :                                                                 ║
+# ║    chmod +x forgeIsoXfce.sh && sudo ./forgeIsoXfce.sh                      ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
 
 set -euo pipefail
 
@@ -23,6 +27,9 @@ CODE_DIR="$(pwd)/../../code"
 DATABASE_DIR="$(pwd)/../database"
 SIGBASE_URL="https://github.com/Neo23x0/signature-base/archive/refs/heads/master.zip"
 
+# Paramètres de boot communs (réutilisés dans syslinux + GRUB)
+BOOT_PARAMS="boot=live components quiet splash hostname=antivirus-usb username=scanner locales=fr_FR.UTF-8 keyboard-layouts=fr noeject nopersistent"
+
 # ── Couleurs ──────────────────────────────────────────────────────────────────
 GREEN="\e[32m"; YELLOW="\e[33m"; RED="\e[31m"; RESET="\e[0m"
 ok()   { echo -e "${GREEN}✅  $*${RESET}"; }
@@ -32,7 +39,7 @@ step() { echo -e "\n${YELLOW}▶▶  $*${RESET}"; }
 
 # ── Vérification des pré-requis ───────────────────────────────────────────────
 step "Vérification des pré-requis..."
-for cmd in lb wget curl python3 unzip rsync; do
+for cmd in lb wget curl python3 unzip rsync xorriso; do
     command -v "$cmd" &>/dev/null \
         || err "Commande manquante : $cmd  →  apt install live-build wget curl python3 unzip"
 done
@@ -46,7 +53,7 @@ ok "Pré-requis OK"
 # ── Installation des outils de build ─────────────────────────────────────────
 step "Installation des dépendances de build..."
 apt-get update -qq
-apt-get install -y live-build xorriso syslinux wget curl python3 unzip rsync
+apt-get install -y live-build xorriso syslinux isolinux syslinux-utils wget curl python3 unzip rsync
 ok "Outils de build installés"
 
 # ── Préparation du répertoire de travail ──────────────────────────────────────
@@ -56,17 +63,15 @@ cd "$WORK_DIR"
 lb clean 2>/dev/null || true
 
 # ── Configuration live-build ──────────────────────────────────────────────────
-step "Configuration de live-build (Debian Bookworm / XFCE / AZERTY)..."
+step "Configuration de live-build (Debian Bookworm / OpenBox / AZERTY)..."
 lb config \
     --distribution bookworm \
     --architectures amd64 \
     --linux-packages linux-image \
-    --debian-installer live \
-    --bootappend-live "boot=live components quiet splash \
-hostname=antivirus-usb username=scanner \
-locales=fr_FR.UTF-8 keyboard-layouts=fr" \
-    --bootappend-install "modules=keyboard-configuration \
-locales=fr_FR.UTF-8 keyboard-layouts=fr" \
+    --debian-installer none \
+    --bootappend-live "${BOOT_PARAMS}" \
+    --bootloaders "syslinux,grub-efi" \
+    --binary-images iso-hybrid \
     --apt-options "--yes --no-install-recommends"
 ok "live-build configuré"
 
@@ -151,15 +156,21 @@ live-tools
 console-setup
 keyboard-configuration
 locales
-# Desktop XFCE minimal
+# Desktop OpenBox minimal
 xorg
-xfce4
-xfce4-terminal
+xserver-xorg-video-all
+xserver-xorg-video-intel
+xserver-xorg-video-ati
+xserver-xorg-video-nouveau
+xserver-xorg-video-vesa
+xserver-xorg-video-fbdev
+xserver-xorg-input-all
+openbox
 lightdm
-lightdm-gtk-greeter
+xfwm4
+xfce4-session
 # Réseau
 network-manager
-network-manager-gnome
 wget
 curl
 ca-certificates
@@ -184,19 +195,27 @@ dosfstools
 exfatprogs
 util-linux
 usbutils
+# GRUB + boot (pour install-to-disk)
+grub-common
+grub-pc-bin
+grub-efi-amd64-bin
+grub-pc
+os-prober
 # Firmware
 firmware-linux-free
 firmware-linux-nonfree
-# Installateur graphique (option "Installer sur le disque")
-calamares
-os-prober
-grub-common
-grub2-common
-shim-signed
-efibootmgr
+# Kiosk – verrouillage de session
+xdotool
+xbindkeys
+unclutter
+xterm
+whiptail
 # Divers
 unzip
+rsync
 squashfs-tools
+pciutils
+acpi
 EOF
 ok "Liste de paquets définie"
 
@@ -738,12 +757,12 @@ HOOK
 chmod +x config/hooks/normal/0250-avast-install.hook.chroot
 ok "Hook Avast Business (procédure officielle) créé"
 
-# ── Hook 3 : configuration système ────────────────────────────────────────────
-step "Création du hook système..."
+# ── Hook 3 : configuration système – OpenBox kiosque ─────────────────────────
+step "Création du hook système (OpenBox + LightDM)..."
 cat > config/hooks/normal/0300-system-config.hook.chroot << 'HOOK'
 #!/bin/bash
 set -euo pipefail
-echo ">>> [Hook Système] Configuration locale, utilisateurs, services..."
+echo ">>> [Hook Système] Configuration locale, utilisateurs, services (OpenBox kiosque)..."
 
 # Locale française
 echo "fr_FR.UTF-8 UTF-8" >> /etc/locale.gen
@@ -772,270 +791,370 @@ exec sudo -E python3 /opt/usb-antivirus/main.py "$@"
 WRAPPER
 chmod 755 /usr/local/bin/usb-antivirus
 
-# Désactivation des services AV au boot (gérés depuis le panneau Admin)
+# ── OPENBOX : configuration globale kiosque ──────────────────────────────────
+# Toutes les fenêtres : plein écran, sans décoration, couche supérieure.
+# Les raccourcis clavier sont supprimés.
+mkdir -p /etc/xdg/openbox
+cat > /etc/xdg/openbox/rc.xml << 'XML'
+<?xml version="1.0" encoding="UTF-8"?>
+<openbox_config xmlns="http://openbox.org/3.4/rc"
+                xmlns:xi="http://www.w3.org/2001/XInclude">
+  <applications>
+    <application class="*">
+      <fullscreen>yes</fullscreen>
+      <decor>no</decor>
+      <maximized>yes</maximized>
+      <layer>above</layer>
+      <focus>yes</focus>
+    </application>
+  </applications>
+  <!-- Tous les raccourcis clavier désactivés en mode kiosque -->
+  <keyboard>
+  </keyboard>
+  <!-- Pas de menu sur clic droit du bureau -->
+  <mouse>
+    <context name="Root">
+    </context>
+  </mouse>
+  <desktops>
+    <number>1</number>
+  </desktops>
+</openbox_config>
+XML
+
+# Pas d'autostart OpenBox (fond noir, pas de taskbar, pas de tray)
+mkdir -p /etc/xdg/openbox
+cat > /etc/xdg/openbox/autostart << 'AUTOSTART'
+# Aucun programme de bureau — kiosque minimal
+AUTOSTART
+
+# ── Désactiver Ctrl+Alt+Backspace (ZAP) et VT switching au niveau Xorg ───────
+mkdir -p /etc/X11/xorg.conf.d
+cat > /etc/X11/xorg.conf.d/99-kiosk-lock.conf << 'XORGCONF'
+Section "ServerFlags"
+    Option "DontZap"       "true"
+    Option "DontVTSwitch"  "true"
+    Option "BlankTime"     "0"
+    Option "StandbyTime"   "0"
+    Option "SuspendTime"   "0"
+    Option "OffTime"       "0"
+EndSection
+Section "Monitor"
+    Identifier "Monitor0"
+    Option "DPMS" "false"
+EndSection
+XORGCONF
+
+# ── Script dispatcher : LightDM appelle ce script pour LIVE et INSTALLATEUR ──
+# Lit /proc/cmdline : si "installer=1" → installe sur disque.
+#                     sinon           → lance l'application en boucle.
+cat > /usr/local/bin/usb-antivirus-session.sh << 'SESSION'
+#!/bin/bash
+# =============================================================================
+# usb-antivirus-session.sh  –  Dispatcher live / installateur
+#
+# Appelé par LightDM via usb-antivirus-live.desktop.
+# Détecte le paramètre "installer=1" dans /proc/cmdline et bascule
+# automatiquement vers le mode installateur (xterm + install-to-disk.sh).
+# =============================================================================
+export DISPLAY=:0
+export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+
+# Anti-veille
+xset s off -dpms 2>/dev/null || true
+xset s noblank   2>/dev/null || true
+
+# Démarrage d'OpenBox en arrière-plan
+openbox &
+OB_PID=$!
+sleep 1
+
+# Fond noir
+xsetroot -solid black 2>/dev/null || true
+
+if grep -q "installer=1" /proc/cmdline 2>/dev/null; then
+    # ── Mode installateur ────────────────────────────────────────────────────
+    xterm -title "USB Antivirus Scanner - Installation" \
+          -fa "Monospace" -fs 12 \
+          -bg "#0d0d1a" -fg "#e0e0e0" \
+          -e "sudo /usr/local/bin/install-to-disk.sh"
+else
+    # ── Mode live kiosque ────────────────────────────────────────────────────
+    # Boucle de relance : l'application redémarre si elle quitte
+    while true; do
+        /usr/local/bin/usb-antivirus || true
+        sleep 1
+    done
+fi
+
+kill "$OB_PID" 2>/dev/null || true
+SESSION
+chmod 755 /usr/local/bin/usb-antivirus-session.sh
+
+# ── Session pour le système INSTALLÉ (xfwm4 + application installée) ─────────
+cat > /usr/local/bin/usb-antivirus-session-installed.sh << 'SESSION'
+#!/bin/bash
+# =============================================================================
+# usb-antivirus-session-installed.sh  –  Session kiosque sur système installé
+#
+# Utilise xfwm4 comme gestionnaire de fenêtres (plus robuste pour un système
+# installé pérenne). L'application redémarre automatiquement.
+# =============================================================================
+export DISPLAY=:0
+export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+
+xset s off -dpms 2>/dev/null || true
+xset s noblank   2>/dev/null || true
+
+# Fond noir
+xsetroot -solid black 2>/dev/null || true
+
+# Démarrage de xfwm4 (léger, stable, sans décoration)
+xfwm4 --compositor=off &
+WM_PID=$!
+sleep 1
+
+# Boucle de relance
+while true; do
+    /usr/local/bin/usb-antivirus || true
+    sleep 1
+done
+
+kill "$WM_PID" 2>/dev/null || true
+SESSION
+chmod 755 /usr/local/bin/usb-antivirus-session-installed.sh
+
+# ── Fichiers .desktop pour LightDM (xsessions) ───────────────────────────────
+mkdir -p /usr/share/xsessions
+
+cat > /usr/share/xsessions/usb-antivirus-live.desktop << 'XSESSION'
+[Desktop Entry]
+Name=USB Antivirus Live
+Comment=Scanner antiviral USB (mode live OpenBox kiosque)
+Exec=/usr/local/bin/usb-antivirus-session.sh
+TryExec=/usr/local/bin/usb-antivirus-session.sh
+Type=Application
+XSESSION
+
+cat > /usr/share/xsessions/usb-antivirus-installed.desktop << 'XSESSION'
+[Desktop Entry]
+Name=USB Antivirus Installed
+Comment=Scanner antiviral USB (système installé, kiosque xfwm4)
+Exec=/usr/local/bin/usb-antivirus-session-installed.sh
+TryExec=/usr/local/bin/usb-antivirus-session-installed.sh
+Type=Application
+XSESSION
+
+# ── LightDM autologin – session live ─────────────────────────────────────────
+mkdir -p /etc/lightdm/lightdm.conf.d
+cat > /etc/lightdm/lightdm.conf.d/50-autologin.conf << 'LDM'
+[Seat:*]
+autologin-user=scanner
+autologin-session=usb-antivirus-live
+autologin-user-timeout=0
+allow-guest=false
+LDM
+
+mkdir -p /etc/skel
+cat > /etc/skel/.dmrc << 'DMRC'
+[Desktop]
+Session=usb-antivirus-live
+DMRC
+
+# ── Script install-to-disk.sh (rsync, UEFI/BIOS, whiptail) ───────────────────
+cat > /usr/local/bin/install-to-disk.sh << 'INSTALLER'
+#!/bin/bash
+set -e
+
+TITLE="USB Antivirus Scanner - Installation"
+TARGET_MNT="/mnt/av-target"
+
+part() {
+    case "$1" in
+        *nvme*|*mmcblk*) echo "${1}p${2}" ;;
+        *)               echo "${1}${2}"  ;;
+    esac
+}
+
+# Détection des disques disponibles (exclure loop et le media live)
+LIVE_DEV=$(findmnt -n -o SOURCE / 2>/dev/null | sed 's|/dev/||;s|[0-9]*$||' || true)
+DISKS=$(lsblk -d -o NAME,SIZE,MODEL -n | grep -v "^loop" | grep -v "^${LIVE_DEV}" || true)
+
+if [ -z "$DISKS" ]; then
+    whiptail --title "$TITLE" --msgbox "Aucun disque cible détecté." 8 55
+    exit 1
+fi
+
+MENU_ARGS=()
+while IFS= read -r line; do
+    name=$(echo "$line" | awk '{print $1}')
+    rest=$(echo "$line" | awk '{$1=""; print $0}' | xargs)
+    MENU_ARGS+=("/dev/$name" "$rest")
+done <<< "$DISKS"
+
+TARGET=$(whiptail --title "$TITLE" \
+    --menu "Choisir le disque cible\n⚠  TOUTES LES DONNÉES SERONT EFFACÉES" \
+    20 72 10 "${MENU_ARGS[@]}" \
+    3>&1 1>&2 2>&3) || { echo "Installation annulée."; exit 0; }
+
+whiptail --title "$TITLE" --yesno \
+"⚠  AVERTISSEMENT FINAL
+
+Toutes les données sur $TARGET seront définitivement effacées.
+Le système sera installé en mode kiosque (démarrage automatique
+de l'application antiviral USB).
+
+Confirmer l'installation sur $TARGET ?" \
+13 62 || { echo "Installation annulée."; exit 0; }
+
+UEFI=0
+[ -d /sys/firmware/efi ] && UEFI=1
+
+# ── Partitionnement ───────────────────────────────────────────────────────────
+whiptail --title "$TITLE" --infobox "Partitionnement de $TARGET..." 5 56
+wipefs -a "$TARGET"
+
+if [ "$UEFI" -eq 1 ]; then
+    parted -s "$TARGET" mklabel gpt
+    parted -s "$TARGET" mkpart ESP  fat32 1MiB 513MiB
+    parted -s "$TARGET" set 1 esp on
+    parted -s "$TARGET" mkpart root ext4 513MiB 100%
+    EFI_PART="$(part "$TARGET" 1)"
+    ROOT_PART="$(part "$TARGET" 2)"
+else
+    parted -s "$TARGET" mklabel msdos
+    parted -s "$TARGET" mkpart primary ext4 1MiB 100%
+    parted -s "$TARGET" set 1 boot on
+    ROOT_PART="$(part "$TARGET" 1)"
+fi
+
+# ── Formatage ─────────────────────────────────────────────────────────────────
+whiptail --title "$TITLE" --infobox "Formatage des partitions..." 5 50
+mkfs.ext4 -F "$ROOT_PART"
+[ "$UEFI" -eq 1 ] && mkfs.fat -F32 "$EFI_PART"
+
+# ── Montage ───────────────────────────────────────────────────────────────────
+whiptail --title "$TITLE" --infobox "Montage des partitions cibles..." 5 56
+mkdir -p "$TARGET_MNT"
+mount "$ROOT_PART" "$TARGET_MNT"
+[ "$UEFI" -eq 1 ] && { mkdir -p "$TARGET_MNT/boot/efi"; mount "$EFI_PART" "$TARGET_MNT/boot/efi"; }
+
+# ── Copie rsync (tout le système live — ClamAV + YARA + scanner inclus) ───────
+whiptail --title "$TITLE" --infobox \
+    "Copie du système (ClamAV + YARA + scanner)...\nCette étape dure plusieurs minutes." \
+    7 62
+rsync -aHAX \
+    --exclude=/proc   --exclude=/sys    --exclude=/dev  \
+    --exclude=/run    --exclude=/mnt    --exclude=/media \
+    --exclude=/tmp    --exclude=/live   \
+    / "$TARGET_MNT"/
+
+mkdir -p "$TARGET_MNT"/{proc,sys,dev,run,mnt,media,tmp}
+chmod 1777 "$TARGET_MNT/tmp"
+
+# ── fstab ─────────────────────────────────────────────────────────────────────
+ROOT_UUID=$(blkid -s UUID -o value "$ROOT_PART")
+{
+    echo "UUID=$ROOT_UUID  /          ext4  errors=remount-ro  0  1"
+    if [ "$UEFI" -eq 1 ]; then
+        EFI_UUID=$(blkid -s UUID -o value "$EFI_PART")
+        echo "UUID=$EFI_UUID  /boot/efi  vfat  umask=0077         0  1"
+    fi
+    echo "tmpfs  /tmp  tmpfs  defaults,nosuid,nodev  0  0"
+} > "$TARGET_MNT/etc/fstab"
+
+# ── Masquer les services live (inutiles sur le système installé) ───────────────
+for svc in live-boot live-config live-tools live-config-components; do
+    chroot "$TARGET_MNT" systemctl mask "$svc" 2>/dev/null || true
+done
+rm -f "$TARGET_MNT/etc/live/boot.conf" 2>/dev/null || true
+
+# ── LightDM : basculer sur la session "installée" (xfwm4 kiosque) ─────────────
+mkdir -p "$TARGET_MNT/etc/lightdm/lightdm.conf.d"
+cat > "$TARGET_MNT/etc/lightdm/lightdm.conf.d/50-autologin.conf" << 'LIGHTDM_EOF'
+[Seat:*]
+autologin-user=scanner
+autologin-session=usb-antivirus-installed
+autologin-user-timeout=0
+allow-guest=false
+LIGHTDM_EOF
+
+[ -f "$TARGET_MNT/etc/skel/.dmrc" ] && \
+cat > "$TARGET_MNT/etc/skel/.dmrc" << 'DMRC_EOF'
+[Desktop]
+Session=usb-antivirus-installed
+DMRC_EOF
+
+[ -f "$TARGET_MNT/home/scanner/.dmrc" ] && \
+cat > "$TARGET_MNT/home/scanner/.dmrc" << 'DMRC_EOF'
+[Desktop]
+Session=usb-antivirus-installed
+DMRC_EOF
+
+# ── GRUB ──────────────────────────────────────────────────────────────────────
+cat > "$TARGET_MNT/etc/default/grub" << 'GRUBCFG'
+GRUB_DEFAULT=0
+GRUB_TIMEOUT=3
+GRUB_DISTRIBUTOR="USB Antivirus Scanner"
+GRUB_CMDLINE_LINUX_DEFAULT="quiet splash"
+GRUB_CMDLINE_LINUX=""
+GRUBCFG
+
+whiptail --title "$TITLE" --infobox "Installation du chargeur d'amorçage GRUB..." 5 58
+mount --bind /dev  "$TARGET_MNT/dev"
+mount --bind /proc "$TARGET_MNT/proc"
+mount --bind /sys  "$TARGET_MNT/sys"
+[ "$UEFI" -eq 1 ] && \
+    mount --bind /sys/firmware/efi/efivars \
+                 "$TARGET_MNT/sys/firmware/efi/efivars" 2>/dev/null || true
+
+if [ "$UEFI" -eq 1 ]; then
+    chroot "$TARGET_MNT" grub-install \
+        --target=x86_64-efi \
+        --efi-directory=/boot/efi \
+        --bootloader-id=AVScanner \
+        --recheck
+else
+    chroot "$TARGET_MNT" grub-install --target=i386-pc --recheck "$TARGET"
+fi
+chroot "$TARGET_MNT" update-grub
+
+umount "$TARGET_MNT/sys/firmware/efi/efivars" 2>/dev/null || true
+umount "$TARGET_MNT/sys"
+umount "$TARGET_MNT/proc"
+umount "$TARGET_MNT/dev"
+[ "$UEFI" -eq 1 ] && umount "$TARGET_MNT/boot/efi"
+umount "$TARGET_MNT"
+
+whiptail --title "$TITLE" --msgbox \
+"✅  Installation terminée !
+
+Le scanner antiviral USB a été installé sur $TARGET.
+ClamAV, YARA et toutes les signatures sont préservés.
+
+Au démarrage :
+  - L'interface de scan se lance automatiquement.
+  - Le panneau Admin (⚙) permet les mises à jour
+    ClamAV/YARA et la gestion Avast.
+
+Retirez la clé USB / le CD et appuyez sur OK pour redémarrer." \
+16 65
+
+reboot
+INSTALLER
+chmod +x /usr/local/bin/install-to-disk.sh
+
+# ── Désactivation des services AV au boot (gérés depuis le panneau Admin) ─────
 systemctl disable clamav-freshclam 2>/dev/null || true
 systemctl disable clamav-daemon    2>/dev/null || true
-# Avast (peut ne pas être installé si le hook 0250 a échoué)
 systemctl disable avast.target     2>/dev/null || true
 systemctl disable avast            2>/dev/null || true
 
-echo ">>> [Hook Système] OK ✅"
+echo ">>> [Hook Système] OpenBox kiosque OK ✅"
 HOOK
 chmod +x config/hooks/normal/0300-system-config.hook.chroot
-ok "Hook système créé"
+ok "Hook système OpenBox kiosque créé"
 
-# ── Hook 3.5 : configuration Calamares (installateur graphique) ───────────────
-step "Création du hook Calamares..."
-cat > config/hooks/normal/0350-calamares.hook.chroot << 'HOOK'
-#!/bin/bash
-# =============================================================================
-# Hook 0350 – Configuration de Calamares, l'installateur graphique.
-#
-# Ce hook configure Calamares pour installer sur disque le système live
-# tel quel (ClamAV + YARA + scanner + XFCE), sans téléchargement réseau.
-# La méthode "unsquashfs" copie le squashfs live directement sur la partition
-# cible — toutes les bases virales et règles YARA sont donc préservées.
-#
-# Modules activés (dans l'ordre d'exécution) :
-#   welcome → locale → keyboard → partition → users →
-#   networkcfg → summary → unpackfs → fstab → bootloader →
-#   services-systemd → grubcfg → umount → finished
-# =============================================================================
-set -euo pipefail
-echo ">>> [Hook Calamares] Configuration de l'installateur..."
-
-CALA_DIR="/etc/calamares"
-MODULES_DIR="$CALA_DIR/modules"
-BRAND_DIR="/usr/share/calamares/branding/antivirus"
-mkdir -p "$MODULES_DIR" "$BRAND_DIR"
-
-# ── Paramètres globaux ────────────────────────────────────────────────────────
-cat > "$CALA_DIR/settings.conf" << 'CONF'
-modules-search: [ local, /usr/lib/calamares/modules ]
-
-sequence:
-  - show:
-    - welcome
-    - locale
-    - keyboard
-    - partition
-    - users
-    - summary
-  - exec:
-    - partition
-    - mount
-    - unpackfs
-    - machineid
-    - fstab
-    - locale
-    - keyboard
-    - localecfg
-    - users
-    - networkcfg
-    - hwclock
-    - services-systemd
-    - grubcfg
-    - bootloader
-    - umount
-  - show:
-    - finished
-
-branding: antivirus
-prompt-install: true
-dont-chroot: false
-CONF
-
-# ── Branding ──────────────────────────────────────────────────────────────────
-cat > "$BRAND_DIR/branding.desc" << 'BRAND'
-componentName: antivirus
-
-strings:
-  productName:         "USB Antivirus Scanner"
-  shortProductName:    "AV Scanner"
-  version:             "1.0"
-  shortVersion:        "1.0"
-  versionedName:       "USB Antivirus Scanner 1.0"
-  shortVersionedName:  "AV Scanner 1.0"
-  bootloaderEntryName: "AV Scanner"
-  productUrl:          ""
-  supportUrl:          ""
-  knownIssuesUrl:      ""
-  releaseNotesUrl:     ""
-
-images:
-  productLogo:   "logo.png"
-  productIcon:   "logo.png"
-  productWelcome: "languages.png"
-
-slideshow: "show.qml"
-BRAND
-
-# Logo minimal (copie l'icône système si disponible)
-if [ -f /usr/share/pixmaps/security-high.png ]; then
-    cp /usr/share/pixmaps/security-high.png "$BRAND_DIR/logo.png"
-elif [ -f /usr/share/icons/hicolor/48x48/apps/clamtk.png ]; then
-    cp /usr/share/icons/hicolor/48x48/apps/clamtk.png "$BRAND_DIR/logo.png"
-else
-    # Crée une image PNG minimale 1×1 transparent pour éviter l'erreur au démarrage
-    printf '\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82' \
-        > "$BRAND_DIR/logo.png"
-fi
-cp "$BRAND_DIR/logo.png" "$BRAND_DIR/languages.png" 2>/dev/null || true
-
-# Slideshow minimal QML (obligatoire, sinon Calamares refuse de démarrer)
-cat > "$BRAND_DIR/show.qml" << 'QML'
-import QtQuick 2.0
-import calamares.slideshow 1.0
-
-Presentation {
-    id: presentation
-    Slide {
-        anchors.fill: parent
-        Text {
-            anchors.centerIn: parent
-            text: "Installation en cours…\n\nClamAV, YARA et toutes les bases\nvirales sont copiés sur le disque."
-            horizontalAlignment: Text.AlignHCenter
-            font.pixelSize: 18
-            color: "#e0e0e0"
-        }
-        Rectangle { anchors.fill: parent; color: "#1a1a2e"; z: -1 }
-    }
-}
-QML
-
-# ── Module : unpackfs (copie le squashfs live → partition cible) ──────────────
-# C'est l'étape clé : copie tout le système live tel quel (bases AV incluses).
-cat > "$MODULES_DIR/unpackfs.conf" << 'CONF'
----
-unpack:
-  - source: "/run/live/medium/live/filesystem.squashfs"
-    sourcefs: "squashfs"
-    destination: ""
-CONF
-
-# ── Module : partition (KPMcore — partitionnement guidé) ─────────────────────
-cat > "$MODULES_DIR/partition.conf" << 'CONF'
----
-efiSystemPartition: "/boot/efi"
-efiSystemPartitionSize: "300M"
-efiSystemPartitionName: "EFI"
-defaultPartitionTableType:
-  - gpt
-  - msdos
-userSwapChoices:
-  - none
-  - small
-  - suspend
-  - file
-requiredStorage: 6.0
-CONF
-
-# ── Module : users ────────────────────────────────────────────────────────────
-cat > "$MODULES_DIR/users.conf" << 'CONF'
----
-defaultGroups:
-  - name: users
-    state: create
-  - name: lp
-    state: create
-  - name: video
-    state: create
-  - name: network
-    state: create
-  - name: storage
-    state: create
-  - name: wheel
-    state: create
-  - name: sudo
-    state: create
-  - name: plugdev
-    state: create
-  - name: cdrom
-    state: create
-
-autologinGroup: autologin
-doAutologin: false
-sudoersGroup: sudo
-setRootPassword: true
-doReusePassword: false
-passwordRequirements:
-  nonempty: true
-  minLength: 4
-  maxLength: -1
-  libpwquality:
-    - minlen=4
-CONF
-
-# ── Module : bootloader ───────────────────────────────────────────────────────
-cat > "$MODULES_DIR/bootloader.conf" << 'CONF'
----
-efiBootLoader: "grub"
-grubInstall: "grub-install"
-grubMkconfig: "grub-mkconfig"
-grubCfg: "/boot/grub/grub.cfg"
-grubProbe: "grub-probe"
-efiBootLoaderId: "AV-Scanner"
-installEFIFallback: true
-# Calamares installe lui-même le bon paquet GRUB selon le firmware détecté.
-# grub-pc (BIOS) et grub-efi-amd64 (UEFI) sont mutuellement exclusifs et ne
-# peuvent pas coexister dans le chroot live — on les laisse donc à Calamares.
-packages:
-  - try_install:
-    - grub-pc
-    - grub-efi-amd64
-CONF
-
-# ── Module : services-systemd ─────────────────────────────────────────────────
-# Désactive sur le système installé les services live-only inutiles.
-# Active clamav-daemon pour qu'il se lance au boot sur le système installé.
-cat > "$MODULES_DIR/services-systemd.conf" << 'CONF'
----
-disable:
-  - live-boot
-  - live-config
-  - live-config-components
-  - live-networkmanager
-
-enable:
-  - clamav-daemon
-  - NetworkManager
-CONF
-
-# ── Module : networkcfg ───────────────────────────────────────────────────────
-cat > "$MODULES_DIR/networkcfg.conf" << 'CONF'
----
-backend: networkmanager
-CONF
-
-# ── Module : welcome ──────────────────────────────────────────────────────────
-cat > "$MODULES_DIR/welcome.conf" << 'CONF'
----
-showSupportUrl:       false
-showKnownIssuesUrl:   false
-showReleaseNotesUrl:  false
-showDonateUrl:        false
-requirements:
-  requiredStorage:    6
-  requiredRam:        1.0
-  internet:           false
-  root:               true
-  screen:             false
-CONF
-
-# ── Lancement auto avec polkit (pas besoin de mot de passe root) ──────────────
-cat > /etc/polkit-1/rules.d/49-calamares.rules << 'POLKIT'
-polkit.addRule(function(action, subject) {
-    if (action.id.indexOf("org.freedesktop.calamares") === 0 &&
-        subject.isInGroup("sudo")) {
-        return polkit.Result.YES;
-    }
-});
-POLKIT
-
-echo ">>> [Hook Calamares] ✅ Configuration terminée."
-HOOK
-chmod +x config/hooks/normal/0350-calamares.hook.chroot
-ok "Hook Calamares créé"
 cat > config/hooks/normal/0400-permissions.hook.chroot << 'HOOK'
 #!/bin/bash
 set -euo pipefail
@@ -1118,7 +1237,6 @@ if [ -d /var/lib/avast ]; then
     chmod -R 755 /var/lib/avast 2>/dev/null || true
 fi
 
-# Autostart XFCE : s'assurer que le répertoire appartient à scanner
 chown -R scanner:scanner /home/scanner/ 2>/dev/null || true
 
 echo ">>> [Hook Permissions] OK ✅"
@@ -1176,37 +1294,32 @@ if [ -d /opt/usb-antivirus ]; then
     chmod 755 /opt/usb-antivirus
 fi
 
-# ── 4. Reconfiguration autologin avec le compte utilisateur réel ──────────────
-# Calamares crée un compte dont le nom est inconnu ici.
-# On prend le premier utilisateur non-système (uid >= 1000) hors "nobody".
+# ── 4. Reconfiguration autologin LightDM (session installée) ─────────────────
+# On cible le compte "scanner" copié depuis le live par rsync.
+# Si l'administrateur a créé un autre compte (uid >= 1000), on le détecte.
 REAL_USER=$(awk -F: '$3 >= 1000 && $1 != "nobody" {print $1; exit}' /etc/passwd)
-if [ -n "$REAL_USER" ]; then
-    echo ">> Autologin → $REAL_USER"
-    # LightDM
-    if [ -f /etc/lightdm/lightdm.conf ]; then
-        sed -i "s/^autologin-user=.*/autologin-user=$REAL_USER/" \
-            /etc/lightdm/lightdm.conf
-    fi
-    # sudo sans mot de passe pour le compte installé
-    echo "$REAL_USER ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/antivirus-user
-    chmod 0440 /etc/sudoers.d/antivirus-user
-    # Autostart du scanner
-    XFCE_AS="/home/$REAL_USER/.config/autostart"
-    mkdir -p "$XFCE_AS"
-    cp /home/scanner/.config/autostart/usb-antivirus.desktop "$XFCE_AS/" \
-        2>/dev/null || true
-    chown -R "$REAL_USER:$REAL_USER" "/home/$REAL_USER/.config" 2>/dev/null || true
-    # Wrapper usb-antivirus
-    if ! [ -f /usr/local/bin/usb-antivirus ]; then
-        cat > /usr/local/bin/usb-antivirus << 'WRAPPER'
-#!/bin/bash
-exec sudo -E python3 /opt/usb-antivirus/main.py "$@"
-WRAPPER
-        chmod 755 /usr/local/bin/usb-antivirus
-    fi
-else
-    echo "⚠ Aucun utilisateur uid >= 1000 trouvé — autologin non reconfiguré"
-fi
+REAL_USER="${REAL_USER:-scanner}"
+echo ">> Autologin → $REAL_USER (session usb-antivirus-installed)"
+mkdir -p /etc/lightdm/lightdm.conf.d
+cat > /etc/lightdm/lightdm.conf.d/50-autologin.conf << LDMEOF
+[Seat:*]
+autologin-user=$REAL_USER
+autologin-session=usb-antivirus-installed
+autologin-user-timeout=0
+allow-guest=false
+LDMEOF
+cat > /etc/skel/.dmrc << DMRC
+[Desktop]
+Session=usb-antivirus-installed
+DMRC
+[ -f "/home/$REAL_USER/.dmrc" ] && cat > "/home/$REAL_USER/.dmrc" << DMRC
+[Desktop]
+Session=usb-antivirus-installed
+DMRC
+# sudo sans mot de passe
+echo "$REAL_USER ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/antivirus-user
+chmod 0440 /etc/sudoers.d/antivirus-user
+chown -R "$REAL_USER:$REAL_USER" "/home/$REAL_USER" 2>/dev/null || true
 
 # ── 5. Auto-désactivation du service ─────────────────────────────────────────
 echo ">> Désactivation du service post-install..."
@@ -1625,13 +1738,41 @@ XKBOPTIONS=""
 BACKSPACE="guess"
 EOF
 
-# LightDM autologin
-mkdir -p config/includes.chroot/etc/lightdm
-cat > config/includes.chroot/etc/lightdm/lightdm.conf << 'EOF'
+# Anti-veille – désactivation complète de la mise en veille / suspend
+mkdir -p config/includes.chroot/etc/systemd/logind.conf.d
+cat > config/includes.chroot/etc/systemd/logind.conf.d/no-suspend.conf << 'EOF'
+[Login]
+HandleSuspendKey=ignore
+HandleHibernateKey=ignore
+HandleLidSwitch=ignore
+HandleLidSwitchExternalPower=ignore
+HandleLidSwitchDocked=ignore
+IdleAction=ignore
+EOF
+
+mkdir -p config/includes.chroot/etc/systemd/sleep.conf.d
+cat > config/includes.chroot/etc/systemd/sleep.conf.d/no-sleep.conf << 'EOF'
+[Sleep]
+AllowSuspend=no
+AllowHibernation=no
+AllowSuspendThenHibernate=no
+AllowHybridSleep=no
+EOF
+
+# LightDM autologin – session live (usb-antivirus-live.desktop)
+mkdir -p config/includes.chroot/etc/lightdm/lightdm.conf.d
+cat > config/includes.chroot/etc/lightdm/lightdm.conf.d/50-autologin.conf << 'EOF'
 [Seat:*]
 autologin-user=scanner
+autologin-session=usb-antivirus-live
 autologin-user-timeout=0
-user-session=xfce
+allow-guest=false
+EOF
+
+mkdir -p config/includes.chroot/etc/skel
+cat > config/includes.chroot/etc/skel/.dmrc << 'EOF'
+[Desktop]
+Session=usb-antivirus-live
 EOF
 
 # NetworkManager
@@ -1668,34 +1809,9 @@ mkdir -p config/includes.chroot/etc/systemd/system/multi-user.target.wants
 ln -sf /etc/systemd/system/clamav-init.service \
     config/includes.chroot/etc/systemd/system/multi-user.target.wants/clamav-init.service
 
-# Autostart XFCE
-mkdir -p "config/includes.chroot/home/scanner/.config/autostart"
-cat > "config/includes.chroot/home/scanner/.config/autostart/usb-antivirus.desktop" << 'EOF'
-[Desktop Entry]
-Type=Application
-Name=USB Antivirus Scanner
-Exec=/usr/local/bin/usb-antivirus
-Terminal=false
-Hidden=false
-X-GNOME-Autostart-enabled=true
-EOF
-
-# Raccourci bureau : lancer l'installateur graphique Calamares
+# Répertoires de base pour l'utilisateur scanner
+mkdir -p "config/includes.chroot/home/scanner/.config/openbox"
 mkdir -p "config/includes.chroot/home/scanner/Desktop"
-cat > "config/includes.chroot/home/scanner/Desktop/install-to-disk.desktop" << 'EOF'
-[Desktop Entry]
-Version=1.0
-Type=Application
-Name=Installer sur le disque
-GenericName=Installer le système
-Comment=Copie le système live (ClamAV + YARA + scanner) sur un disque dur ou SSD
-Exec=sudo -E calamares
-Icon=system-software-install
-Terminal=false
-Categories=System;
-X-XFCE-Source=file:///home/scanner/Desktop/install-to-disk.desktop
-EOF
-chmod +x "config/includes.chroot/home/scanner/Desktop/install-to-disk.desktop"
 
 # Entrée menu application
 mkdir -p config/includes.chroot/usr/share/applications
@@ -1745,11 +1861,11 @@ JOURNAUX
 =============================================================================
 EOF
 
-# Règle polkit pour Calamares (lancé sans mot de passe depuis le bureau)
+# Règle polkit : sudo sans mot de passe pour le scanner (install-to-disk)
 mkdir -p "config/includes.chroot/etc/polkit-1/rules.d"
-cat > "config/includes.chroot/etc/polkit-1/rules.d/49-calamares.rules" << 'EOF'
+cat > "config/includes.chroot/etc/polkit-1/rules.d/49-scanner-sudo.rules" << 'EOF'
 polkit.addRule(function(action, subject) {
-    if (action.id.indexOf("org.freedesktop.calamares") === 0 &&
+    if (action.id.indexOf("org.freedesktop.policykit") === 0 &&
         subject.isInGroup("sudo")) {
         return polkit.Result.YES;
     }
@@ -1757,6 +1873,97 @@ polkit.addRule(function(action, subject) {
 EOF
 
 ok "Tous les fichiers de configuration générés"
+
+
+# =============================================================================
+# Hook 9999 (BINAIRE) : menus de boot syslinux (BIOS) + GRUB (UEFI)
+# =============================================================================
+# Ce hook s'exécute APRÈS lb_binary et écrase les configs générées par
+# live-build pour les deux bootloaders.
+step "Création du hook de menu de boot (syslinux + GRUB EFI)..."
+mkdir -p config/hooks/normal
+cat << HOOK > config/hooks/normal/9999-bootmenu.hook.binary
+#!/bin/bash
+# ── Hook binary – s'exécute APRÈS la génération des fichiers boot par live-build
+# Patche syslinux (BIOS) ET grub (UEFI) en une seule passe.
+set -e
+
+BOOT_PARAMS="${BOOT_PARAMS}"
+
+# ── 1. Syslinux / isolinux (BIOS legacy) ─────────────────────────────────────
+write_syslinux() {
+    local DIR="\$1"
+    [ -d "\$DIR" ] || return 0
+    cat > "\$DIR/isolinux.cfg" << SYSLINUX
+UI vesamenu.c32
+DEFAULT live
+TIMEOUT 150
+PROMPT 0
+
+MENU TITLE USB Antivirus Scanner v1.0 - Menu de demarrage
+
+LABEL live
+  MENU LABEL > Demarrer en mode Live (OpenBox kiosque)
+  MENU DEFAULT
+  KERNEL /live/vmlinuz
+  APPEND initrd=/live/initrd.img \${BOOT_PARAMS}
+
+LABEL install
+  MENU LABEL > Installer sur le disque (kiosque persistant)
+  KERNEL /live/vmlinuz
+  APPEND initrd=/live/initrd.img \${BOOT_PARAMS} installer=1
+
+LABEL live-safe
+  MENU LABEL > Demarrer en mode Live - Sans echec (nomodeset)
+  KERNEL /live/vmlinuz
+  APPEND initrd=/live/initrd.img \${BOOT_PARAMS} nomodeset
+SYSLINUX
+    echo "# replaced by custom boot menu" > "\$DIR/live.cfg"
+    echo "[hook] syslinux patche dans \$DIR"
+}
+
+for DIR in binary/isolinux binary/boot/isolinux; do
+    write_syslinux "\$DIR"
+done
+
+# ── 2. GRUB EFI (UEFI) ────────────────────────────────────────────────────────
+write_grub() {
+    local CFG="\$1"
+    [ -f "\$CFG" ] || { echo "[hook] \$CFG absent, ignore"; return 0; }
+    cat > "\$CFG" << GRUBMENU
+set default=0
+set timeout=15
+
+if [ x\\\$feature_all_video_module = xy ]; then
+  insmod all_video
+fi
+
+menuentry "Demarrer en mode Live (OpenBox kiosque)" {
+  linux /live/vmlinuz \${BOOT_PARAMS}
+  initrd /live/initrd.img
+}
+
+menuentry "Installer sur le disque (kiosque persistant)" {
+  linux /live/vmlinuz \${BOOT_PARAMS} installer=1
+  initrd /live/initrd.img
+}
+
+menuentry "Demarrer en mode Live - Sans echec (nomodeset)" {
+  linux /live/vmlinuz \${BOOT_PARAMS} nomodeset
+  initrd /live/initrd.img
+}
+GRUBMENU
+    echo "[hook] grub patche dans \$CFG"
+}
+
+for CFG in binary/boot/grub/grub.cfg \
+           binary/EFI/boot/grub.cfg  \
+           binary/boot/grub/x86_64-efi/grub.cfg; do
+    write_grub "\$CFG"
+done
+HOOK
+chmod +x config/hooks/normal/9999-bootmenu.hook.binary
+ok "Hook 9999-bootmenu (syslinux + GRUB EFI) créé"
 
 # =============================================================================
 # Build de l'ISO
@@ -1766,21 +1973,128 @@ lb build 2>&1 | tee /tmp/lb-build.log
 
 # ── Récupération de l'ISO ─────────────────────────────────────────────────────
 step "Récupération de l'ISO générée..."
-ISO_FOUND=""
-for candidate in live-image-amd64.hybrid.iso binary.hybrid.iso; do
-    [[ -f "$candidate" ]] && { ISO_FOUND="$candidate"; break; }
+BUILT_ISO=""
+for candidate in live-image-amd64.hybrid.iso live-image-amd64.iso; do
+    [[ -f "$candidate" ]] && { BUILT_ISO="$candidate"; break; }
 done
-[[ -n "$ISO_FOUND" ]] || err "ISO introuvable après la build. Consultez /tmp/lb-build.log"
-mv "$ISO_FOUND" "$ISO_NAME"
-ok "ISO : $ISO_NAME"
+[[ -n "$BUILT_ISO" ]] || err "ISO introuvable après la build. Consultez /tmp/lb-build.log"
+ok "ISO brute : $BUILT_ISO ($(du -h "$BUILT_ISO" | cut -f1))"
 
-# ── Comptage des fichiers intégrés (avant lb clean qui efface le chroot) ──────
-ISO_SIZE=$(du -h "$ISO_NAME" | cut -f1)
-CV_COUNT=$(find "$CLAMAV_CHROOT" \( -name "*.cvd" -o -name "*.cld" \) 2>/dev/null | wc -l)
-TP_COUNT=$(find "$CLAMAV_CHROOT" \( -name "*.ndb" -o -name "*.hdb" -o -name "*.hsb" \
+# ── Comptage des fichiers intégrés (avant lb clean) ──────────────────────────
+ISO_SIZE=$(du -h "$BUILT_ISO" | cut -f1)
+CV_COUNT=$(find "config/includes.chroot/var/lib/clamav" \( -name "*.cvd" -o -name "*.cld" \) 2>/dev/null | wc -l)
+TP_COUNT=$(find "config/includes.chroot/var/lib/clamav" \( -name "*.ndb" -o -name "*.hdb" -o -name "*.hsb" \
     -o -name "*.db" -o -name "*.ftm" -o -name "*.ldb" \
     -o -name "*.cdb" -o -name "*.fp" \) 2>/dev/null | wc -l)
-YR_COUNT=$(find "$YARA_CHROOT/signature-base" -name "*.yar" 2>/dev/null | wc -l)
+YR_COUNT=$(find "config/includes.chroot/var/lib/yara-rules/signature-base" -name "*.yar" 2>/dev/null | wc -l)
+
+# =============================================================================
+# Patch post-build via xorriso (filet de sécurité)
+# Patche isolinux.cfg, live.cfg ET grub.cfg dans l'ISO finale scellée.
+# Garantit les menus de boot même si lb_binary a régénéré ses configs.
+# =============================================================================
+step "Patch post-build des menus de boot via xorriso..."
+
+PATCH_DIR=$(mktemp -d)
+trap 'rm -rf "$PATCH_DIR"' EXIT
+
+# ── Génération des fichiers de remplacement ───────────────────────────────────
+cat > "$PATCH_DIR/isolinux.cfg" << SYSLINUX
+UI vesamenu.c32
+DEFAULT live
+TIMEOUT 150
+PROMPT 0
+
+MENU TITLE USB Antivirus Scanner v1.0 - Menu de demarrage
+
+LABEL live
+  MENU LABEL > Demarrer en mode Live (OpenBox kiosque)
+  MENU DEFAULT
+  KERNEL /live/vmlinuz
+  APPEND initrd=/live/initrd.img ${BOOT_PARAMS}
+
+LABEL install
+  MENU LABEL > Installer sur le disque (kiosque persistant)
+  KERNEL /live/vmlinuz
+  APPEND initrd=/live/initrd.img ${BOOT_PARAMS} installer=1
+
+LABEL live-safe
+  MENU LABEL > Demarrer en mode Live - Sans echec (nomodeset)
+  KERNEL /live/vmlinuz
+  APPEND initrd=/live/initrd.img ${BOOT_PARAMS} nomodeset
+SYSLINUX
+
+echo "# replaced by custom boot menu" > "$PATCH_DIR/live.cfg"
+
+cat > "$PATCH_DIR/grub.cfg" << GRUBMENU
+set default=0
+set timeout=15
+
+if [ x\$feature_all_video_module = xy ]; then
+  insmod all_video
+fi
+
+menuentry "Demarrer en mode Live (OpenBox kiosque)" {
+  linux /live/vmlinuz ${BOOT_PARAMS}
+  initrd /live/initrd.img
+}
+
+menuentry "Installer sur le disque (kiosque persistant)" {
+  linux /live/vmlinuz ${BOOT_PARAMS} installer=1
+  initrd /live/initrd.img
+}
+
+menuentry "Demarrer en mode Live - Sans echec (nomodeset)" {
+  linux /live/vmlinuz ${BOOT_PARAMS} nomodeset
+  initrd /live/initrd.img
+}
+GRUBMENU
+
+# ── Inventaire des chemins dans l'ISO ─────────────────────────────────────────
+ISO_FILES=$(xorriso -indev "$BUILT_ISO" -find / -type f 2>/dev/null | grep '^/' || true)
+ISO_ISOL_CFG=$(echo "$ISO_FILES" | grep -i 'isolinux\.cfg$'          | head -1)
+ISO_LIVE_CFG=$(echo "$ISO_FILES" | grep -i '/isolinux/live\.cfg$'    | head -1)
+ISO_GRUB_CFG=$(echo "$ISO_FILES" | grep -i 'boot/grub/grub\.cfg$'    | head -1)
+[ -z "$ISO_ISOL_CFG" ] && ISO_ISOL_CFG="/isolinux/isolinux.cfg"
+[ -z "$ISO_LIVE_CFG" ] && ISO_LIVE_CFG="/isolinux/live.cfg"
+[ -z "$ISO_GRUB_CFG" ] && ISO_GRUB_CFG="/boot/grub/grub.cfg"
+ok "isolinux.cfg : $ISO_ISOL_CFG  |  grub.cfg : $ISO_GRUB_CFG"
+
+# ── Application du patch xorriso ─────────────────────────────────────────────
+PATCHED_ISO="$PATCH_DIR/patched.iso"
+xorriso \
+    -indev  "$BUILT_ISO" \
+    -outdev "$PATCHED_ISO" \
+    -boot_image any replay \
+    -map "$PATCH_DIR/isolinux.cfg" "$ISO_ISOL_CFG" \
+    -map "$PATCH_DIR/live.cfg"     "$ISO_LIVE_CFG" \
+    -map "$PATCH_DIR/grub.cfg"     "$ISO_GRUB_CFG"
+
+# ── Vérification taille ───────────────────────────────────────────────────────
+ORIG_SIZE=$(stat -c%s "$BUILT_ISO")
+PATCH_SIZE=$(stat -c%s "$PATCHED_ISO" 2>/dev/null || echo 0)
+if [ "$PATCH_SIZE" -lt $(( ORIG_SIZE / 2 )) ]; then
+    warn "ISO patchée anormalement petite ($PATCH_SIZE vs $ORIG_SIZE) — utilisation de l'originale"
+    cp "$BUILT_ISO" "$PATCH_DIR/patched.iso" || true
+fi
+ok "ISO patchée : $PATCH_SIZE octets (originale : $ORIG_SIZE)"
+
+# ── Vérification grub.cfg ────────────────────────────────────────────────────
+VERIFY="$PATCH_DIR/verify_grub.cfg"
+xorriso -indev "$PATCHED_ISO" -osirrox on -extract "$ISO_GRUB_CFG" "$VERIFY" 2>/dev/null || true
+if [[ -f "$VERIFY" ]] && grep -q "installer=1" "$VERIFY"; then
+    ok "grub.cfg : entrée installer=1 confirmée"
+else
+    warn "grub.cfg : entrée installer=1 non trouvée (hook binary suffit)"
+fi
+
+mv "$PATCHED_ISO" "$BUILT_ISO"
+ok "Patch xorriso appliqué"
+
+# ── Renommage final ───────────────────────────────────────────────────────────
+step "Finalisation..."
+mv "$BUILT_ISO" "$ISO_NAME"
+ok "ISO : $ISO_NAME"
 
 # ── Nettoyage ─────────────────────────────────────────────────────────────────
 step "Nettoyage..."
@@ -1791,25 +2105,38 @@ lb clean
 # =============================================================================
 
 echo ""
-echo "═══════════════════════════════════════════════════════════"
-echo -e "${GREEN}🎉  BUILD TERMINÉ AVEC SUCCÈS${RESET}"
-echo "═══════════════════════════════════════════════════════════"
-echo "  ISO         : $ISO_NAME  ($ISO_SIZE)"
-echo "  ClamAV      : $CV_COUNT fichier(s) de base officielle(s)"
-echo "  Signatures  : $TP_COUNT fichier(s) tiers (Sanesecurity, InterServer, URLhaus)"
-echo "  Avast       : installé (licence requise via panneau Admin)"
-echo "  YARA        : $YR_COUNT règle(s) signature-base incluses"
-echo "  Clavier     : AZERTY (fr)"
-echo "  Autologin   : scanner  (sudo sans mot de passe)"
-echo "  Code admin  : 0000  (À CHANGER au premier démarrage !)"
-echo ""
-echo "  MODES DE DÉMARRAGE :"
-echo "    • Live   : démarre directement le scanner (mode mémoire, rien écrit)"
-echo "    • Install: icône bureau 'Installer sur le disque' → Calamares"
-echo "               copie le système live entier (ClamAV + YARA + scanner)"
-echo "               sur le disque dur. Le service antivirus-post-install"
-echo "               reconfigure le compte au premier démarrage."
-echo ""
-echo "  Pour flasher sur une clé USB :"
-echo "    sudo dd if=$ISO_NAME of=/dev/sdX bs=4M status=progress"
-echo "═══════════════════════════════════════════════════════════"
+echo "╔══════════════════════════════════════════════════════════════╗"
+echo -e "${GREEN}║  🎉  BUILD TERMINÉ AVEC SUCCÈS${RESET}"
+echo "╠══════════════════════════════════════════════════════════════╣"
+echo "║  ISO         : $ISO_NAME"
+echo "║  Taille      : $ISO_SIZE"
+echo "║  ClamAV      : $CV_COUNT fichier(s) de base officielle(s)"
+echo "║  Signatures  : $TP_COUNT fichier(s) tiers (Sanesecurity, InterServer, URLhaus)"
+echo "║  Avast       : installé (licence requise via panneau Admin)"
+echo "║  YARA        : $YR_COUNT règle(s) signature-base incluses"
+echo "║  Clavier     : AZERTY (fr)"
+echo "║  Autologin   : scanner  (sudo sans mot de passe)"
+echo "║  Code admin  : 0000  (À CHANGER au premier démarrage !)"
+echo "╠══════════════════════════════════════════════════════════════╣"
+echo "║  MENU DE DÉMARRAGE (BIOS syslinux + UEFI GRUB) :            ║"
+echo "║    1. Live       → OpenBox kiosque  (usb-antivirus)         ║"
+echo "║    2. Installer  → rsync sur disque + kiosque persistant    ║"
+echo "║    3. Live Safe  → Live + nomodeset                         ║"
+echo "╠══════════════════════════════════════════════════════════════╣"
+echo "║  ARCHITECTURE SESSION :                                     ║"
+echo "║    Live     : LightDM → usb-antivirus-live.desktop          ║"
+echo "║               → usb-antivirus-session.sh (OpenBox)          ║"
+echo "║               → dispatcher /proc/cmdline                    ║"
+echo "║                   installer=1 → install-to-disk.sh (rsync) ║"
+echo "║                   (rien)      → /usr/local/bin/usb-antivirus║"
+echo "║    Installé : LightDM → usb-antivirus-installed.desktop     ║"
+echo "║               → usb-antivirus-session-installed.sh (xfwm4) ║"
+echo "╠══════════════════════════════════════════════════════════════╣"
+echo "║  KIOSK HARDENING :                                          ║"
+echo "║    • OpenBox rc.xml : fullscreen, no-decor, no menu         ║"
+echo "║    • Xorg DontZap + DontVTSwitch                            ║"
+echo "║    • Anti-veille (logind + sleep.conf)                      ║"
+echo "╠══════════════════════════════════════════════════════════════╣"
+echo "║  Pour flasher sur une clé USB :                             ║"
+echo "║    sudo dd if=$ISO_NAME of=/dev/sdX bs=4M status=progress   ║"
+echo "╚══════════════════════════════════════════════════════════════╝"
