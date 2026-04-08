@@ -2,9 +2,10 @@
 """admin_auth.py – Authentification et panneau d'administration.
 
 Onglets du panneau :
-  🛡 ClamAV       – mise à jour base (en ligne / USB)
-  🔐 Avast        – licence (activation par code, import .avastlic USB)
-                    + base VPS (en ligne / USB)
+  🔧 Moteurs      – sélection ClamAV / Avast / YARA, mode scan, suppression
+  📡 Supports     – affichage exhaustif de tous les supports USB
+  🛡 ClamAV       – mise à jour base (en ligne / USB) + signatures tierces
+  🔐 Avast        – installation, licence, base VPS
   🔍 YARA         – règles signature-base (GitHub / USB)
   ⏰ Planification – crontab freshclam
   📋 Journaux     – export vers USB, purge des logs
@@ -38,8 +39,6 @@ class AdminAuthManager:
     def _hash(code: str) -> str:
         return hashlib.sha256(code.strip().encode()).hexdigest()
 
-    # ── Config ─────────────────────────────────────────────────────────────────
-
     def __init__(self) -> None:
         self._ensure_config()
 
@@ -64,8 +63,6 @@ class AdminAuthManager:
             json.dump(data, f, indent=2)
         os.chmod(ADMIN_CFG_PATH, 0o600)
 
-    # ── Auth ────────────────────────────────────────────────────────────────────
-
     def verify(self, code: str) -> bool:
         return self._hash(code) == self._load().get("code_hash", "")
 
@@ -76,18 +73,16 @@ class AdminAuthManager:
         if not self.verify(old):
             return False, "Code actuel incorrect."
         if len(new) < MIN_CODE_LENGTH:
-            return False, f"Le nouveau code doit comporter au moins {MIN_CODE_LENGTH} caractères."
+            return False, f"Le code doit comporter au moins {MIN_CODE_LENGTH} caractères."
         if new != confirm:
-            return False, "Le nouveau code et sa confirmation ne correspondent pas."
+            return False, "La confirmation ne correspond pas."
         if new == DEFAULT_CODE:
-            return False, f"Le code '{DEFAULT_CODE}' est le code par défaut — choisissez-en un autre."
+            return False, f"'{DEFAULT_CODE}' est le code par défaut — choisissez-en un autre."
         try:
             self._save({"code_hash": self._hash(new)})
             return True, "Code administrateur modifié avec succès."
         except Exception as e:
             return False, f"Erreur lors de la sauvegarde : {e}"
-
-    # ── Cron ────────────────────────────────────────────────────────────────────
 
     _CRON_TAG = "# virusscanner_auto"
 
@@ -123,7 +118,8 @@ class AdminAuthManager:
 # Dialog saisie code
 # ══════════════════════════════════════════════════════════════════════════════
 
-def ask_admin_code(parent: tk.Misc, prompt: str = "Code administrateur :") -> Optional[str]:
+def ask_admin_code(parent: tk.Misc,
+                   prompt: str = "Code administrateur :") -> Optional[str]:
     result: List[Optional[str]] = [None]
 
     dlg = tk.Toplevel(parent)
@@ -172,55 +168,73 @@ def ask_admin_code(parent: tk.Misc, prompt: str = "Code administrateur :") -> Op
 # ══════════════════════════════════════════════════════════════════════════════
 
 class AdminPanel:
-    """
-    Panneau d'administration modal, accessible uniquement après saisie du code.
-    Reçoit des callbacks pour déclencher les actions métier depuis la GUI.
-    """
+    """Panneau d'administration modal, accessible après saisie du code."""
 
     def __init__(
         self,
         parent: tk.Misc,
         auth:   AdminAuthManager,
+        # Options moteurs (BooleanVar / StringVar partagées avec la GUI)
+        use_clamav_var: tk.BooleanVar,
+        use_avast_var:  tk.BooleanVar,
+        use_yara_var:   tk.BooleanVar,
+        scan_mode_var:  tk.StringVar,
+        remove_var:     tk.BooleanVar,
         # ClamAV
         on_update_clamav_online:      Callable,
         on_import_clamav_usb:         Callable,
         on_download_third_party_sigs: Callable,
         # Avast
-        on_update_avast_vps_online: Callable,
-        on_import_avast_vps_usb:   Callable,
+        on_install_avast:            Callable,
+        on_update_avast_vps_online:  Callable,
+        on_import_avast_vps_usb:     Callable,
         on_import_avast_license_usb:  Callable,
         on_import_avast_license_file: Callable,
-        on_activate_avast_code:    Callable,
-        on_refresh_avast_status:   Callable,
+        on_activate_avast_code:       Callable,
+        on_refresh_avast_status:      Callable,
         # YARA
-        on_update_yara_online:     Callable,
-        on_import_yara_usb:        Callable,
+        on_update_yara_online: Callable,
+        on_import_yara_usb:    Callable,
         # Journaux
-        on_export_logs_usb:        Callable,
-        on_purge_logs:             Callable,
+        on_export_logs_usb: Callable,
+        on_purge_logs:      Callable,
         # Système
-        on_poweroff:               Callable,
-        on_quit:                   Callable,
+        on_poweroff: Callable,
+        on_quit:     Callable,
+        # Supports exhaustifs
+        get_usb_partitions: Callable,
+        refresh_usb:        Callable,
     ) -> None:
         self._parent = parent
         self._auth   = auth
+
+        # Vars partagées
+        self._use_clamav = use_clamav_var
+        self._use_avast  = use_avast_var
+        self._use_yara   = use_yara_var
+        self._scan_mode  = scan_mode_var
+        self._remove     = remove_var
+
         self._cb = {
-            "clamav_online":         on_update_clamav_online,
-            "clamav_usb":            on_import_clamav_usb,
-            "clamav_thirdparty":     on_download_third_party_sigs,
-            "avast_vps_online":      on_update_avast_vps_online,
-            "avast_vps_usb":         on_import_avast_vps_usb,
-            "avast_license_usb":     on_import_avast_license_usb,
-            "avast_license_file":    on_import_avast_license_file,
-            "avast_activate":        on_activate_avast_code,
-            "avast_refresh":         on_refresh_avast_status,
-            "yara_online":           on_update_yara_online,
-            "yara_usb":              on_import_yara_usb,
-            "export_logs_usb":       on_export_logs_usb,
-            "purge_logs":            on_purge_logs,
-            "poweroff":              on_poweroff,
-            "quit":                  on_quit,
+            "clamav_online":      on_update_clamav_online,
+            "clamav_usb":         on_import_clamav_usb,
+            "clamav_thirdparty":  on_download_third_party_sigs,
+            "avast_install":      on_install_avast,
+            "avast_vps_online":   on_update_avast_vps_online,
+            "avast_vps_usb":      on_import_avast_vps_usb,
+            "avast_license_usb":  on_import_avast_license_usb,
+            "avast_license_file": on_import_avast_license_file,
+            "avast_activate":     on_activate_avast_code,
+            "avast_refresh":      on_refresh_avast_status,
+            "yara_online":        on_update_yara_online,
+            "yara_usb":           on_import_yara_usb,
+            "export_logs_usb":    on_export_logs_usb,
+            "purge_logs":         on_purge_logs,
+            "poweroff":           on_poweroff,
+            "quit":               on_quit,
         }
+        self._get_usb_partitions = get_usb_partitions
+        self._refresh_usb        = refresh_usb
 
     def show(self) -> None:
         code = ask_admin_code(
@@ -237,7 +251,7 @@ class AdminPanel:
             messagebox.showwarning(
                 "Code par défaut",
                 "⚠  Le code est toujours '0000'.\n"
-                "Changez-le immédiatement dans l'onglet 'Sécurité'.",
+                "Changez-le dans l'onglet 'Sécurité'.",
                 parent=self._parent
             )
         self._open()
@@ -245,11 +259,11 @@ class AdminPanel:
     def _open(self) -> None:
         dlg = tk.Toplevel(self._parent)
         dlg.title("⚙  Panneau d'administration")
-        dlg.resizable(False, False)
+        dlg.resizable(True, True)
         dlg.grab_set()
         dlg.transient(self._parent)
 
-        w, h = 640, 540
+        w, h = 700, 580
         px = self._parent.winfo_rootx() + (self._parent.winfo_width()  - w) // 2
         py = self._parent.winfo_rooty() + (self._parent.winfo_height() - h) // 2
         dlg.geometry(f"{w}x{h}+{px}+{py}")
@@ -257,6 +271,8 @@ class AdminPanel:
         nb = ttk.Notebook(dlg)
         nb.pack(fill=tk.BOTH, expand=True, padx=10, pady=8)
 
+        self._tab_engines(nb)
+        self._tab_usb_detail(nb, dlg)
         self._tab_clamav(nb)
         self._tab_avast(nb)
         self._tab_yara(nb)
@@ -268,6 +284,230 @@ class AdminPanel:
 
         ttk.Button(dlg, text="Fermer", command=dlg.destroy).pack(pady=6)
 
+    # ── Onglet Moteurs ────────────────────────────────────────────────────────
+
+    def _tab_engines(self, nb: ttk.Notebook) -> None:
+        tab = ttk.Frame(nb, padding=16)
+        nb.add(tab, text="🔧 Moteurs")
+
+        ttk.Label(tab, text="Configuration des moteurs d'analyse",
+                  font=("Arial", 11, "bold")).pack(anchor=tk.W, pady=(0, 10))
+
+        # ── Moteurs actifs ────────────────────────────────────────────────────
+        eng_frm = ttk.LabelFrame(tab, text="Moteurs actifs", padding=10)
+        eng_frm.pack(fill=tk.X, pady=(0, 10))
+
+        ttk.Label(
+            eng_frm,
+            text="Sélectionnez les moteurs utilisés lors des analyses.\n"
+                 "Les moteurs non installés ou non licenciés sont automatiquement désactivés.",
+            foreground="#555"
+        ).pack(anchor=tk.W, pady=(0, 8))
+
+        chk_row = ttk.Frame(eng_frm)
+        chk_row.pack(anchor=tk.W)
+        ttk.Checkbutton(chk_row, text="ClamAV  (recommandé)",
+                        variable=self._use_clamav).pack(side=tk.LEFT, padx=8)
+        ttk.Checkbutton(chk_row, text="Avast Business",
+                        variable=self._use_avast).pack(side=tk.LEFT, padx=8)
+        ttk.Checkbutton(chk_row, text="YARA  (règles personnalisées)",
+                        variable=self._use_yara).pack(side=tk.LEFT, padx=8)
+
+        # ── Mode de scan ──────────────────────────────────────────────────────
+        mode_frm = ttk.LabelFrame(tab, text="Mode d'analyse", padding=10)
+        mode_frm.pack(fill=tk.X, pady=(0, 10))
+
+        mode_row = ttk.Frame(mode_frm)
+        mode_row.pack(anchor=tk.W)
+        ttk.Radiobutton(mode_row, text="Rapide  (analyse la partition sélectionnée)",
+                        variable=self._scan_mode,
+                        value="quick").pack(side=tk.LEFT, padx=8)
+        ttk.Radiobutton(mode_row, text="Complet  (toutes les partitions du disque)",
+                        variable=self._scan_mode,
+                        value="deep").pack(side=tk.LEFT, padx=8)
+
+        # ── Suppression automatique ────────────────────────────────────────────
+        del_frm = ttk.LabelFrame(tab, text="Gestion des fichiers infectés", padding=10)
+        del_frm.pack(fill=tk.X)
+
+        ttk.Label(
+            del_frm,
+            text="⚠  DANGER — Activez uniquement si vous voulez que les fichiers\n"
+                 "    infectés soient supprimés DÉFINITIVEMENT et automatiquement.",
+            foreground="#8B0000"
+        ).pack(anchor=tk.W, pady=(0, 6))
+
+        ttk.Checkbutton(
+            del_frm,
+            text="Supprimer automatiquement les fichiers infectés",
+            variable=self._remove
+        ).pack(anchor=tk.W)
+
+        # ── Statut courant ────────────────────────────────────────────────────
+        ttk.Separator(tab, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=10)
+        ttk.Label(tab, text="Configuration actuelle :",
+                  font=("Arial", 9, "bold")).pack(anchor=tk.W)
+
+        def _refresh_summary():
+            engines = " + ".join(filter(None, [
+                "ClamAV" if self._use_clamav.get() else None,
+                "Avast"  if self._use_avast.get()  else None,
+                "YARA"   if self._use_yara.get()   else None,
+            ])) or "Aucun moteur sélectionné !"
+            mode  = "Rapide" if self._scan_mode.get() == "quick" else "Complet"
+            suppr = "Oui ⚠" if self._remove.get() else "Non"
+            summary_var.set(
+                f"Moteurs : {engines}\n"
+                f"Mode    : {mode}\n"
+                f"Suppression auto : {suppr}"
+            )
+
+        summary_var = tk.StringVar()
+        ttk.Label(tab, textvariable=summary_var,
+                  foreground="navy", font=("Courier", 9)).pack(anchor=tk.W, pady=4)
+        ttk.Button(tab, text="↺  Actualiser le résumé",
+                   command=_refresh_summary, width=24).pack(anchor=tk.W)
+        _refresh_summary()
+
+        # Met à jour le résumé si une case change
+        for var in (self._use_clamav, self._use_avast, self._use_yara,
+                    self._scan_mode, self._remove):
+            var.trace_add("write", lambda *_: _refresh_summary())
+
+    # ── Onglet Supports (affichage exhaustif) ─────────────────────────────────
+
+    def _tab_usb_detail(self, nb: ttk.Notebook, dlg: tk.Toplevel) -> None:
+        tab = ttk.Frame(nb, padding=10)
+        nb.add(tab, text="📡 Supports")
+
+        ttk.Label(tab, text="Affichage exhaustif des supports amovibles",
+                  font=("Arial", 11, "bold")).pack(anchor=tk.W, pady=(0, 6))
+
+        # Treeview complet
+        cols = ("device", "label", "size", "fstype", "uuid", "mountpoint", "status")
+        tree = ttk.Treeview(tab, columns=cols, show="headings",
+                             height=8, selectmode="browse")
+        for cid, heading, width in [
+            ("device",     "Périphérique",  105),
+            ("label",      "Étiquette",      80),
+            ("size",       "Taille",         55),
+            ("fstype",     "FS",             55),
+            ("uuid",       "UUID",          155),
+            ("mountpoint", "Point montage", 150),
+            ("status",     "État",          110),
+        ]:
+            tree.heading(cid, text=heading)
+            tree.column(cid, width=width, minwidth=30, anchor=tk.W)
+
+        tree.tag_configure("ro",      background="#e6f4ea")
+        tree.tag_configure("rw",      background="#fef3cd")
+        tree.tag_configure("unmount", background="#f0f0f0")
+
+        sb = ttk.Scrollbar(tab, orient=tk.VERTICAL, command=tree.yview)
+        tree.configure(yscrollcommand=sb.set)
+
+        tree_frame = ttk.Frame(tab)
+        tree_frame.pack(fill=tk.BOTH, expand=True)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, in_=tree_frame)
+        sb.pack(side=tk.RIGHT, fill=tk.Y, in_=tree_frame)
+
+        # Détail sélectionné
+        detail_var = tk.StringVar()
+        ttk.Label(tab, textvariable=detail_var,
+                  font=("Courier", 8), foreground="navy",
+                  wraplength=640, justify=tk.LEFT).pack(anchor=tk.W, pady=4)
+
+        def _on_select(_=None):
+            sel = tree.selection()
+            if not sel:
+                detail_var.set("")
+                return
+            vals = tree.item(sel[0], "values")
+            detail_var.set(
+                f"Périphérique : {vals[0]}  |  "
+                f"Étiquette : {vals[1]}  |  Taille : {vals[2]}  |  "
+                f"FS : {vals[3]}\nUUID : {vals[4]}\n"
+                f"Point montage : {vals[5]}  |  État : {vals[6]}"
+            )
+        tree.bind("<<TreeviewSelect>>", _on_select)
+
+        def _populate():
+            for row in tree.get_children():
+                tree.delete(row)
+            from usb_manager import UsbManager
+            usb = self._get_usb_partitions()
+            if not usb:
+                tree.insert("", tk.END,
+                             values=("—", "—", "—", "—", "—", "—",
+                                     "Aucun support détecté"))
+                return
+            for p in usb:
+                from scanner import ScanEngine
+                eng = ScanEngine()
+                try:
+                    from usb_manager import UsbManager as _UM
+                    usb_mgr = _UM()
+                    mp  = usb_mgr.get_mountpoint(p.device) or "—"
+                    ro  = usb_mgr._is_ro(p.device, mp) if mp != "—" else None
+                    if mp != "—":
+                        status = ("✅ RO" if ro else "⚠ RW")
+                        tag    = "ro" if ro else "rw"
+                    else:
+                        status = "⏏ Non monté"
+                        tag    = "unmount"
+                except Exception:
+                    mp     = "—"
+                    status = "?"
+                    tag    = "unmount"
+
+                tree.insert("", tk.END,
+                             values=(p.device,
+                                     p.label or "—",
+                                     p.size,
+                                     p.fstype or "—",
+                                     p.uuid  or "—",
+                                     mp,
+                                     status),
+                             tags=(tag,))
+
+        btn_row = ttk.Frame(tab)
+        btn_row.pack(anchor=tk.W, pady=4)
+        ttk.Button(btn_row, text="↺  Actualiser",
+                   command=lambda: (self._refresh_usb(), _populate()),
+                   width=16).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_row, text="▲  Monter RO",
+                   command=lambda: self._mount_selected(tree),
+                   width=16).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_row, text="▼  Démonter",
+                   command=lambda: self._umount_selected(tree),
+                   width=16).pack(side=tk.LEFT, padx=4)
+
+        _populate()
+
+    def _mount_selected(self, tree: ttk.Treeview) -> None:
+        sel = tree.selection()
+        if not sel:
+            return
+        dev = tree.item(sel[0], "values")[0]
+        if dev == "—":
+            return
+        from usb_manager import UsbManager
+        usb = UsbManager()
+        ok, msg = usb.mount(dev)
+        messagebox.showinfo("Montage", msg) if ok else messagebox.showerror("Montage", msg)
+
+    def _umount_selected(self, tree: ttk.Treeview) -> None:
+        sel = tree.selection()
+        if not sel:
+            return
+        dev = tree.item(sel[0], "values")[0]
+        if dev == "—":
+            return
+        from usb_manager import UsbManager
+        usb = UsbManager()
+        ok, msg = usb.umount(dev)
+        messagebox.showinfo("Démontage", msg) if ok else messagebox.showerror("Démontage", msg)
+
     # ── Onglet ClamAV ──────────────────────────────────────────────────────────
 
     def _tab_clamav(self, nb: ttk.Notebook) -> None:
@@ -275,7 +515,7 @@ class AdminPanel:
         nb.add(tab, text="🛡 ClamAV")
 
         ttk.Label(tab, text="Mise à jour de la base ClamAV",
-                  font=("Arial", 11, "bold")).pack(anchor=tk.W, pady=(0, 10))
+                  font=("Arial", 11, "bold")).pack(anchor=tk.W, pady=(0, 8))
         ttk.Label(
             tab,
             text="• En ligne : freshclam contacte les serveurs ClamAV (Internet requis).\n"
@@ -297,19 +537,16 @@ class AdminPanel:
                   font=("Arial", 10, "bold")).pack(anchor=tk.W, pady=(0, 4))
         ttk.Label(
             tab,
-            text="Télécharge des bases complémentaires gratuites :\n"
-                 "  • URLhaus (abuse.ch) – URLs malveillantes actives\n"
-                 "  • Sanesecurity       – phishing, scam, spam, macros, rogues, foxhole\n"
-                 "  • InterServer        – signatures génériques\n"
-                 "Ces fichiers (.ndb/.hdb/.cdb) sont installés dans /var/lib/clamav/\n"
-                 "et pris en compte immédiatement par le daemon ClamAV.",
+            text="• URLhaus (abuse.ch), Sanesecurity, InterServer\n"
+                 "  Installés dans /var/lib/clamav/ — Internet requis.",
             justify=tk.LEFT, foreground="#444"
         ).pack(anchor=tk.W, pady=(0, 8))
 
         row2 = ttk.Frame(tab)
         row2.pack(anchor=tk.W)
         ttk.Button(row2, text="🌐  Télécharger signatures tierces",
-                   command=self._cb["clamav_thirdparty"], width=36).pack(side=tk.LEFT, padx=4)
+                   command=self._cb["clamav_thirdparty"],
+                   width=36).pack(side=tk.LEFT, padx=4)
 
     # ── Onglet Avast ───────────────────────────────────────────────────────────
 
@@ -318,76 +555,98 @@ class AdminPanel:
         nb.add(tab, text="🔐 Avast")
 
         ttk.Label(tab, text="Gestion d'Avast Business for Linux",
-                  font=("Arial", 11, "bold")).pack(anchor=tk.W, pady=(0, 4))
+                  font=("Arial", 11, "bold")).pack(anchor=tk.W, pady=(0, 6))
 
         # ── Statut ────────────────────────────────────────────────────────────
         status_frame = ttk.LabelFrame(tab, text="Statut", padding=8)
         status_frame.pack(fill=tk.X, pady=(0, 8))
 
         self._avast_status_var = tk.StringVar(value="Vérification…")
-        status_lbl = ttk.Label(status_frame, textvariable=self._avast_status_var,
-                                foreground="navy", font=("Courier", 9))
-        status_lbl.pack(anchor=tk.W)
-
-        ttk.Button(status_frame, text="↺  Actualiser le statut",
+        ttk.Label(status_frame, textvariable=self._avast_status_var,
+                  foreground="navy", font=("Courier", 9)).pack(anchor=tk.W)
+        ttk.Button(status_frame, text="↺  Actualiser",
                    command=self._refresh_avast_status_display,
-                   width=24).pack(anchor=tk.W, pady=(4, 0))
-
+                   width=20).pack(anchor=tk.W, pady=(4, 0))
         self._refresh_avast_status_display()
+
+        # ── Installation (mode installé) ──────────────────────────────────────
+        install_frame = ttk.LabelFrame(tab, text="Installation (mode installé)", padding=8)
+        install_frame.pack(fill=tk.X, pady=(0, 8))
+
+        ttk.Label(
+            install_frame,
+            text="Installe Avast Business for Linux depuis le dépôt officiel.\n"
+                 "Nécessite une connexion Internet et les droits root.\n\n"
+                 "Étapes automatiques :\n"
+                 "  1. Ajout de la clé GPG depuis repo.avcdn.net\n"
+                 "  2. Ajout du dépôt APT avast\n"
+                 "  3. apt-get install avast\n"
+                 "  4. Activation du service systemd",
+            justify=tk.LEFT, foreground="#444"
+        ).pack(anchor=tk.W, pady=(0, 6))
+
+        install_row = ttk.Frame(install_frame)
+        install_row.pack(anchor=tk.W)
+        ttk.Button(install_row, text="📦  Installer Avast Business",
+                   command=self._cb["avast_install"],
+                   width=28).pack(side=tk.LEFT, padx=4)
+
+        ttk.Label(
+            install_frame,
+            text="Installation manuelle :\n"
+                 "  curl -fsSL https://repo.avcdn.net/linux/avast.gpg "
+                 "| tee /etc/apt/trusted.gpg.d/avast.gpg\n"
+                 "  echo 'deb https://repo.avcdn.net/linux stable avast' "
+                 "| tee /etc/apt/sources.list.d/avast.list\n"
+                 "  apt-get update && apt-get install avast",
+            justify=tk.LEFT, foreground="#666",
+            font=("Courier", 7)
+        ).pack(anchor=tk.W, pady=(6, 0))
 
         # ── Licence ───────────────────────────────────────────────────────────
         lic_frame = ttk.LabelFrame(tab, text="Licence Business", padding=8)
         lic_frame.pack(fill=tk.X, pady=(0, 8))
 
-        ttk.Label(
-            lic_frame,
-            text="A — Code d'activation (Internet requis) :"
-                 "   Requiert le paquet avast-license (outil avastlic).",
-            justify=tk.LEFT, foreground="#444"
-        ).grid(row=0, column=0, columnspan=3, sticky=tk.W, pady=(0, 4))
+        ttk.Label(lic_frame,
+                  text="A — Code d'activation (Internet requis) :",
+                  foreground="#444").grid(row=0, column=0, columnspan=3,
+                                          sticky=tk.W, pady=(0, 4))
 
-        code_var = tk.StringVar()
+        code_var  = tk.StringVar()
         code_entry = ttk.Entry(lic_frame, textvariable=code_var,
                                width=30, font=("Courier", 10))
-        code_entry.grid(row=1, column=0, sticky=tk.W, pady=2, padx=(0, 6))
+        code_entry.grid(row=1, column=0, sticky=tk.W, padx=(0, 6))
 
         def _activate():
             code = code_var.get().strip()
             if not code:
-                messagebox.showwarning(
-                    "Code vide",
-                    "Entrez un code d'activation Avast Business.",
-                    parent=tab.winfo_toplevel()
-                )
+                messagebox.showwarning("Code vide",
+                                       "Entrez un code d'activation.",
+                                       parent=tab.winfo_toplevel())
                 return
             self._cb["avast_activate"](code)
 
-        ttk.Button(lic_frame, text="🔑  Activer",
+        ttk.Button(lic_frame, text="🔑 Activer",
                    command=_activate, width=13).grid(row=1, column=1, padx=4)
 
         ttk.Separator(lic_frame, orient=tk.HORIZONTAL).grid(
-            row=2, column=0, columnspan=3, sticky=tk.EW, pady=8
-        )
+            row=2, column=0, columnspan=3, sticky=tk.EW, pady=6)
 
-        ttk.Label(
-            lic_frame,
-            text="B — Fichier license.avastlic depuis une clé USB :",
-            justify=tk.LEFT, foreground="#444"
-        ).grid(row=3, column=0, columnspan=3, sticky=tk.W, pady=(0, 4))
-
-        ttk.Button(lic_frame, text="🔌  Importer depuis USB",
+        ttk.Label(lic_frame,
+                  text="B — Fichier .avastlic depuis USB :",
+                  foreground="#444").grid(row=3, column=0, columnspan=3,
+                                          sticky=tk.W, pady=(0, 4))
+        ttk.Button(lic_frame, text="🔌  Import depuis USB",
                    command=self._cb["avast_license_usb"],
-                   width=24).grid(row=4, column=0, sticky=tk.W, pady=(0, 4))
+                   width=22).grid(row=4, column=0, sticky=tk.W)
 
         ttk.Separator(lic_frame, orient=tk.HORIZONTAL).grid(
-            row=5, column=0, columnspan=3, sticky=tk.EW, pady=8
-        )
+            row=5, column=0, columnspan=3, sticky=tk.EW, pady=6)
 
-        ttk.Label(
-            lic_frame,
-            text="C — Fichier license.avastlic depuis le système de fichiers :",
-            justify=tk.LEFT, foreground="#444"
-        ).grid(row=6, column=0, columnspan=3, sticky=tk.W, pady=(0, 4))
+        ttk.Label(lic_frame,
+                  text="C — Fichier .avastlic depuis le système :",
+                  foreground="#444").grid(row=6, column=0, columnspan=3,
+                                          sticky=tk.W, pady=(0, 4))
 
         self._avast_lic_path_var = tk.StringVar(value="Aucun fichier sélectionné")
         ttk.Label(lic_frame, textvariable=self._avast_lic_path_var,
@@ -395,13 +654,13 @@ class AdminPanel:
                   wraplength=360).grid(row=7, column=0, columnspan=2,
                                        sticky=tk.W, pady=2)
 
-        def _browse_license():
+        def _browse():
             from tkinter import filedialog
             path = filedialog.askopenfilename(
                 parent=tab.winfo_toplevel(),
-                title="Sélectionner le fichier de licence Avast",
+                title="Sélectionner la licence Avast",
                 filetypes=[("Licence Avast", "*.avastlic"),
-                           ("Tous les fichiers", "*.*")],
+                           ("Tous", "*.*")],
                 initialdir=os.path.expanduser("~"),
             )
             if path:
@@ -410,63 +669,57 @@ class AdminPanel:
         def _import_browsed():
             path = self._avast_lic_path_var.get()
             if not path or path == "Aucun fichier sélectionné":
-                messagebox.showwarning(
-                    "Aucun fichier",
-                    "Utilisez 'Parcourir…' pour sélectionner un fichier .avastlic.",
-                    parent=tab.winfo_toplevel()
-                )
+                messagebox.showwarning("Aucun fichier",
+                                       "Utilisez 'Parcourir…' d'abord.",
+                                       parent=tab.winfo_toplevel())
                 return
             if not os.path.isfile(path):
-                messagebox.showerror(
-                    "Fichier introuvable",
-                    f"Le fichier n'existe pas :\n{path}",
-                    parent=tab.winfo_toplevel()
-                )
+                messagebox.showerror("Fichier introuvable",
+                                     f"Le fichier n'existe pas :\n{path}",
+                                     parent=tab.winfo_toplevel())
                 return
             self._cb["avast_license_file"](path)
 
-        btn_row = ttk.Frame(lic_frame)
-        btn_row.grid(row=8, column=0, columnspan=3, sticky=tk.W, pady=(2, 0))
-        ttk.Button(btn_row, text="📂  Parcourir…",
-                   command=_browse_license, width=16).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(btn_row, text="⬇  Installer ce fichier",
-                   command=_import_browsed, width=20).pack(side=tk.LEFT)
+        btn_row2 = ttk.Frame(lic_frame)
+        btn_row2.grid(row=8, column=0, columnspan=3, sticky=tk.W, pady=(2, 0))
+        ttk.Button(btn_row2, text="📂  Parcourir…",
+                   command=_browse, width=16).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(btn_row2, text="⬇  Installer",
+                   command=_import_browsed, width=16).pack(side=tk.LEFT)
 
         # ── Base VPS ──────────────────────────────────────────────────────────
-        vps_frame = ttk.LabelFrame(tab, text="Base VPS (définitions de virus)", padding=8)
-        vps_frame.pack(fill=tk.X, pady=(0, 4))
+        vps_frame = ttk.LabelFrame(tab, text="Base VPS (définitions)", padding=8)
+        vps_frame.pack(fill=tk.X)
 
-        ttk.Label(
-            vps_frame,
-            text="• En ligne : Avast télécharge la dernière VPS depuis ses serveurs.\n"
-                 "• Hors-ligne : copiez un fichier .vps/.vpz à la racine d'une clé USB.",
-            justify=tk.LEFT, foreground="#444"
-        ).pack(anchor=tk.W, pady=(0, 8))
+        ttk.Label(vps_frame,
+                  text="• En ligne : Avast télécharge la dernière VPS.\n"
+                       "• Hors-ligne : copiez un fichier .vps/.vpz sur une clé USB.",
+                  foreground="#444").pack(anchor=tk.W, pady=(0, 6))
 
-        row = ttk.Frame(vps_frame)
-        row.pack(anchor=tk.W)
-        ttk.Button(row, text="🌐  Mise à jour VPS en ligne",
-                   command=self._cb["avast_vps_online"], width=26).pack(side=tk.LEFT, padx=4)
-        ttk.Button(row, text="🔌  Importer VPS depuis USB",
-                   command=self._cb["avast_vps_usb"],   width=26).pack(side=tk.LEFT, padx=4)
+        vps_row = ttk.Frame(vps_frame)
+        vps_row.pack(anchor=tk.W)
+        ttk.Button(vps_row, text="🌐  Mise à jour VPS en ligne",
+                   command=self._cb["avast_vps_online"],
+                   width=26).pack(side=tk.LEFT, padx=4)
+        ttk.Button(vps_row, text="🔌  Importer VPS depuis USB",
+                   command=self._cb["avast_vps_usb"],
+                   width=26).pack(side=tk.LEFT, padx=4)
 
     def _refresh_avast_status_display(self) -> None:
-        """Met à jour l'affichage du statut Avast dans le panneau."""
         try:
             from scanner import ScanEngine
             eng = ScanEngine()
             if not eng.is_avast_installed():
                 self._avast_status_var.set(
                     "❌ Avast Business non installé\n"
-                    "   Dépôt : https://repo.avcdn.net\n"
-                    "   Licence requise : https://www.avast.com/business/linux"
+                    "   → Utilisez le bouton 'Installer Avast Business' ci-dessous\n"
+                    "   → Dépôt : https://repo.avcdn.net"
                 )
                 return
             if not eng.is_avast_licensed():
                 self._avast_status_var.set(
-                    "✅ Avast Business installé\n"
-                    "⚠  Licence requise pour scanner — sans licence Avast\n"
-                    "   refusera les scans (code 126). Activez via les boutons."
+                    "✅ Avast Business : installé\n"
+                    "⚠  Licence requise — activez via les boutons ci-dessous."
                 )
                 return
             from config import AVAST_LICENSE_PATH
@@ -477,11 +730,11 @@ class AdminPanel:
             except OSError:
                 date = "?"
             self._avast_status_var.set(
-                f"✅ Avast Business installé et licencié\n"
+                f"✅ Avast Business : installé et licencié\n"
                 f"   Licence active depuis le : {date}"
             )
         except Exception as e:
-            self._avast_status_var.set(f"Erreur de vérification : {e}")
+            self._avast_status_var.set(f"Erreur vérification : {e}")
 
     # ── Onglet YARA ────────────────────────────────────────────────────────────
 
@@ -490,11 +743,11 @@ class AdminPanel:
         nb.add(tab, text="🔍 YARA")
 
         ttk.Label(tab, text="Gestion des règles YARA",
-                  font=("Arial", 11, "bold")).pack(anchor=tk.W, pady=(0, 10))
+                  font=("Arial", 11, "bold")).pack(anchor=tk.W, pady=(0, 8))
         ttk.Label(
             tab,
-            text="• En ligne : télécharge signature-base de Florian Roth (GitHub).\n"
-                 "  Connexion Internet requise. ~30 Mo.\n"
+            text="• En ligne  : télécharge signature-base de Florian Roth (GitHub).\n"
+                 "  Connexion Internet requise — ~30 Mo.\n"
                  "• Hors-ligne : placez des fichiers .yar/.yara ou un .zip\n"
                  "  contenant des règles à la racine d'une clé USB.",
             justify=tk.LEFT, foreground="#444"
@@ -503,7 +756,7 @@ class AdminPanel:
         row = ttk.Frame(tab)
         row.pack(anchor=tk.W)
         ttk.Button(row, text="🌐  Télécharger signature-base",
-                   command=self._cb["yara_online"], width=28).pack(side=tk.LEFT, padx=4)
+                   command=self._cb["yara_online"], width=30).pack(side=tk.LEFT, padx=4)
         ttk.Button(row, text="🔌  Importer depuis clé USB",
                    command=self._cb["yara_usb"],    width=28).pack(side=tk.LEFT, padx=4)
 
@@ -578,23 +831,22 @@ class AdminPanel:
         ttk.Label(tab, text="Gestion des journaux d'activité",
                   font=("Arial", 11, "bold")).pack(anchor=tk.W, pady=(0, 6))
 
-        # ── Volumétrie actuelle ────────────────────────────────────────────────
+        from log_handler import get_log_size_info
+        from config import LOG_FILE as _LOG_FILE
+
+        self._log_size_var = tk.StringVar(value=get_log_size_info())
+
         info_frame = ttk.LabelFrame(tab, text="Volumétrie", padding=8)
         info_frame.pack(fill=tk.X, pady=(0, 10))
 
-        from log_handler import get_log_size_info, LOG_FILE as _LOG_FILE
-        self._log_size_var = tk.StringVar(value=get_log_size_info())
-
-        size_row = ttk.Frame(info_frame)
-        size_row.pack(fill=tk.X)
-        ttk.Label(size_row, text="Fichier principal :").pack(side=tk.LEFT)
-        ttk.Label(size_row, text=_LOG_FILE,
+        r1 = ttk.Frame(info_frame); r1.pack(fill=tk.X)
+        ttk.Label(r1, text="Fichier principal :").pack(side=tk.LEFT)
+        ttk.Label(r1, text=_LOG_FILE,
                   foreground="navy", font=("Courier", 9)).pack(side=tk.LEFT, padx=6)
 
-        vol_row = ttk.Frame(info_frame)
-        vol_row.pack(fill=tk.X, pady=(4, 0))
-        ttk.Label(vol_row, text="Taille totale (rotation incluse) :").pack(side=tk.LEFT)
-        ttk.Label(vol_row, textvariable=self._log_size_var,
+        r2 = ttk.Frame(info_frame); r2.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(r2, text="Taille totale :").pack(side=tk.LEFT)
+        ttk.Label(r2, textvariable=self._log_size_var,
                   foreground="navy", font=("Courier", 9)).pack(side=tk.LEFT, padx=6)
 
         def _refresh_size():
@@ -603,71 +855,45 @@ class AdminPanel:
 
         ttk.Button(info_frame, text="↺  Actualiser",
                    command=_refresh_size, width=14).pack(anchor=tk.W, pady=(6, 0))
-
         ttk.Label(info_frame,
-                  text=f"Rotation : fichiers de 5 Mo max, 5 archives conservées.",
+                  text="Rotation : fichiers 5 Mo max, 5 archives.",
                   foreground="#666", font=("Arial", 8)).pack(anchor=tk.W, pady=(4, 0))
 
-        # ── Export vers support externe ────────────────────────────────────────
+        # Export
         export_frame = ttk.LabelFrame(tab, text="Export vers support externe", padding=8)
         export_frame.pack(fill=tk.X, pady=(0, 10))
 
-        ttk.Label(
-            export_frame,
-            text="Monte une clé USB en écriture, vous permet de sélectionner\n"
-                 "un répertoire de destination, copie les logs, puis démonte\n"
-                 "automatiquement le support.",
-            justify=tk.LEFT, foreground="#444"
-        ).pack(anchor=tk.W, pady=(0, 8))
-
-        export_status_var = tk.StringVar()
-        export_status_lbl = ttk.Label(export_frame, textvariable=export_status_var,
-                                       wraplength=440)
-        export_status_lbl.pack(anchor=tk.W, pady=(0, 4))
+        ttk.Label(export_frame,
+                  text="Monte une clé USB en écriture, ouvre un sélecteur\n"
+                       "de dossier, copie les logs, puis démonte le support.",
+                  foreground="#444").pack(anchor=tk.W, pady=(0, 6))
 
         def _do_export():
-            export_status_var.set("Export en cours…")
-            export_status_lbl.configure(foreground="blue")
-            tab.update_idletasks()
             self._cb["export_logs_usb"]()
             _refresh_size()
-            export_status_var.set("")
 
         ttk.Button(export_frame, text="💾  Exporter les logs vers USB",
                    command=_do_export, width=32).pack(anchor=tk.W)
 
-        # ── Purge ─────────────────────────────────────────────────────────────
+        # Purge
         purge_frame = ttk.LabelFrame(tab, text="Purge des logs", padding=8)
         purge_frame.pack(fill=tk.X)
 
-        ttk.Label(
-            purge_frame,
-            text="⚠  Supprime définitivement tous les fichiers de log\n"
-                 "   (fichier actif + archives de rotation).\n"
-                 "   Une confirmation sera demandée avant l'opération.",
-            justify=tk.LEFT, foreground="#8B0000"
-        ).pack(anchor=tk.W, pady=(0, 8))
-
-        purge_status_var = tk.StringVar()
-        purge_status_lbl = ttk.Label(purge_frame, textvariable=purge_status_var,
-                                      wraplength=440)
-        purge_status_lbl.pack(anchor=tk.W, pady=(0, 4))
+        ttk.Label(purge_frame,
+                  text="⚠  Supprime définitivement tous les fichiers de log.",
+                  foreground="#8B0000").pack(anchor=tk.W, pady=(0, 6))
 
         def _do_purge():
-            result = messagebox.askyesno(
-                "⚠  Confirmer la purge",
+            if not messagebox.askyesno(
+                "⚠ Confirmer la purge",
                 "Cette opération supprime DÉFINITIVEMENT\n"
-                "tous les journaux d'activité.\n\n"
-                "Êtes-vous certain de vouloir continuer ?",
+                "tous les journaux d'activité.\n\nConfirmer ?",
                 icon="warning",
                 parent=tab.winfo_toplevel()
-            )
-            if not result:
+            ):
                 return
             self._cb["purge_logs"]()
             _refresh_size()
-            purge_status_lbl.configure(foreground="green")
-            purge_status_var.set("✅ Purge effectuée.")
 
         ttk.Button(purge_frame, text="🗑  Purger tous les logs",
                    command=_do_purge, width=24).pack(anchor=tk.W)
@@ -689,8 +915,8 @@ class AdminPanel:
         svars  = [tk.StringVar() for _ in labels]
         entries = []
         for i, (lbl, sv) in enumerate(zip(labels, svars)):
-            ttk.Label(tab, text=lbl).grid(row=i+1, column=0, sticky=tk.E,
-                                           padx=(0, 8), pady=4)
+            ttk.Label(tab, text=lbl).grid(row=i+1, column=0,
+                                           sticky=tk.E, padx=(0, 8), pady=4)
             e = ttk.Entry(tab, textvariable=sv, show="●", width=20)
             e.grid(row=i+1, column=1, sticky=tk.W, pady=4)
             entries.append(e)
@@ -714,7 +940,8 @@ class AdminPanel:
         if auth.is_default_code():
             ttk.Label(tab,
                       text="⚠  Code par défaut (0000) – changez-le maintenant !",
-                      foreground="red", font=("Arial", 9, "bold")).grid(
+                      foreground="red",
+                      font=("Arial", 9, "bold")).grid(
                 row=6, column=0, columnspan=2, pady=4)
 
     # ── Onglet Arrêt ──────────────────────────────────────────────────────────
@@ -725,38 +952,27 @@ class AdminPanel:
 
         ttk.Label(tab, text="Arrêt de la station",
                   font=("Arial", 11, "bold")).pack(pady=(0, 8))
-
         ttk.Label(
             tab,
             text="Éteint complètement la station de travail.\n\n"
-                 "Avant l'arrêt :\n"
-                 "  • Les clés USB gérées par l'application sont démontées proprement.\n"
-                 "  • L'application est fermée.\n"
-                 "  • La commande system 'poweroff' est exécutée.\n\n"
+                 "• Les clés USB gérées sont démontées proprement.\n"
+                 "• L'application est fermée.\n"
+                 "• La commande 'poweroff' est exécutée.\n\n"
                  "⚠  Assurez-vous d'avoir sauvegardé votre travail.",
-            justify=tk.LEFT,
-            foreground="#444"
+            justify=tk.LEFT, foreground="#444"
         ).pack(anchor=tk.W, pady=(0, 16))
 
-        def _do_poweroff():
-            confirm = messagebox.askyesno(
-                "⏻  Confirmer l'arrêt",
-                "Voulez-vous vraiment éteindre la station ?\n\n"
-                "L'application sera fermée et la machine arrêtée.",
-                icon="warning",
-                parent=dlg
-            )
-            if not confirm:
-                return
-            dlg.destroy()
-            self._cb["poweroff"]()
+        def _do():
+            if messagebox.askyesno(
+                "⏻ Confirmer l'arrêt",
+                "Voulez-vous vraiment éteindre la station ?",
+                icon="warning", parent=dlg
+            ):
+                dlg.destroy()
+                self._cb["poweroff"]()
 
-        ttk.Button(
-            tab,
-            text="⏻  Éteindre la station",
-            command=_do_poweroff,
-            width=26
-        ).pack(pady=8)
+        ttk.Button(tab, text="⏻  Éteindre la station",
+                   command=_do, width=26).pack(pady=8)
 
     # ── Onglet Quitter ────────────────────────────────────────────────────────
 
@@ -767,7 +983,7 @@ class AdminPanel:
         ttk.Label(tab, text="Quitter l'application",
                   font=("Arial", 11, "bold")).pack(pady=(0, 12))
         ttk.Label(tab,
-                  text="Ferme complètement le scanner antiviral.\n"
+                  text="Ferme le scanner antiviral.\n"
                        "Toutes les clés USB gérées seront démontées proprement.",
                   justify=tk.CENTER).pack(pady=8)
 
