@@ -209,3 +209,69 @@ def _build_stream(title: str, lines: List[str], *info: str) -> str:
 def _esc(t: str) -> str:
     t = str(t).replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
     return "".join(c if 32 <= ord(c) <= 126 else " " for c in t)
+
+
+# ── Rapport de scan par support (export automatique) ──────────────────────────
+
+def write_device_scan_report(mountpoint: str, device: str,
+                              label: str, uuid: str, result) -> str:
+    """
+    Écrit un rapport de scan au format texte à la racine du support analysé.
+
+    Nommage : scan_AV_YYYYMMDD_HHMMSS_<label>.txt
+    Retourne le chemin complet du fichier créé.
+    """
+    ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_lbl = (label or device.replace("/dev/", "")).replace(" ", "_")
+    # Caractères interdits dans les noms de fichiers FAT/NTFS
+    for ch in r'\/:*?"<>|':
+        safe_lbl = safe_lbl.replace(ch, "_")
+    fname = f"scan_AV_{ts}_{safe_lbl}.txt"
+    dest  = os.path.join(mountpoint, fname)
+
+    sep  = "=" * 60
+    dash = "-" * 60
+    now  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    lines: List[str] = [
+        sep,
+        "  USB Antivirus Scanner – Rapport de scan",
+        sep,
+        f"  Date      : {now}",
+        f"  Support   : {device}",
+    ]
+    if label:
+        lines.append(f"  Étiquette : {label}")
+    if uuid:
+        lines.append(f"  UUID      : {uuid}")
+    lines += [dash, ""]
+
+    # Résumé du scan
+    lines.append(result.summary())
+    lines.append("")
+    lines.append(dash)
+
+    # Détail des menaces
+    if result.threats:
+        lines.append("")
+        lines.append("FICHIERS INFECTÉS :")
+        for t in result.threats:
+            lines.append(f"  [{t.engine}]  {t.threat}")
+            lines.append(f"    → {t.path}")
+    else:
+        lines.append("")
+        lines.append("✓  Aucune menace détectée sur ce support.")
+
+    lines += [
+        "",
+        sep,
+        "  Rapport généré automatiquement par USB Antivirus Scanner",
+        sep,
+        "",
+    ]
+
+    with open(dest, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+    log_info(f"Rapport de scan écrit : {dest}")
+    return dest
