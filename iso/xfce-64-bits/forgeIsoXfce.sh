@@ -1876,21 +1876,93 @@ ok "Tous les fichiers de configuration générés"
 
 
 # =============================================================================
-# Hook 9999 (BINAIRE) : menus de boot syslinux (BIOS) + GRUB (UEFI)
+# Boot menus : config/includes.binary/ (méthode fiable)
+#
+# live-build copie config/includes.binary/ dans binary/ lors de lb_binary_includes,
+# APRÈS que lb_binary_syslinux et lb_binary_grub_efi ont généré leurs configs.
+# Ces fichiers écrasent donc les configs par défaut de live-build.
+# Le hook 9999 (ci-dessous) agit en filet de sécurité pour les cas où
+# live-build régénère les configs après lb_binary_includes.
 # =============================================================================
-# Ce hook s'exécute APRÈS lb_binary et écrase les configs générées par
-# live-build pour les deux bootloaders.
-step "Création du hook de menu de boot (syslinux + GRUB EFI)..."
+step "Création des menus de boot (syslinux BIOS + GRUB EFI)..."
+
+# ── Syslinux / isolinux (BIOS legacy) ────────────────────────────────────────
+mkdir -p config/includes.binary/isolinux
+cat > config/includes.binary/isolinux/isolinux.cfg << SYSLINUX
+UI vesamenu.c32
+DEFAULT live
+TIMEOUT 150
+PROMPT 0
+
+MENU TITLE USB Antivirus Scanner v1.0 - Menu de demarrage
+
+LABEL live
+  MENU LABEL > Demarrer en mode Live (scanner antiviral)
+  MENU DEFAULT
+  KERNEL /live/vmlinuz
+  APPEND initrd=/live/initrd.img ${BOOT_PARAMS}
+
+LABEL install
+  MENU LABEL > Installer sur le disque (kiosque persistant)
+  KERNEL /live/vmlinuz
+  APPEND initrd=/live/initrd.img ${BOOT_PARAMS} installer=1
+
+LABEL live-safe
+  MENU LABEL > Demarrer en mode Live - Sans echec (nomodeset)
+  KERNEL /live/vmlinuz
+  APPEND initrd=/live/initrd.img ${BOOT_PARAMS} nomodeset
+SYSLINUX
+
+# Supprimer live.cfg par défaut (il prendrait le dessus sur isolinux.cfg)
+echo "# replaced by isolinux.cfg" > config/includes.binary/isolinux/live.cfg
+
+# ── GRUB EFI (UEFI) ──────────────────────────────────────────────────────────
+mkdir -p config/includes.binary/boot/grub
+cat > config/includes.binary/boot/grub/grub.cfg << GRUBMENU
+set default=0
+set timeout=15
+
+if [ x\$feature_all_video_module = xy ]; then
+  insmod all_video
+fi
+
+menuentry "Demarrer en mode Live (scanner antiviral)" {
+  linux /live/vmlinuz ${BOOT_PARAMS}
+  initrd /live/initrd.img
+}
+
+menuentry "Installer sur le disque (kiosque persistant)" {
+  linux /live/vmlinuz ${BOOT_PARAMS} installer=1
+  initrd /live/initrd.img
+}
+
+menuentry "Demarrer en mode Live - Sans echec (nomodeset)" {
+  linux /live/vmlinuz ${BOOT_PARAMS} nomodeset
+  initrd /live/initrd.img
+}
+GRUBMENU
+
+# Même config pour le chemin EFI alternatif
+mkdir -p config/includes.binary/EFI/boot
+cp config/includes.binary/boot/grub/grub.cfg \
+   config/includes.binary/EFI/boot/grub.cfg
+
+ok "Menus de boot syslinux + GRUB EFI créés (config/includes.binary/)"
+
+# =============================================================================
+# Hook 9999 (BINAIRE) : filet de sécurité – repatche après lb_binary
+# S'exécute APRÈS lb_binary_includes pour garantir les 3 entrées même si
+# live-build regénère ses configs dans une phase ultérieure.
+# =============================================================================
+step "Création du hook de boot (filet de sécurité)..."
 mkdir -p config/hooks/normal
 cat << HOOK > config/hooks/normal/9999-bootmenu.hook.binary
 #!/bin/bash
-# ── Hook binary – s'exécute APRÈS la génération des fichiers boot par live-build
-# Patche syslinux (BIOS) ET grub (UEFI) en une seule passe.
 set -e
 
 BOOT_PARAMS="${BOOT_PARAMS}"
 
-# ── 1. Syslinux / isolinux (BIOS legacy) ─────────────────────────────────────
+# ── Syslinux (BIOS) ───────────────────────────────────────────────────────────
 write_syslinux() {
     local DIR="\$1"
     [ -d "\$DIR" ] || return 0
@@ -1903,7 +1975,7 @@ PROMPT 0
 MENU TITLE USB Antivirus Scanner v1.0 - Menu de demarrage
 
 LABEL live
-  MENU LABEL > Demarrer en mode Live (OpenBox kiosque)
+  MENU LABEL > Demarrer en mode Live (scanner antiviral)
   MENU DEFAULT
   KERNEL /live/vmlinuz
   APPEND initrd=/live/initrd.img \${BOOT_PARAMS}
@@ -1926,7 +1998,7 @@ for DIR in binary/isolinux binary/boot/isolinux; do
     write_syslinux "\$DIR"
 done
 
-# ── 2. GRUB EFI (UEFI) ────────────────────────────────────────────────────────
+# ── GRUB EFI (UEFI) ───────────────────────────────────────────────────────────
 write_grub() {
     local CFG="\$1"
     [ -f "\$CFG" ] || { echo "[hook] \$CFG absent, ignore"; return 0; }
@@ -1938,7 +2010,7 @@ if [ x\\\$feature_all_video_module = xy ]; then
   insmod all_video
 fi
 
-menuentry "Demarrer en mode Live (OpenBox kiosque)" {
+menuentry "Demarrer en mode Live (scanner antiviral)" {
   linux /live/vmlinuz \${BOOT_PARAMS}
   initrd /live/initrd.img
 }
@@ -1963,7 +2035,7 @@ for CFG in binary/boot/grub/grub.cfg \
 done
 HOOK
 chmod +x config/hooks/normal/9999-bootmenu.hook.binary
-ok "Hook 9999-bootmenu (syslinux + GRUB EFI) créé"
+ok "Hook 9999-bootmenu créé"
 
 # =============================================================================
 # Build de l'ISO
