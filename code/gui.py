@@ -184,7 +184,7 @@ class VirusScannerGUI:
 
         cols = ("device", "label", "size", "status")
         self.usb_tree = ttk.Treeview(inner, columns=cols, show="headings",
-                                      height=8, selectmode="extended")
+                                      height=8, selectmode="none")
 
         style = ttk.Style()
         style.configure("Treeview",
@@ -232,6 +232,8 @@ class VirusScannerGUI:
                  font=("Arial", 8), anchor=tk.W).pack(
                      fill=tk.X, padx=10, pady=(0, 4))
 
+        # Sélection tactile : tap = toggle (pas de Ctrl requis)
+        self.usb_tree.bind("<Button-1>", self._on_usb_tap)
         self.usb_tree.bind("<<TreeviewSelect>>", self._on_usb_select)
 
     # ── Contrôles de scan ─────────────────────────────────────────────────────
@@ -257,14 +259,7 @@ class VirusScannerGUI:
             bg="#444", fg="white", relief=tk.FLAT,
             font=("Arial", 11), pady=8, state=tk.DISABLED
         )
-        self.stop_btn.pack(fill=tk.X, pady=(0, 6))
-
-        tk.Button(
-            frm, text="📄  Exporter rapport PDF",
-            command=self._export_pdf,
-            bg=self.TOPBAR, fg=self.FG_DIM, relief=tk.FLAT,
-            font=("Arial", 10), pady=6
-        ).pack(fill=tk.X)
+        self.stop_btn.pack(fill=tk.X)
 
     # ── Panneau animation ─────────────────────────────────────────────────────
 
@@ -299,7 +294,7 @@ class VirusScannerGUI:
         logo_frame.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
 
         tk.Label(logo_frame,
-                 text="[ Logo USB Antivirus ]",
+                 text="[ Logo ]",
                  bg=self.CARD, fg=self.FG_DIM,
                  font=("Arial", 18, "italic")).pack(expand=True)
 
@@ -553,10 +548,47 @@ class VirusScannerGUI:
     # Gestion USB
     # ══════════════════════════════════════════════════════════════════════════
 
+    @staticmethod
+    def _get_system_devices() -> set:
+        """
+        Retourne l'ensemble des noms de périphériques hébergeant le système
+        (ex. {'sda', 'sda1', 'sda2', 'nvme0n1', 'nvme0n1p1'…}).
+        Lit /proc/mounts pour trouver le bloc monté sur '/'.
+        """
+        system_devs: set = set()
+        try:
+            with open("/proc/mounts") as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[1] == "/":
+                        dev = parts[0]                          # ex. /dev/sda1
+                        if dev.startswith("/dev/"):
+                            part_name = dev[5:]                 # ex. sda1
+                            system_devs.add(part_name)
+                            # Remonter au disque parent (supprime les chiffres finaux
+                            # et 'p' pour les NVMe : nvme0n1p1 → nvme0n1)
+                            import re
+                            parent = re.sub(r'p?\d+$', '', part_name)
+                            if parent and parent != part_name:
+                                system_devs.add(parent)
+        except Exception:
+            pass
+        return system_devs
+
     def _refresh_usb(self) -> None:
         selected_devs = self._selected_usb_list()
         for row in self.usb_tree.get_children():
             self.usb_tree.delete(row)
+
+        self._usb_partitions = self.usb.list_partitions()
+
+        # Exclure les partitions du disque système
+        system_devs = self._get_system_devices()
+        self._usb_partitions = [
+            p for p in self._usb_partitions
+            if os.path.basename(p.device) not in system_devs
+            and os.path.basename(p.parent) not in system_devs
+        ]
 
         self._usb_partitions = self.usb.list_partitions()
 
@@ -594,6 +626,28 @@ class VirusScannerGUI:
                 self.usb_tree.selection_add(dev)
             except Exception:
                 pass
+
+    def _on_usb_tap(self, event: tk.Event) -> str:
+        """
+        Gestion tactile de la sélection : chaque tap toggle l'état de la ligne.
+        Plusieurs lignes peuvent être sélectionnées en tapant successivement.
+        Retourne "break" pour empêcher le comportement par défaut du Treeview.
+        """
+        iid = self.usb_tree.identify_row(event.y)
+        if not iid:
+            return "break"
+        vals = self.usb_tree.item(iid, "values")
+        if not vals or vals[0] == "—":
+            return "break"
+        # Toggle : sélectionné → désélectionner, sinon → ajouter à la sélection
+        current = set(self.usb_tree.selection())
+        if iid in current:
+            current.discard(iid)
+        else:
+            current.add(iid)
+        self.usb_tree.selection_set(list(current))
+        self._on_usb_select()
+        return "break"
 
     def _on_usb_select(self, _=None) -> None:
         devs = self._selected_usb_list()
