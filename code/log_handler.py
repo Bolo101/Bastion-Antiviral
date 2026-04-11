@@ -213,65 +213,117 @@ def _esc(t: str) -> str:
 
 # ── Rapport de scan par support (export automatique) ──────────────────────────
 
-def write_device_scan_report(mountpoint: str, device: str,
-                              label: str, uuid: str, result) -> str:
+def write_device_scan_report_pdf(
+        mountpoint: str, device: str, label: str, uuid: str,
+        result,
+        clamav_info: dict,
+        yara_info:   dict,
+        avast_info:  dict,
+        engines_used: dict,
+) -> str:
     """
-    Écrit un rapport de scan au format texte à la racine du support analysé.
+    Génère un PDF de rapport de scan et l'écrit à la racine du support.
 
-    Nommage : scan_AV_YYYYMMDD_HHMMSS_<label>.txt
-    Retourne le chemin complet du fichier créé.
+    Nommage  : scan_AV_YYYYMMDD_HHMMSS_<label>.pdf
+    Contenu  : en-tête support, bases utilisées, résumé, détail des menaces.
+    Retourne : chemin complet du fichier créé.
     """
     ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_lbl = (label or device.replace("/dev/", "")).replace(" ", "_")
-    # Caractères interdits dans les noms de fichiers FAT/NTFS
     for ch in r'\/:*?"<>|':
         safe_lbl = safe_lbl.replace(ch, "_")
-    fname = f"scan_AV_{ts}_{safe_lbl}.txt"
+    fname = f"scan_AV_{ts}_{safe_lbl}.pdf"
     dest  = os.path.join(mountpoint, fname)
 
-    sep  = "=" * 60
-    dash = "-" * 60
-    now  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    lines: List[str] = [
-        sep,
-        "  USB Antivirus Scanner – Rapport de scan",
-        sep,
-        f"  Date      : {now}",
-        f"  Support   : {device}",
-    ]
+    # ── Construction des lignes du rapport ────────────────────────────────────
+    lines: List[str] = []
+
+    # En-tête support
+    lines.append(f"Support   : {device}")
     if label:
-        lines.append(f"  Étiquette : {label}")
+        lines.append(f"Etiquette : {label}")
     if uuid:
-        lines.append(f"  UUID      : {uuid}")
-    lines += [dash, ""]
-
-    # Résumé du scan
-    lines.append(result.summary())
+        lines.append(f"UUID      : {uuid}")
+    lines.append(f"Date      : {now}")
     lines.append("")
-    lines.append(dash)
 
-    # Détail des menaces
+    # Moteurs utilisés
+    engines_list = []
+    if engines_used.get("clamav"):
+        engines_list.append("ClamAV")
+    if engines_used.get("avast"):
+        engines_list.append("Avast")
+    if engines_used.get("yara"):
+        engines_list.append("YARA")
+    lines.append(f"Moteurs   : {' + '.join(engines_list) or 'aucun'}")
+    lines.append("")
+
+    # Bases ClamAV
+    lines.append("--- BASE CLAMAV ---")
+    clamav_status = clamav_info.get("status", "MISSING")
+    clamav_lu     = clamav_info.get("last_update", "inconnue")
+    lines.append(f"Statut    : {clamav_status}  (MAJ : {clamav_lu})")
+    official = {k: v for k, v in clamav_info.get("files", {}).items()
+                if k in ("main.cvd","main.cld","daily.cvd","daily.cld",
+                         "bytecode.cvd","bytecode.cld")}
+    tp_count = len(clamav_info.get("files", {})) - len(official)
+    for fname_db, info_db in official.items():
+        lines.append(f"  {fname_db:<18} {info_db}")
+    if tp_count > 0:
+        lines.append(f"  Signatures tierces : {tp_count} fichier(s)")
+    lines.append("")
+
+    # Base YARA
+    if engines_used.get("yara"):
+        lines.append("--- BASE YARA ---")
+        yara_count = yara_info.get("count", 0)
+        yara_lu    = yara_info.get("last_update", "inconnue")
+        lines.append(f"Regles    : {yara_count}  (MAJ : {yara_lu})")
+        lines.append("")
+
+    # Avast
+    if engines_used.get("avast"):
+        lines.append("--- AVAST BUSINESS ---")
+        if avast_info.get("licensed"):
+            lines.append("Statut    : installe et licence active")
+        elif avast_info.get("installed"):
+            lines.append("Statut    : installe - LICENCE REQUISE")
+        else:
+            lines.append("Statut    : non installe")
+        lines.append("")
+
+    # Résultats
+    lines.append("--- RESULTATS DU SCAN ---")
+    lines.append(f"Fichiers analyses  : {result.scanned}")
+    lines.append(f"Menaces detectees  : {result.infected}")
+    lines.append(f"Duree              : {result.duration:.1f}s")
+    if result.scanned_clamav:
+        lines.append(f"  ClamAV : {result.scanned_clamav} fichier(s)")
+    if result.scanned_avast:
+        lines.append(f"  Avast  : {result.scanned_avast} fichier(s)")
+    if result.scanned_yara:
+        lines.append(f"  YARA   : {result.scanned_yara} fichier(s)")
+    if result.stopped:
+        lines.append("  (scan interrompu par l'utilisateur)")
+    lines.append("")
+
     if result.threats:
-        lines.append("")
-        lines.append("FICHIERS INFECTÉS :")
+        lines.append("--- FICHIERS INFECTES ---")
         for t in result.threats:
-            lines.append(f"  [{t.engine}]  {t.threat}")
-            lines.append(f"    → {t.path}")
+            lines.append(f"[{t.engine}] {t.threat}")
+            lines.append(f"  -> {t.path}")
     else:
-        lines.append("")
-        lines.append("✓  Aucune menace détectée sur ce support.")
+        lines.append("Aucune menace detectee sur ce support.")
 
-    lines += [
-        "",
-        sep,
-        "  Rapport généré automatiquement par USB Antivirus Scanner",
-        sep,
-        "",
-    ]
+    lines += ["", "Rapport genere par USB Antivirus Scanner - EDF"]
 
-    with open(dest, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
+    _write_pdf(dest, "Rapport de scan - USB Antivirus Scanner",
+               lines,
+               f"Support : {label or device}",
+               f"Date    : {now}",
+               f"Resultat: {'MENACES DETECTEES' if result.infected else 'SAIN'}")
 
-    log_info(f"Rapport de scan écrit : {dest}")
+    log_info(f"Rapport PDF ecrit : {dest}")
     return dest
