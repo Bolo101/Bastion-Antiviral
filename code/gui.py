@@ -75,6 +75,7 @@ class VirusScannerGUI:
 
         # ── Suivi des scans parallèles ─────────────────────────────────────────
         self._scan_engines:  Dict[str, ScanEngine] = {}   # dev → engine
+        self._targets_map:   Dict[str, str]         = {}   # dev → mountpoint
         self._scan_lock      = threading.Lock()
         self._active_scans   = 0
         self._total_scanned  = 0
@@ -138,8 +139,9 @@ class VirusScannerGUI:
         self.clamav_status_var = tk.StringVar(value="ClamAV : vérification…")
         self.avast_status_var  = tk.StringVar(value="Avast : vérification…")
         self.yara_status_var   = tk.StringVar(value="YARA : vérification…")
+        self.tp_status_var     = tk.StringVar(value="Sigs tierces : vérification…")
         for var in (self.clamav_status_var, self.avast_status_var,
-                    self.yara_status_var):
+                    self.yara_status_var, self.tp_status_var):
             tk.Label(sbar, textvariable=var,
                      bg="#0a2240", fg=self.GREEN,
                      font=("Courier", 8), padx=14).pack(side=tk.LEFT)
@@ -148,15 +150,18 @@ class VirusScannerGUI:
         body = tk.Frame(self.root, bg=self.BG)
         body.pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
 
-        left  = tk.Frame(body, bg=self.BG, width=420)
-        right = tk.Frame(body, bg=self.BG)
-        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=False, padx=(0, 6))
+        left   = tk.Frame(body, bg=self.BG, width=520)
+        center = tk.Frame(body, bg=self.BG)
+        right  = tk.Frame(body, bg=self.BG, width=340)
+        left.pack(side=tk.LEFT,  fill=tk.BOTH, expand=False, padx=(0, 4))
         left.pack_propagate(False)
-        right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+        right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=False, padx=(4, 0))
+        right.pack_propagate(False)
+        center.pack(side=tk.LEFT, fill=tk.BOTH, expand=True,  padx=(0, 4))
 
         self._build_usb_panel(left)
         self._build_scan_controls(left)
-        self._build_animation_panel(left)
+        self._build_animation_panel(center)
         self._build_log_panel(right)
 
     # ── Panneau USB (simplifié utilisateur) ───────────────────────────────────
@@ -166,60 +171,60 @@ class VirusScannerGUI:
         outer.pack(fill=tk.BOTH, expand=True, pady=(0, 4))
 
         hdr = tk.Frame(outer, bg=self.CARD)
-        hdr.pack(fill=tk.X, padx=8, pady=(6, 2))
-        tk.Label(hdr, text="  Clés USB & disques amovibles",
+        hdr.pack(fill=tk.X, padx=8, pady=(8, 4))
+        tk.Label(hdr, text="  Supports USB détectés",
+                 bg=self.CARD, fg=self.FG,
+                 font=("Arial", 11, "bold")).pack(side=tk.LEFT)
+        tk.Label(hdr, text="Appuyez pour sélectionner",
                  bg=self.CARD, fg=self.FG_DIM,
-                 font=("Arial", 9, "bold")).pack(side=tk.LEFT)
-        tk.Label(hdr, text="(Ctrl+clic pour sélectionner plusieurs)",
-                 bg=self.CARD, fg=self.FG_DIM,
-                 font=("Arial", 7, "italic")).pack(side=tk.RIGHT, padx=6)
+                 font=("Arial", 8, "italic")).pack(side=tk.RIGHT, padx=6)
 
         inner = tk.Frame(outer, bg=self.CARD, padx=6, pady=4)
         inner.pack(fill=tk.BOTH, expand=True)
 
-        # Colonnes simplifiées pour l'utilisateur
         cols = ("device", "label", "size", "status")
         self.usb_tree = ttk.Treeview(inner, columns=cols, show="headings",
-                                      height=5, selectmode="extended")
+                                      height=8, selectmode="extended")
 
         style = ttk.Style()
         style.configure("Treeview",
                         background=self.CARD, fieldbackground=self.CARD,
-                        foreground=self.FG, rowheight=22)
+                        foreground=self.FG, rowheight=32)
         style.configure("Treeview.Heading",
                         background=self.TOPBAR, foreground=self.FG,
-                        font=("Arial", 8, "bold"))
+                        font=("Arial", 9, "bold"))
         style.map("Treeview", background=[("selected", "#1a4a8a")])
 
         for cid, heading, width in [
-            ("device", "Périphérique",  110),
-            ("label",  "Étiquette",      90),
-            ("size",   "Taille",         60),
-            ("status", "État",          140),
+            ("device", "Périphérique",  120),
+            ("label",  "Étiquette",     120),
+            ("size",   "Taille",         70),
+            ("status", "État",          180),
         ]:
             self.usb_tree.heading(cid, text=heading)
-            self.usb_tree.column(cid, width=width, minwidth=30, anchor=tk.W)
+            self.usb_tree.column(cid, width=width, minwidth=40, anchor=tk.W)
 
         self.usb_tree.tag_configure("ro",      background="#1a3a2a", foreground="#90ee90")
         self.usb_tree.tag_configure("rw",      background="#3a2a00", foreground="#ffcc66")
         self.usb_tree.tag_configure("unmount", background=self.CARD,  foreground=self.FG_DIM)
+        self.usb_tree.tag_configure("scanning",background="#1a1a4a", foreground="#88aaff")
 
         usb_sb = ttk.Scrollbar(inner, orient=tk.VERTICAL, command=self.usb_tree.yview)
         self.usb_tree.configure(yscrollcommand=usb_sb.set)
         self.usb_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         usb_sb.pack(side=tk.LEFT, fill=tk.Y)
 
-        # Boutons actions
+        # Boutons actions — grands pour écran tactile
         btn_col = tk.Frame(inner, bg=self.CARD)
-        btn_col.pack(side=tk.LEFT, padx=(6, 0), anchor=tk.N)
+        btn_col.pack(side=tk.LEFT, padx=(8, 0), anchor=tk.N)
         for txt, cmd in [
-            ("↺ Actualiser", self._refresh_usb),
-            ("▲ Monter",     self._mount_usb),
-            ("▼ Démonter",   self._umount_usb),
+            ("↺  Actualiser", self._refresh_usb),
+            ("▲  Monter",     self._mount_usb),
+            ("▼  Démonter",   self._umount_usb),
         ]:
-            tk.Button(btn_col, text=txt, command=cmd, width=11,
+            tk.Button(btn_col, text=txt, command=cmd, width=12,
                       bg=self.TOPBAR, fg=self.FG, relief=tk.FLAT,
-                      font=("Arial", 8), pady=5).pack(fill=tk.X, pady=2)
+                      font=("Arial", 10), pady=10).pack(fill=tk.X, pady=3)
 
         self.usb_info_var = tk.StringVar(value="")
         tk.Label(outer, textvariable=self.usb_info_var,
@@ -234,60 +239,69 @@ class VirusScannerGUI:
     def _build_scan_controls(self, parent: tk.Frame) -> None:
         outer = tk.Frame(parent, bg=self.CARD, bd=1, relief=tk.SOLID)
         outer.pack(fill=tk.X, pady=4)
-        frm = tk.Frame(outer, bg=self.CARD, padx=10, pady=8)
+        frm = tk.Frame(outer, bg=self.CARD, padx=10, pady=10)
         frm.pack(fill=tk.X)
 
         self.scan_btn = tk.Button(
             frm, text="▶   LANCER L'ANALYSE",
             command=self._start_scan,
             bg=self.ACCENT, fg="white", relief=tk.FLAT,
-            font=("Arial", 14, "bold"), pady=12, padx=20,
+            font=("Arial", 16, "bold"), pady=16, padx=20,
             cursor="hand2"
         )
-        self.scan_btn.pack(fill=tk.X, pady=(0, 4))
+        self.scan_btn.pack(fill=tk.X, pady=(0, 6))
 
         self.stop_btn = tk.Button(
-            frm, text="⏹  Arrêter",
+            frm, text="⏹  Arrêter tous les scans",
             command=self._stop_all_scans,
             bg="#444", fg="white", relief=tk.FLAT,
-            font=("Arial", 10), pady=6, state=tk.DISABLED
+            font=("Arial", 11), pady=8, state=tk.DISABLED
         )
-        self.stop_btn.pack(fill=tk.X, pady=(0, 4))
+        self.stop_btn.pack(fill=tk.X, pady=(0, 6))
 
         tk.Button(
             frm, text="📄  Exporter rapport PDF",
             command=self._export_pdf,
             bg=self.TOPBAR, fg=self.FG_DIM, relief=tk.FLAT,
-            font=("Arial", 9), pady=4
+            font=("Arial", 10), pady=6
         ).pack(fill=tk.X)
 
     # ── Panneau animation ─────────────────────────────────────────────────────
 
     def _build_animation_panel(self, parent: tk.Frame) -> None:
         outer = tk.Frame(parent, bg=self.CARD, bd=1, relief=tk.SOLID)
-        outer.pack(fill=tk.X, pady=4)
+        outer.pack(fill=tk.X)
 
         self._anim_canvas = tk.Canvas(
-            outer, width=420, height=130,
+            outer, height=220,
             bg=self.CARD, highlightthickness=0
         )
-        self._anim_canvas.pack()
+        self._anim_canvas.pack(fill=tk.X, expand=True)
 
         self.status_var   = tk.StringVar(value="Prêt — insérez une clé USB")
         self.scanned_var  = tk.StringVar(value="")
         self.infected_var = tk.StringVar(value="")
 
         info_row = tk.Frame(outer, bg=self.CARD)
-        info_row.pack(fill=tk.X, padx=12, pady=(0, 8))
+        info_row.pack(fill=tk.X, padx=10, pady=(0, 8))
         tk.Label(info_row, textvariable=self.status_var,
                  bg=self.CARD, fg=self.FG,
                  font=("Arial", 10, "bold")).pack(side=tk.LEFT)
         tk.Label(info_row, textvariable=self.scanned_var,
                  bg=self.CARD, fg=self.GREEN,
-                 font=("Courier", 9)).pack(side=tk.LEFT, padx=14)
+                 font=("Courier", 9)).pack(side=tk.LEFT, padx=10)
         tk.Label(info_row, textvariable=self.infected_var,
                  bg=self.CARD, fg=self.RED,
                  font=("Courier", 9, "bold")).pack(side=tk.LEFT)
+
+        # ── Zone logo ──────────────────────────────────────────────────────
+        logo_frame = tk.Frame(parent, bg=self.CARD, bd=1, relief=tk.SOLID)
+        logo_frame.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
+
+        tk.Label(logo_frame,
+                 text="[ Logo USB Antivirus ]",
+                 bg=self.CARD, fg=self.FG_DIM,
+                 font=("Arial", 18, "italic")).pack(expand=True)
 
     # ── Journal ───────────────────────────────────────────────────────────────
 
@@ -304,9 +318,9 @@ class VirusScannerGUI:
 
         self.log_text = tk.Text(
             parent, bg="#0b0d14", fg="#c8d0de",
-            font=("Courier", 8), wrap=tk.WORD,
+            font=("Courier", 9), wrap=tk.WORD,
             state=tk.NORMAL, insertbackground="white",
-            relief=tk.FLAT, padx=8, pady=6
+            relief=tk.FLAT, padx=10, pady=8
         )
         sb = ttk.Scrollbar(parent, command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=sb.set)
@@ -326,8 +340,10 @@ class VirusScannerGUI:
 
     def _animate(self) -> None:
         c  = self._anim_canvas
-        cx = 210     # centre X dans le canvas 420px
-        cy = 62      # centre Y
+        cw = c.winfo_width()  or 400
+        ch = c.winfo_height() or 220
+        cx = cw // 2   # centre X dynamique
+        cy = ch // 2 - 10  # centre Y légèrement au-dessus du milieu
 
         c.delete("all")
 
@@ -403,7 +419,7 @@ class VirusScannerGUI:
             c.create_rectangle(cx - 3, cy - 10, cx + 3, cy - 5,
                                 fill="#3a6498", outline=glow_color, width=1)
 
-        # ── texte d'état sous le bouclier ─────────────────────────────────────
+        # ── texte d'état sous le bouclier (centré) ────────────────────────────
         if st == "scanning":
             dots = "." * (int(self._anim_phase / 60) % 4)
             label = f"Analyse en cours{dots}"
@@ -414,25 +430,25 @@ class VirusScannerGUI:
         else:
             label = "Prêt"
 
-        c.create_text(cx + 70, cy,
+        c.create_text(cx, cy + 88,
                       text=label,
                       fill=glow_color,
                       font=("Arial", 11, "bold"),
-                      anchor=tk.W)
+                      anchor=tk.CENTER)
 
-        # ── compteurs ─────────────────────────────────────────────────────────
+        # ── compteurs (centrés) ────────────────────────────────────────────────
         if self._active_scans > 0:
-            c.create_text(cx + 70, cy + 24,
+            c.create_text(cx, cy + 112,
                           text=f"Analysés : {self._total_scanned}   "
                                f"Menaces : {self._total_infected}",
                           fill=self.FG_DIM,
                           font=("Courier", 8),
-                          anchor=tk.W)
-            c.create_text(cx + 70, cy + 40,
+                          anchor=tk.CENTER)
+            c.create_text(cx, cy + 128,
                           text=f"{self._active_scans} scan(s) actif(s)",
                           fill="#5577aa",
                           font=("Courier", 8),
-                          anchor=tk.W)
+                          anchor=tk.CENTER)
 
         interval = 40 if st == "scanning" else 200
         self._anim_after_id = self.root.after(interval, self._animate)
@@ -505,10 +521,25 @@ class VirusScannerGUI:
             yara_text = (f"✅  YARA ({method}) : {n} règle(s)  (màj : {lu2})"
                          if n > 0 else f"⚠   YARA ({method}) : aucune règle")
 
+        # Signatures tierces ClamAV
+        import glob as _glob
+        _TP_PATTERNS = [
+            "*.ndb", "*.hdb", "*.hsb", "*.db",
+            "*.ftm", "*.ldb", "*.cdb", "*.fp", "*.ign2"
+        ]
+        tp_count = sum(
+            len(_glob.glob(f"/var/lib/clamav/{p}")) for p in _TP_PATTERNS
+        )
+        if tp_count > 0:
+            tp_text = f"Sigs tierces : {tp_count} fichier(s)"
+        else:
+            tp_text = "⚠  Sigs tierces : aucune"
+
         def _apply():
             self.clamav_status_var.set(clamav_text)
             self.avast_status_var.set(avast_text)
             self.yara_status_var.set(yara_text)
+            self.tp_status_var.set(tp_text)
             # Synchronise les vars d'options avec la réalité du système
             if avast_installed and avast_licensed:
                 self.use_avast_var.set(True)
@@ -535,9 +566,14 @@ class VirusScannerGUI:
                                           "Aucune clé USB détectée"))
             return
 
+        scanning_devs = set(self._scan_engines.keys())
+
         for p in self._usb_partitions:
             mp = self.usb.get_mountpoint(p.device)
-            if mp:
+            if p.device in scanning_devs:
+                status = f"🔍 Analyse en cours…"
+                tag    = "scanning"
+            elif mp:
                 ro     = self.usb._is_ro(p.device, mp)
                 status = f"✅ Monté RO → {mp}" if ro else f"⚠  Monté RW → {mp}"
                 tag    = "ro" if ro else "rw"
@@ -552,8 +588,8 @@ class VirusScannerGUI:
                                           status),
                                   tags=(tag,))
 
-        # Rétablit la sélection
-        for dev in selected_devs:
+        # Rétablit la sélection (y compris les supports en cours de scan)
+        for dev in set(selected_devs) | scanning_devs:
             try:
                 self.usb_tree.selection_add(dev)
             except Exception:
@@ -632,9 +668,6 @@ class VirusScannerGUI:
     # ══════════════════════════════════════════════════════════════════════════
 
     def _start_scan(self) -> None:
-        if self._active_scans > 0:
-            return
-
         if (not self.engine.is_clamav_installed()
                 and not self.use_avast_var.get()):
             messagebox.showerror(
@@ -649,12 +682,25 @@ class VirusScannerGUI:
         if not devs:
             messagebox.showwarning(
                 "Aucun périphérique",
-                "Sélectionnez une ou plusieurs clés USB dans la liste.",
+                "Appuyez sur un support USB dans la liste pour le sélectionner.",
                 parent=self.root
             )
             return
 
-        # Vérifications Avast
+        # Exclure les supports déjà en cours de scan
+        devs_to_scan = [d for d in devs if d not in self._scan_engines]
+        already = [d for d in devs if d in self._scan_engines]
+        if already:
+            msg = "  ".join(already)
+            if not devs_to_scan:
+                messagebox.showinfo(
+                    "Déjà en cours",
+                    f"Ces supports sont déjà en cours de scan :\n{msg}",
+                    parent=self.root
+                )
+                return
+            self._log(f"ℹ Déjà en scan : {msg} — ignoré", "info")
+
         if (self.use_avast_var.get()
                 and self.engine.is_avast_installed()
                 and not self.engine.is_avast_licensed()):
@@ -676,35 +722,37 @@ class VirusScannerGUI:
                 return
 
         # Prépare les cibles
-        targets_map: Dict[str, str] = {}   # dev → mountpoint
-        for dev in devs:
+        targets_map: Dict[str, str] = {}
+        for dev in devs_to_scan:
             mp = self.usb.get_mountpoint(dev)
             if not mp:
                 ok, msg = self.usb.mount(dev)
                 if not ok:
                     messagebox.showerror("Montage", msg, parent=self.root)
-                    return
+                    continue
                 self._refresh_usb()
                 mp = self.usb.get_mountpoint(dev)
             if not mp:
                 messagebox.showerror(
                     "Erreur", f"Impossible de monter {dev}.", parent=self.root)
-                return
+                continue
             targets_map[dev] = mp
 
-        # Réinitialisation des compteurs
-        with self._scan_lock:
-            self._active_scans   = len(targets_map)
-            self._total_scanned  = 0
-            self._total_infected = 0
+        if not targets_map:
+            return
 
-        self.scan_btn.configure(state=tk.DISABLED, bg="#555")
-        self.stop_btn.configure(state=tk.NORMAL,   bg=self.ACCENT)
+        self._targets_map.update(targets_map)
+
+        with self._scan_lock:
+            self._active_scans   += len(targets_map)
+            self._total_scanned   = 0
+            self._total_infected  = 0
+
+        self.stop_btn.configure(state=tk.NORMAL, bg=self.ACCENT)
         self._anim_state = "scanning"
         self.status_var.set("Analyse en cours…")
         self.scanned_var.set("Analysés : 0")
         self.infected_var.set("")
-        self._scan_engines.clear()
 
         engines_str = " + ".join(filter(None, [
             "ClamAV" if self.use_clamav_var.get() else None,
@@ -713,10 +761,16 @@ class VirusScannerGUI:
         ]))
 
         for dev, mp in targets_map.items():
-            part = next((p for p in self._usb_partitions if p.device == dev), None)
+            part   = next((p for p in self._usb_partitions if p.device == dev), None)
             uuid_s = f"  UUID={part.uuid}" if part and part.uuid else ""
             self._log(
                 f"Démarrage : {dev}{uuid_s} → {mp}  [{engines_str}]", "info")
+
+            # Marquer visuellement la ligne en cours de scan
+            try:
+                self.usb_tree.item(dev, tags=("scanning",))
+            except Exception:
+                pass
 
             eng = ScanEngine()
             self._scan_engines[dev] = eng
@@ -758,7 +812,7 @@ class VirusScannerGUI:
                 self._total_infected += result.infected
 
         if result:
-            tag = "threat" if result.infected > 0 else "ok"
+            tag  = "threat" if result.infected > 0 else "ok"
             icon = "⚠" if result.infected > 0 else "✅"
             self._log(
                 f"{icon} {dev} : {result.scanned} fichier(s), "
@@ -768,18 +822,33 @@ class VirusScannerGUI:
         else:
             self._log(f"❌ {dev} : erreur durant le scan.", "threat")
 
+        # Restaurer le tag visuel de la ligne USB
+        try:
+            mp = self.usb.get_mountpoint(dev)
+            if mp:
+                ro = self.usb._is_ro(dev, mp)
+                self.usb_tree.item(dev, tags=("ro" if ro else "rw",))
+            else:
+                self.usb_tree.item(dev, tags=("unmount",))
+        except Exception:
+            pass
+
+        # Retirer l'engine de la map
+        self._scan_engines.pop(dev, None)
+
         self.scanned_var.set(f"Analysés : {self._total_scanned}")
         if self._total_infected > 0:
             self.infected_var.set(f"Menaces : {self._total_infected}")
 
-        # Tous les scans sont terminés ?
-        if self._active_scans == 0:
-            self._all_scans_done(result)
+        # Export PDF automatique sur le support analysé
+        self._auto_export_to_device(dev, result)
 
-    def _all_scans_done(self, last_result: Optional[ScanResult]) -> None:
-        self.scan_btn.configure(state=tk.NORMAL, bg=self.ACCENT)
+        # Si plus aucun scan actif, bilan global
+        if self._active_scans == 0:
+            self._all_scans_done()
+
+    def _all_scans_done(self) -> None:
         self.stop_btn.configure(state=tk.DISABLED, bg="#444")
-        self._scan_engines.clear()
 
         if self._total_infected > 0:
             self._anim_state = "threat"
@@ -801,7 +870,6 @@ class VirusScannerGUI:
                 parent=self.root
             )
 
-        # Retour à idle après 5 s
         self.root.after(5000, self._reset_anim_idle)
 
     def _reset_anim_idle(self) -> None:
@@ -816,6 +884,79 @@ class VirusScannerGUI:
             self.status_var.set("Arrêt en cours…")
             self.stop_btn.configure(state=tk.DISABLED)
             self._log("Arrêt demandé par l'utilisateur.", "warning")
+
+    def _auto_export_to_device(self, dev: str,
+                                result: Optional[ScanResult]) -> None:
+        """
+        Génère un PDF de rapport sur le support analysé.
+        Séquence : remontage RW → écriture PDF → remontage RO → démontage.
+        """
+        if result is None:
+            return
+
+        part  = next((p for p in self._usb_partitions if p.device == dev), None)
+        label = (part.label if part and part.label else "") or dev.replace("/dev/", "")
+        uuid  = (part.uuid  if part and part.uuid  else "") or ""
+
+        # Snapshot des options UI (thread-safe car BooleanVar)
+        engines_used = {
+            "clamav": self.use_clamav_var.get(),
+            "avast":  self.use_avast_var.get(),
+            "yara":   self.use_yara_var.get(),
+        }
+        avast_installed = self.engine.is_avast_installed()
+        avast_licensed  = self.engine.is_avast_licensed()
+
+        # Référence aux managers (thread-safe en lecture)
+        db     = self.db
+        engine = self.engine
+
+        def _worker() -> None:
+            # Collecte des infos bases dans le thread worker (évite de bloquer l'UI)
+            clamav_info = db.get_clamav_status()
+            yara_info   = db.get_yara_status()
+            avast_info  = {
+                "installed": avast_installed,
+                "licensed":  avast_licensed,
+            }
+
+            # Remontage RW
+            ok_mnt, msg_mnt, mp_rw, action = self.usb.mount_for_export(
+                dev,
+                progress_cb=lambda m: self.root.after(0, self._log, m, "info")
+            )
+            if not ok_mnt:
+                self.root.after(0, self._log,
+                                f"⚠ PDF non écrit sur {dev} : {msg_mnt}",
+                                "warning")
+                return
+            try:
+                from log_handler import write_device_scan_report_pdf
+                report_path = write_device_scan_report_pdf(
+                    mountpoint   = mp_rw,
+                    device       = dev,
+                    label        = label,
+                    uuid         = uuid,
+                    result       = result,
+                    clamav_info  = clamav_info,
+                    yara_info    = yara_info,
+                    avast_info   = avast_info,
+                    engines_used = engines_used,
+                )
+                self.root.after(0, self._log,
+                                f"📄 Rapport PDF écrit : {os.path.basename(report_path)}",
+                                "ok")
+            except Exception as exc:
+                self.root.after(0, self._log,
+                                f"⚠ Erreur PDF sur {dev} : {exc}",
+                                "warning")
+            finally:
+                # Remontage RO puis démontage propre
+                self.usb.restore_after_export(dev, action)
+                self.usb.umount(dev)
+                self.root.after(0, self._refresh_usb)
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     # ══════════════════════════════════════════════════════════════════════════
     # Administration
