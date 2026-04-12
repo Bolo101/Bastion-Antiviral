@@ -380,107 +380,265 @@ class AdminPanel:
         tab = ttk.Frame(nb, padding=10)
         nb.add(tab, text="📡 Supports")
 
-        ttk.Label(tab, text="Affichage exhaustif des supports amovibles",
-                  font=("Arial", 11, "bold")).pack(anchor=tk.W, pady=(0, 6))
+        ttk.Label(
+            tab,
+            text="Affichage exhaustif de tous les supports (blkid)",
+            font=("Arial", 11, "bold")
+        ).pack(anchor=tk.W, pady=(0, 6))
 
-        # Treeview complet
-        cols = ("device", "label", "size", "fstype", "uuid", "mountpoint", "status")
-        tree = ttk.Treeview(tab, columns=cols, show="headings",
-                             height=8, selectmode="browse")
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+
+        style.configure(
+            "Usb.Treeview",
+            background="#101533",
+            foreground="#ffffff",
+            fieldbackground="#101533",
+            rowheight=24,
+            borderwidth=1,
+            relief="solid"
+        )
+        style.configure(
+            "Usb.Treeview.Heading",
+            background="#d9d9d9",
+            foreground="#000000",
+            font=("Arial", 9, "bold"),
+            relief="raised"
+        )
+        style.map(
+            "Usb.Treeview",
+            background=[("selected", "#2e7d32")],
+            foreground=[("selected", "#ffffff")]
+        )
+
+        # ── Créer le cadre AVANT le Treeview pour qu'il soit le parent direct ──
+        tree_frame = ttk.Frame(tab)
+        tree_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
+
+        cols = ("device", "label", "size", "fstype", "uuid", "partuuid",
+                "mountpoint", "status")
+        tree = ttk.Treeview(
+            tree_frame,           # ← parent = tree_frame (correction clé)
+            columns=cols,
+            show="headings",
+            height=10,
+            selectmode="browse",
+            style="Usb.Treeview"
+        )
+
         for cid, heading, width in [
-            ("device",     "Périphérique",  105),
-            ("label",      "Étiquette",      80),
-            ("size",       "Taille",         55),
-            ("fstype",     "FS",             55),
-            ("uuid",       "UUID",          155),
-            ("mountpoint", "Point montage", 150),
-            ("status",     "État",          110),
+            ("device",     "Périphérique",  140),
+            ("label",      "Étiquette",      90),
+            ("size",       "Taille",         70),
+            ("fstype",     "FS",             70),
+            ("uuid",       "UUID",          160),
+            ("partuuid",   "PARTUUID",      160),
+            ("mountpoint", "Point montage", 130),
+            ("status",     "État",          140),
         ]:
             tree.heading(cid, text=heading)
-            tree.column(cid, width=width, minwidth=30, anchor=tk.W)
+            tree.column(cid, width=width, minwidth=40, anchor=tk.W)
 
-        tree.tag_configure("ro",      background="#e6f4ea")
-        tree.tag_configure("rw",      background="#fef3cd")
-        tree.tag_configure("unmount", background="#f0f0f0")
+        tree.tag_configure("system",  background="#fff3cd", foreground="#856404")
+        tree.tag_configure("mounted", background="#e6f4ea", foreground="#000000")
+        tree.tag_configure("unmount", background="#f0f0f0", foreground="#000000")
+        tree.tag_configure("disk",    background="#e8eaf6", foreground="#333333")
 
-        sb = ttk.Scrollbar(tab, orient=tk.VERTICAL, command=tree.yview)
+        sb = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=tree.yview)
         tree.configure(yscrollcommand=sb.set)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
 
-        tree_frame = ttk.Frame(tab)
-        tree_frame.pack(fill=tk.BOTH, expand=True)
-        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, in_=tree_frame)
-        sb.pack(side=tk.RIGHT, fill=tk.Y, in_=tree_frame)
-
-        # Détail sélectionné
         detail_var = tk.StringVar()
-        ttk.Label(tab, textvariable=detail_var,
-                  font=("Courier", 8), foreground="navy",
-                  wraplength=640, justify=tk.LEFT).pack(anchor=tk.W, pady=4)
+        ttk.Label(
+            tab,
+            textvariable=detail_var,
+            font=("Courier", 8),
+            foreground="navy",
+            wraplength=660,
+            justify=tk.LEFT
+        ).pack(anchor=tk.W, pady=4)
 
         def _on_select(_=None):
             sel = tree.selection()
             if not sel:
                 detail_var.set("")
                 return
-            vals = tree.item(sel[0], "values")
+            v = tree.item(sel[0], "values")
             detail_var.set(
-                f"Périphérique : {vals[0]}  |  "
-                f"Étiquette : {vals[1]}  |  Taille : {vals[2]}  |  "
-                f"FS : {vals[3]}\nUUID : {vals[4]}\n"
-                f"Point montage : {vals[5]}  |  État : {vals[6]}"
+                f"Périphérique : {v[0].strip()}  |  Étiquette : {v[1]}  |  "
+                f"Taille : {v[2]}  |  FS : {v[3]}\n"
+                f"UUID : {v[4]}\n"
+                f"PARTUUID : {v[5]}\n"
+                f"Point montage : {v[6]}  |  État : {v[7]}"
             )
+
         tree.bind("<<TreeviewSelect>>", _on_select)
+
+        def _blkid_info() -> dict:
+            info: dict = {}
+            try:
+                r = subprocess.run(
+                    ["blkid", "-o", "export"],
+                    capture_output=True,
+                    text=True
+                )
+                current: dict = {}
+                dev_key = ""
+                for line in r.stdout.splitlines():
+                    line = line.strip()
+                    if not line:
+                        if dev_key:
+                            info[dev_key] = current
+                        current, dev_key = {}, ""
+                        continue
+                    if "=" in line:
+                        k, v = line.split("=", 1)
+                        if k == "DEVNAME":
+                            dev_key = v
+                        else:
+                            current[k] = v
+                if dev_key:
+                    info[dev_key] = current
+            except Exception:
+                pass
+            return info
+
+        def _system_devices() -> set:
+            devs: set = set()
+            try:
+                import re
+                with open("/proc/mounts") as f:
+                    for line in f:
+                        parts = line.split()
+                        if len(parts) >= 2 and parts[1] == "/":
+                            dev = parts[0]
+                            if dev.startswith("/dev/"):
+                                devs.add(dev)
+                                parent = "/dev/" + re.sub(r"p?\d+$", "", dev[5:])
+                                if parent != dev:
+                                    devs.add(parent)
+            except Exception:
+                pass
+            return devs
 
         def _populate():
             for row in tree.get_children():
                 tree.delete(row)
-            from usb_manager import UsbManager
-            usb = self._get_usb_partitions()
-            if not usb:
-                tree.insert("", tk.END,
-                             values=("—", "—", "—", "—", "—", "—",
-                                     "Aucun support détecté"))
-                return
-            for p in usb:
-                from scanner import ScanEngine
-                eng = ScanEngine()
-                try:
-                    from usb_manager import UsbManager as _UM
-                    usb_mgr = _UM()
-                    mp  = usb_mgr.get_mountpoint(p.device) or "—"
-                    ro  = usb_mgr._is_ro(p.device, mp) if mp != "—" else None
-                    if mp != "—":
-                        status = ("✅ RO" if ro else "⚠ RW")
-                        tag    = "ro" if ro else "rw"
-                    else:
-                        status = "⏏ Non monté"
-                        tag    = "unmount"
-                except Exception:
-                    mp     = "—"
-                    status = "?"
-                    tag    = "unmount"
 
-                tree.insert("", tk.END,
-                             values=(p.device,
-                                     p.label or "—",
-                                     p.size,
-                                     p.fstype or "—",
-                                     p.uuid  or "—",
-                                     mp,
-                                     status),
-                             tags=(tag,))
+            import json as _json
+
+            blkid = _blkid_info()
+            system = _system_devices()
+
+            try:
+                r = subprocess.run(
+                    ["lsblk", "-J", "-o",
+                     "NAME,LABEL,SIZE,FSTYPE,UUID,MOUNTPOINT,TYPE"],
+                    capture_output=True,
+                    text=True
+                )
+                devices = _json.loads(r.stdout).get("blockdevices", [])
+            except Exception as exc:
+                tree.insert(
+                    "",
+                    tk.END,
+                    values=("—", "—", "—", "—", "—", "—", "—",
+                            f"Erreur lsblk : {exc}")
+                )
+                return
+
+            if not devices:
+                tree.insert(
+                    "",
+                    tk.END,
+                    values=("—", "—", "—", "—", "—", "—", "—",
+                            "Aucun support détecté")
+                )
+                return
+
+            def _add(dev_info: dict, indent: int = 0) -> None:
+                name = dev_info.get("name", "?")
+                dpath = f"/dev/{name}"
+                dtype = dev_info.get("type", "")
+
+                label = dev_info.get("label") or "—"
+                size = dev_info.get("size") or "—"
+                fstype = dev_info.get("fstype") or "—"
+                uuid = dev_info.get("uuid") or "—"
+                mountpoint = dev_info.get("mountpoint") or "—"
+                partuuid = blkid.get(dpath, {}).get("PARTUUID", "—")
+
+                is_sys = dpath in system
+                if dtype == "disk":
+                    tag = "disk"
+                    status = "💾 Disque"
+                elif mountpoint == "/":
+                    tag = "system"
+                    status = "⚙ Système [racine]"
+                elif is_sys:
+                    tag = "system"
+                    status = f"⚙ Système → {mountpoint}"
+                elif mountpoint != "—":
+                    tag = "mounted"
+                    status = f"✅ Monté → {mountpoint}"
+                else:
+                    tag = "unmount"
+                    status = "⏏ Non monté"
+
+                prefix = "  " * indent
+                tree.insert(
+                    "",
+                    tk.END,
+                    values=(prefix + dpath, label, size, fstype,
+                            uuid, partuuid, mountpoint, status),
+                    tags=(tag,)
+                )
+
+                for child in dev_info.get("children", []):
+                    _add(child, indent + 1)
+
+            for dev in devices:
+                _add(dev)
 
         btn_row = ttk.Frame(tab)
         btn_row.pack(anchor=tk.W, pady=4)
-        ttk.Button(btn_row, text="↺  Actualiser",
-                   command=lambda: (self._refresh_usb(), _populate()),
-                   width=16).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btn_row, text="▲  Monter RO",
-                   command=lambda: self._mount_selected(tree),
-                   width=16).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btn_row, text="▼  Démonter",
-                   command=lambda: self._umount_selected(tree),
-                   width=16).pack(side=tk.LEFT, padx=4)
+        ttk.Button(
+            btn_row,
+            text="↺  Actualiser",
+            command=lambda: (self._refresh_usb(), _populate()),
+            width=16
+        ).pack(side=tk.LEFT, padx=4)
+        ttk.Button(
+            btn_row,
+            text="▲  Monter RO",
+            command=lambda: self._mount_selected(tree),
+            width=16
+        ).pack(side=tk.LEFT, padx=4)
+        ttk.Button(
+            btn_row,
+            text="▼  Démonter",
+            command=lambda: self._umount_selected(tree),
+            width=16
+        ).pack(side=tk.LEFT, padx=4)
+
+        legend = ttk.Frame(tab)
+        legend.pack(anchor=tk.W, pady=(2, 0))
+        for color, text in [
+            ("#856404", "⚙ Disque système"),
+            ("#2e7d32", "✅ Monté"),
+            ("#555555", "⏏ Non monté"),
+            ("#3949ab", "💾 Disque physique"),
+        ]:
+            ttk.Label(
+                legend,
+                text=text,
+                foreground=color,
+                font=("Arial", 8)
+            ).pack(side=tk.LEFT, padx=8)
 
         _populate()
 
@@ -488,26 +646,32 @@ class AdminPanel:
         sel = tree.selection()
         if not sel:
             return
-        dev = tree.item(sel[0], "values")[0]
-        if dev == "—":
+        dev = tree.item(sel[0], "values")[0].strip()
+        if dev in ("—", "") or not dev.startswith("/dev/"):
             return
         from usb_manager import UsbManager
         usb = UsbManager()
         ok, msg = usb.mount(dev)
-        messagebox.showinfo("Montage", msg) if ok else messagebox.showerror("Montage", msg)
+        if ok:
+            messagebox.showinfo("Montage", msg)
+        else:
+            messagebox.showerror("Montage", msg)
 
     def _umount_selected(self, tree: ttk.Treeview) -> None:
         sel = tree.selection()
         if not sel:
             return
-        dev = tree.item(sel[0], "values")[0]
-        if dev == "—":
+        dev = tree.item(sel[0], "values")[0].strip()
+        if dev in ("—", "") or not dev.startswith("/dev/"):
             return
         from usb_manager import UsbManager
         usb = UsbManager()
         ok, msg = usb.umount(dev)
-        messagebox.showinfo("Démontage", msg) if ok else messagebox.showerror("Démontage", msg)
-
+        if ok:
+            messagebox.showinfo("Démontage", msg)
+        else:
+            messagebox.showerror("Démontage", msg)
+            
     # ── Onglet ClamAV ──────────────────────────────────────────────────────────
 
     def _tab_clamav(self, nb: ttk.Notebook) -> None:
