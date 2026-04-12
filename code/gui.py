@@ -150,9 +150,9 @@ class VirusScannerGUI:
         body = tk.Frame(self.root, bg=self.BG)
         body.pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
 
-        left   = tk.Frame(body, bg=self.BG, width=520)
+        left   = tk.Frame(body, bg=self.BG, width=420)
         center = tk.Frame(body, bg=self.BG)
-        right  = tk.Frame(body, bg=self.BG, width=340)
+        right  = tk.Frame(body, bg=self.BG, width=360)
         left.pack(side=tk.LEFT,  fill=tk.BOTH, expand=False, padx=(0, 4))
         left.pack_propagate(False)
         right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=False, padx=(4, 0))
@@ -170,6 +170,7 @@ class VirusScannerGUI:
         outer = tk.Frame(parent, bg=self.CARD, bd=1, relief=tk.SOLID)
         outer.pack(fill=tk.BOTH, expand=True, pady=(0, 4))
 
+        # ── Entête ────────────────────────────────────────────────────────────
         hdr = tk.Frame(outer, bg=self.CARD)
         hdr.pack(fill=tk.X, padx=8, pady=(8, 4))
         tk.Label(hdr, text="  Supports USB détectés",
@@ -179,53 +180,60 @@ class VirusScannerGUI:
                  bg=self.CARD, fg=self.FG_DIM,
                  font=("Arial", 8, "italic")).pack(side=tk.RIGHT, padx=6)
 
-        inner = tk.Frame(outer, bg=self.CARD, padx=6, pady=4)
-        inner.pack(fill=tk.BOTH, expand=True)
+        # ── Treeview + scrollbar dans un sous-cadre ───────────────────────────
+        tree_frame = tk.Frame(outer, bg=self.CARD, padx=6, pady=2)
+        tree_frame.pack(fill=tk.BOTH, expand=True)
 
-        cols = ("device", "label", "size", "status")
-        self.usb_tree = ttk.Treeview(inner, columns=cols, show="headings",
-                                      height=8, selectmode="none")
+        cols = ("label", "size", "status")
+        self.usb_tree = ttk.Treeview(tree_frame, columns=cols, show="headings",
+                                      height=7, selectmode="none")
 
         style = ttk.Style()
         style.configure("Treeview",
                         background=self.CARD, fieldbackground=self.CARD,
-                        foreground=self.FG, rowheight=32)
+                        foreground=self.FG, rowheight=34)
         style.configure("Treeview.Heading",
                         background=self.TOPBAR, foreground=self.FG,
                         font=("Arial", 9, "bold"))
         style.map("Treeview", background=[("selected", "#1a4a8a")])
 
-        for cid, heading, width in [
-            ("device", "Périphérique",  120),
-            ("label",  "Étiquette",     120),
-            ("size",   "Taille",         70),
-            ("status", "État",          180),
+        for cid, heading, width, anchor in [
+            ("label",  "Étiquette", 130, tk.W),
+            ("size",   "Taille",     65, tk.CENTER),
+            ("status", "État",      175, tk.W),
         ]:
             self.usb_tree.heading(cid, text=heading)
-            self.usb_tree.column(cid, width=width, minwidth=40, anchor=tk.W)
+            self.usb_tree.column(cid, width=width, minwidth=40, anchor=anchor)
 
         self.usb_tree.tag_configure("ro",      background="#1a3a2a", foreground="#90ee90")
         self.usb_tree.tag_configure("rw",      background="#3a2a00", foreground="#ffcc66")
         self.usb_tree.tag_configure("unmount", background=self.CARD,  foreground=self.FG_DIM)
         self.usb_tree.tag_configure("scanning",background="#1a1a4a", foreground="#88aaff")
 
-        usb_sb = ttk.Scrollbar(inner, orient=tk.VERTICAL, command=self.usb_tree.yview)
+        usb_sb = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL,
+                                command=self.usb_tree.yview)
         self.usb_tree.configure(yscrollcommand=usb_sb.set)
         self.usb_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        usb_sb.pack(side=tk.LEFT, fill=tk.Y)
+        usb_sb.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # Boutons actions — grands pour écran tactile
-        btn_col = tk.Frame(inner, bg=self.CARD)
-        btn_col.pack(side=tk.LEFT, padx=(8, 0), anchor=tk.N)
-        for txt, cmd in [
-            ("↺  Actualiser", self._refresh_usb),
-            ("▲  Monter",     self._mount_usb),
-            ("▼  Démonter",   self._umount_usb),
-        ]:
-            tk.Button(btn_col, text=txt, command=cmd, width=12,
-                      bg=self.TOPBAR, fg=self.FG, relief=tk.FLAT,
-                      font=("Arial", 10), pady=10).pack(fill=tk.X, pady=3)
+        # ── Boutons en ligne sous le tableau ──────────────────────────────────
+        btn_row = tk.Frame(outer, bg=self.CARD, padx=6, pady=4)
+        btn_row.pack(fill=tk.X)
+        btn_row.columnconfigure(0, weight=1)
+        btn_row.columnconfigure(1, weight=1)
+        btn_row.columnconfigure(2, weight=1)
+        for col, (txt, cmd, color) in enumerate([
+            ("↺  Actualiser", self._refresh_usb,  self.TOPBAR),
+            ("▲  Monter",     self._mount_usb,    "#1a4a1a"),
+            ("▼  Démonter",   self._umount_usb,   "#3a1a00"),
+        ]):
+            tk.Button(btn_row, text=txt, command=cmd,
+                      bg=color, fg=self.FG, relief=tk.FLAT,
+                      font=("Arial", 9, "bold"), pady=8,
+                      cursor="hand2").grid(row=0, column=col,
+                                           sticky=tk.EW, padx=2)
 
+        # ── Info périphérique sélectionné ─────────────────────────────────────
         self.usb_info_var = tk.StringVar(value="")
         tk.Label(outer, textvariable=self.usb_info_var,
                  bg=self.CARD, fg=self.FG_DIM,
@@ -264,39 +272,47 @@ class VirusScannerGUI:
     # ── Panneau animation ─────────────────────────────────────────────────────
 
     def _build_animation_panel(self, parent: tk.Frame) -> None:
-        outer = tk.Frame(parent, bg=self.CARD, bd=1, relief=tk.SOLID)
-        outer.pack(fill=tk.X)
+        # ── Zone logo ──────────────────────────────────────────────────────────
+        logo_frame = tk.Frame(parent, bg=self.CARD, bd=1, relief=tk.SOLID,
+                              height=88)
+        logo_frame.pack(fill=tk.X, pady=(0, 4))
+        logo_frame.pack_propagate(False)
+
+        logo_path = os.path.normpath(
+            os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "..", "img", "logo.png"))
+        self._logo_img: Optional[tk.PhotoImage] = None
+        try:
+            img = tk.PhotoImage(file=logo_path)
+            # Sous-échantillonnage si trop grand (PhotoImage natif)
+            iw, ih = img.width(), img.height()
+            max_h = 76
+            if ih > max_h:
+                factor = max(1, ih // max_h)
+                img = img.subsample(factor, factor)
+            self._logo_img = img
+            tk.Label(logo_frame, image=self._logo_img,
+                     bg=self.CARD, cursor="arrow").pack(expand=True)
+        except Exception:
+            # Fallback texte si l'image est introuvable
+            tk.Label(logo_frame,
+                     text="🛡  USB Antivirus Scanner",
+                     bg=self.CARD, fg="#3a6498",
+                     font=("Arial", 18, "bold italic")).pack(expand=True)
+
+        # ── Canvas d'animation (remplit tout l'espace restant) ─────────────────
+        anim_outer = tk.Frame(parent, bg=self.CARD, bd=1, relief=tk.SOLID)
+        anim_outer.pack(fill=tk.BOTH, expand=True)
 
         self._anim_canvas = tk.Canvas(
-            outer, height=220,
-            bg=self.CARD, highlightthickness=0
+            anim_outer, bg=self.CARD, highlightthickness=0
         )
-        self._anim_canvas.pack(fill=tk.X, expand=True)
+        self._anim_canvas.pack(fill=tk.BOTH, expand=True)
 
+        # Vars conservées pour compatibilité avec le reste du code
         self.status_var   = tk.StringVar(value="Prêt — insérez une clé USB")
         self.scanned_var  = tk.StringVar(value="")
         self.infected_var = tk.StringVar(value="")
-
-        info_row = tk.Frame(outer, bg=self.CARD)
-        info_row.pack(fill=tk.X, padx=10, pady=(0, 8))
-        tk.Label(info_row, textvariable=self.status_var,
-                 bg=self.CARD, fg=self.FG,
-                 font=("Arial", 10, "bold")).pack(side=tk.LEFT)
-        tk.Label(info_row, textvariable=self.scanned_var,
-                 bg=self.CARD, fg=self.GREEN,
-                 font=("Courier", 9)).pack(side=tk.LEFT, padx=10)
-        tk.Label(info_row, textvariable=self.infected_var,
-                 bg=self.CARD, fg=self.RED,
-                 font=("Courier", 9, "bold")).pack(side=tk.LEFT)
-
-        # ── Zone logo ──────────────────────────────────────────────────────
-        logo_frame = tk.Frame(parent, bg=self.CARD, bd=1, relief=tk.SOLID)
-        logo_frame.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
-
-        tk.Label(logo_frame,
-                 text="[ Logo ]",
-                 bg=self.CARD, fg=self.FG_DIM,
-                 font=("Arial", 18, "italic")).pack(expand=True)
 
     # ── Journal ───────────────────────────────────────────────────────────────
 
@@ -335,117 +351,307 @@ class VirusScannerGUI:
 
     def _animate(self) -> None:
         c  = self._anim_canvas
-        cw = c.winfo_width()  or 400
-        ch = c.winfo_height() or 220
-        cx = cw // 2   # centre X dynamique
-        cy = ch // 2 - 10  # centre Y légèrement au-dessus du milieu
-
+        cw = c.winfo_width()  or 500
+        ch = c.winfo_height() or 340
+        cx, cy = cw // 2, ch // 2
         c.delete("all")
 
         st = self._anim_state
+        ph = self._anim_phase
 
-        # ── couleur selon l'état ───────────────────────────────────────────────
+        # ── Avancer la phase ──────────────────────────────────────────────────
+        speed = {"scanning": 3.5, "ok": 1.2, "threat": 2.0, "idle": 0.7}
+        self._anim_phase = (ph + speed.get(st, 0.7)) % 360
+
+        # ── Rayon du bouclier (adapté à la taille du canvas) ──────────────────
+        sr = max(44, min(int(min(cw, ch) * 0.22), 88))
+
+        # ══ 1. FOND — grille de points hexagonaux ════════════════════════════
+        spacing = 30
+        for row_i, gy in enumerate(range(0, ch + spacing, spacing)):
+            for gx in range(-(spacing if row_i % 2 else 0),
+                             cw + spacing, spacing):
+                dx, dy = gx - cx, gy - cy
+                dist = math.sqrt(dx*dx + dy*dy)
+                if dist < sr * 1.1:
+                    continue
+                brightness = max(0, 1.0 - dist / (max(cw, ch) * 0.65))
+                if brightness > 0.06:
+                    c.create_oval(gx-1, gy-1, gx+1, gy+1,
+                                   fill="#1e2a4a", outline="")
+
+        # ══ 2. EFFETS SPÉCIFIQUES À L'ÉTAT ═══════════════════════════════════
+
         if st == "scanning":
-            shield_color = "#2255cc"
-            glow_color   = "#4488ff"
-            self._anim_phase = (self._anim_phase + 3.0) % 360
+            # ── Anneaux radars concentriques ──────────────────────────────────
+            for i in range(6):
+                ring_ph = (ph + i * 60) % 360
+                fade    = abs(math.sin(math.radians(ring_ph)))
+                r_ring  = sr * (1.6 + i * 0.55) + fade * 5
+                if r_ring > max(cw, ch):
+                    break
+                stip = ("gray75", "gray50", "gray50", "gray25",
+                         "gray25", "gray12")[i]
+                c.create_oval(cx - r_ring, cy - r_ring,
+                               cx + r_ring, cy + r_ring,
+                               outline="#2244aa", width=1, stipple=stip)
+
+            # ── Balayage radar ────────────────────────────────────────────────
+            sweep_deg  = (ph * 2.2) % 360
+            sweep_rad  = math.radians(sweep_deg)
+            radar_r    = sr * 3.0
+            # Traînée en arc (dégradé simulé par plusieurs arcs)
+            for arc_i, (ext, w, stip) in enumerate(
+                    [(90, 6, "gray50"), (60, 4, "gray25"), (30, 2, "gray12")]):
+                c.create_arc(cx - radar_r, cy - radar_r,
+                              cx + radar_r, cy + radar_r,
+                              start=sweep_deg, extent=ext,
+                              outline="#4488ff", width=w,
+                              style=tk.ARC, stipple=stip)
+            # Ligne de balayage
+            c.create_line(cx, cy,
+                           cx + math.cos(sweep_rad) * radar_r,
+                           cy - math.sin(sweep_rad) * radar_r,
+                           fill="#88bbff", width=2)
+
+            # ── Particules / points scannés ───────────────────────────────────
+            for i in range(12):
+                angle    = math.radians((ph * 2.8 + i * 30) % 360)
+                progress = ((ph / 360.0) * 0.7 + i / 12.0) % 1.0
+                r_p      = sr * 1.3 + progress * sr * 2.8
+                px_p     = cx + math.cos(angle) * r_p
+                py_p     = cy - math.sin(angle) * r_p
+                size_p   = max(1.5, 3.5 * (1 - progress))
+                if 0 < px_p < cw and 0 < py_p < ch:
+                    alpha_color = "#4488ff" if progress < 0.5 else "#224466"
+                    c.create_oval(px_p - size_p, py_p - size_p,
+                                   px_p + size_p, py_p + size_p,
+                                   fill=alpha_color, outline="")
+
+            # ── Compteurs en temps réel (affichage proéminent) ────────────────
+            ns = self._total_scanned
+            ni = self._total_infected
+            na = self._active_scans
+
+            # Position : deux colonnes au-dessus du bouclier
+            stat_y  = cy - sr - 52
+            left_x  = cx - sr * 1.1
+            right_x = cx + sr * 1.1
+
+            # Fond semi-transparent (rectangles)
+            pad = 8
+            for bx, val_text, lbl_text, col in [
+                (left_x,  str(ns), "fichiers analysés", "#88ccff"),
+                (right_x, str(ni),
+                 "menace(s)",
+                 self.RED if ni > 0 else self.GREEN),
+            ]:
+                tw = max(60, len(str(max(ns, ni))) * 14 + 30)
+                c.create_rectangle(bx - tw//2 - pad, stat_y - 4,
+                                    bx + tw//2 + pad, stat_y + 36,
+                                    fill="#0d1528", outline="#223355",
+                                    width=1)
+                c.create_text(bx, stat_y + 2,
+                              text=val_text, fill=col,
+                              font=("Courier", 20, "bold"), anchor=tk.N)
+                c.create_text(bx, stat_y + 30,
+                              text=lbl_text, fill=self.FG_DIM,
+                              font=("Arial", 8), anchor=tk.N)
+
+            if na > 1:
+                c.create_text(cx, stat_y + 52,
+                              text=f"⚡ {na} scans en parallèle",
+                              fill="#5577aa", font=("Arial", 9, "bold"),
+                              anchor=tk.CENTER)
+
         elif st == "ok":
-            shield_color = "#1a6b2e"
-            glow_color   = self.GREEN
-        elif st == "threat":
-            shield_color = "#8b0000"
-            glow_color   = self.RED
-        else:
-            shield_color = "#1a3460"
-            glow_color   = "#3a6498"
+            # ── Éclat de lumière verte ────────────────────────────────────────
+            pulse = abs(math.sin(math.radians(ph * 2.5)))
+            for i in range(4):
+                r_g = sr * (1.35 + i * 0.35 + pulse * 0.12)
+                stip = ("gray75", "gray50", "gray25", "gray12")[i]
+                c.create_oval(cx - r_g, cy - r_g, cx + r_g, cy + r_g,
+                               fill="", outline=self.GREEN,
+                               width=2, stipple=stip)
+            # Étincelles
+            for i in range(10):
+                angle = math.radians(ph * 2.5 + i * 36)
+                r_sp  = sr * (1.55 + pulse * 0.45)
+                sx    = cx + math.cos(angle) * r_sp
+                sy    = cy - math.sin(angle) * r_sp
+                if 0 < sx < cw and 0 < sy < ch:
+                    c.create_oval(sx-2, sy-2, sx+2, sy+2,
+                                   fill=self.GREEN, outline="")
+            # Résultats finaux
+            res_y = cy - sr - 44
+            c.create_rectangle(cx - 110, res_y - 6, cx + 110, res_y + 32,
+                                fill="#071a0f", outline="#1a5e2a", width=1)
+            c.create_text(cx, res_y + 2,
+                          text=f"✓  {self._total_scanned} fichier(s) analysé(s) — propre",
+                          fill=self.GREEN,
+                          font=("Arial", 11, "bold"), anchor=tk.N)
 
-        # ── anneaux pulsants (scan uniquement) ─────────────────────────────────
-        if st == "scanning":
+        elif st == "threat":
+            # ── Pulsations rouges ─────────────────────────────────────────────
+            pulse = abs(math.sin(math.radians(ph * 3.5)))
+            for i in range(4):
+                r_t = sr * (1.3 + i * 0.4 + pulse * 0.2)
+                stip = ("gray75", "gray50", "gray25", "gray12")[i]
+                c.create_oval(cx - r_t, cy - r_t, cx + r_t, cy + r_t,
+                               fill="", outline=self.RED,
+                               width=2, stipple=stip)
+            # Triangles d'alerte aux coins
+            for i in range(4):
+                angle = math.radians(ph * 1.8 + i * 90 + 45)
+                r_tri = sr * 2.2
+                tx    = cx + math.cos(angle) * r_tri
+                ty    = cy - math.sin(angle) * r_tri
+                sz    = 10
+                tri_pts = [tx,       ty - sz,
+                            tx - sz * 0.87, ty + sz * 0.5,
+                            tx + sz * 0.87, ty + sz * 0.5]
+                c.create_polygon(tri_pts, fill=self.RED,
+                                  outline="", stipple="gray75")
+            # Résultats
+            res_y = cy - sr - 44
+            c.create_rectangle(cx - 130, res_y - 6, cx + 130, res_y + 32,
+                                fill="#1a0000", outline="#5e1a1a", width=1)
+            c.create_text(cx, res_y + 2,
+                          text=f"⚠  {self._total_infected} menace(s) / "
+                               f"{self._total_scanned} fichier(s)",
+                          fill=self.RED,
+                          font=("Arial", 11, "bold"), anchor=tk.N)
+
+        else:  # idle
+            # ── Halo pulsant ──────────────────────────────────────────────────
+            pulse = abs(math.sin(math.radians(ph * 1.8)))
             for i in range(3):
-                phase = (self._anim_phase + i * 120) % 360
-                alpha = abs(math.sin(math.radians(phase)))
-                r = 38 + i * 14 + alpha * 6
-                stipple = ("gray75", "gray50", "gray25")[i]
-                c.create_oval(cx - r, cy - r, cx + r, cy + r,
-                               outline=glow_color, width=2 - i * 0.4,
-                               stipple=stipple)
+                r_h = sr * (1.25 + i * 0.45 + pulse * 0.12)
+                stip = ("gray50", "gray25", "gray12")[i]
+                c.create_oval(cx - r_h, cy - r_h, cx + r_h, cy + r_h,
+                               fill="", outline="#2a4a78",
+                               width=1, stipple=stip)
+            # Trois petits USB en orbite
+            for i in range(3):
+                orbit_angle = math.radians(ph * 1.4 + i * 120)
+                orbit_r     = sr * 1.75
+                ox = cx + math.cos(orbit_angle) * orbit_r
+                oy = cy - math.sin(orbit_angle) * orbit_r
+                # Corps USB
+                c.create_rectangle(ox-6, oy-4, ox+6, oy+4,
+                                    fill="#2a4a78", outline="#4a7ab8", width=1)
+                c.create_rectangle(ox-3, oy+4, ox+3, oy+8,
+                                    fill="#2a4a78", outline="#4a7ab8", width=1)
+                # Connecteur
+                c.create_rectangle(ox-2, oy-8, ox+2, oy-4,
+                                    fill="#4a7ab8", outline="#88aacc", width=1)
 
-        # ── bouclier (forme hexagonale stylisée) ───────────────────────────────
-        sh = 34   # demi-hauteur
-        sw = 26   # demi-largeur
-        pts = [cx,      cy - sh,
-               cx + sw, cy - sh//2,
-               cx + sw, cy + sh//3,
-               cx,      cy + sh,
-               cx - sw, cy + sh//3,
-               cx - sw, cy - sh//2]
-
-        # Ombre portée
-        c.create_polygon([p + 3 if i % 2 == 0 else p + 3
-                           for i, p in enumerate(pts)],
-                          fill="#000000", outline="", stipple="gray25")
-        # Corps du bouclier
-        c.create_polygon(pts, fill=shield_color, outline=glow_color, width=2)
-
-        # ── icône centrale ────────────────────────────────────────────────────
-        if st == "ok":
-            # Coche verte
-            c.create_line(cx - 10, cy, cx - 2, cy + 10,
-                           cx + 12, cy - 12,
-                           fill=self.GREEN, width=3, joinstyle=tk.ROUND)
+        # ══ 3. BOUCLIER CENTRAL ══════════════════════════════════════════════
+        if st == "scanning":
+            sf, so, gc = "#0f1e55", "#4488ff", "#4488ff"
+        elif st == "ok":
+            sf, so, gc = "#062210", self.GREEN, self.GREEN
         elif st == "threat":
-            # X rouge
-            c.create_line(cx - 9, cy - 9, cx + 9, cy + 9,
-                           fill=self.RED, width=3, capstyle=tk.ROUND)
-            c.create_line(cx + 9, cy - 9, cx - 9, cy + 9,
-                           fill=self.RED, width=3, capstyle=tk.ROUND)
+            sf, so, gc = "#3a0000", self.RED, self.RED
+        else:
+            sf, so, gc = "#0f2244", "#3a6498", "#3a6498"
+
+        # Forme bouclier
+        pts = [
+            cx,      cy - sr,
+            cx + int(sr * 0.76), cy - int(sr * 0.50),
+            cx + int(sr * 0.76), cy + int(sr * 0.30),
+            cx,      cy + sr,
+            cx - int(sr * 0.76), cy + int(sr * 0.30),
+            cx - int(sr * 0.76), cy - int(sr * 0.50),
+        ]
+        # Ombre
+        c.create_polygon([p + 5 for p in pts],
+                          fill="#000000", outline="", stipple="gray25")
+        # Corps
+        c.create_polygon(pts, fill=sf, outline=so, width=2)
+        # Reflet haut-gauche
+        hl = [
+            cx - int(sr * 0.30), cy - int(sr * 0.72),
+            cx + int(sr * 0.10), cy - int(sr * 0.72),
+            cx - int(sr * 0.08), cy - int(sr * 0.20),
+            cx - int(sr * 0.40), cy - int(sr * 0.32),
+        ]
+        c.create_polygon(hl, fill="white", outline="", stipple="gray25")
+        # Bord interne
+        inset = 5
+        inner_pts = [
+            cx,           cy - sr + inset,
+            cx + int((sr - inset) * 0.74), cy - int((sr - inset) * 0.50),
+            cx + int((sr - inset) * 0.74), cy + int((sr - inset) * 0.28),
+            cx,           cy + sr - inset,
+            cx - int((sr - inset) * 0.74), cy + int((sr - inset) * 0.28),
+            cx - int((sr - inset) * 0.74), cy - int((sr - inset) * 0.50),
+        ]
+        c.create_polygon(inner_pts, fill="", outline=gc, width=1,
+                          stipple="gray50")
+
+        # ── Icône dans le bouclier ────────────────────────────────────────────
+        ic = int(sr * 0.38)
+        lw = max(2, sr // 18)
+        if st == "ok":
+            c.create_line(cx - ic, cy + ic//5,
+                           cx - ic//4, cy + ic,
+                           cx + ic,    cy - ic,
+                           fill=self.GREEN, width=lw + 1,
+                           joinstyle=tk.ROUND, capstyle=tk.ROUND)
+        elif st == "threat":
+            c.create_line(cx - ic * 0.75, cy - ic * 0.75,
+                           cx + ic * 0.75, cy + ic * 0.75,
+                           fill=self.RED, width=lw + 1, capstyle=tk.ROUND)
+            c.create_line(cx + ic * 0.75, cy - ic * 0.75,
+                           cx - ic * 0.75, cy + ic * 0.75,
+                           fill=self.RED, width=lw + 1, capstyle=tk.ROUND)
         elif st == "scanning":
-            # Arc tournant
-            a0 = self._anim_phase
-            c.create_arc(cx - 14, cy - 14, cx + 14, cy + 14,
-                          start=a0, extent=220,
-                          outline="#aaccff", width=3, style=tk.ARC)
+            # Arc tournant double
+            a0 = (ph * 2.2) % 360
+            c.create_arc(cx - ic, cy - ic, cx + ic, cy + ic,
+                          start=a0, extent=250,
+                          outline="#88bbff", width=lw + 1, style=tk.ARC)
+            c.create_arc(cx - ic//2, cy - ic//2, cx + ic//2, cy + ic//2,
+                          start=a0 + 180, extent=200,
+                          outline="#4466aa", width=lw, style=tk.ARC)
         else:
             # Clé USB stylisée
-            c.create_rectangle(cx - 9, cy - 5, cx + 9, cy + 8,
-                                fill="#3a6498", outline=glow_color, width=1)
-            c.create_rectangle(cx - 5, cy + 8, cx + 5, cy + 14,
-                                fill="#3a6498", outline=glow_color, width=1)
-            c.create_rectangle(cx - 3, cy - 10, cx + 3, cy - 5,
-                                fill="#3a6498", outline=glow_color, width=1)
+            c.create_rectangle(cx - ic//2, cy - ic//5,
+                                cx + ic//2, cy + ic//2,
+                                fill=sf, outline=gc, width=1)
+            c.create_rectangle(cx - ic//4, cy + ic//2,
+                                cx + ic//4, cy + int(ic * 0.85),
+                                fill=sf, outline=gc, width=1)
+            c.create_rectangle(cx - ic//6, cy - int(ic * 0.65),
+                                cx + ic//6, cy - ic//5,
+                                fill=gc, outline=gc, width=1)
 
-        # ── texte d'état sous le bouclier (centré) ────────────────────────────
+        # ══ 4. TEXTE D'ÉTAT sous le bouclier ═════════════════════════════════
+        text_y = cy + sr + 18
         if st == "scanning":
-            dots = "." * (int(self._anim_phase / 60) % 4)
+            dots  = "." * (int(ph / 90) % 4)
             label = f"Analyse en cours{dots}"
         elif st == "ok":
             label = "✓  Aucune menace détectée"
         elif st == "threat":
-            label = "⚠  Menace(s) détectée(s) !"
+            label = f"⚠  {self._total_infected} menace(s) !"
         else:
-            label = "Prêt"
+            label = "Prêt — insérez une clé USB"
 
-        c.create_text(cx, cy + 88,
-                      text=label,
-                      fill=glow_color,
-                      font=("Arial", 11, "bold"),
-                      anchor=tk.CENTER)
+        c.create_text(cx, text_y,
+                      text=label, fill=gc,
+                      font=("Arial", 11, "bold"), anchor=tk.CENTER)
 
-        # ── compteurs (centrés) ────────────────────────────────────────────────
-        if self._active_scans > 0:
-            c.create_text(cx, cy + 112,
-                          text=f"Analysés : {self._total_scanned}   "
-                               f"Menaces : {self._total_infected}",
-                          fill=self.FG_DIM,
-                          font=("Courier", 8),
-                          anchor=tk.CENTER)
-            c.create_text(cx, cy + 128,
-                          text=f"{self._active_scans} scan(s) actif(s)",
-                          fill="#5577aa",
-                          font=("Courier", 8),
+        # Sous-texte résultats (hors scan)
+        if st not in ("scanning", "idle") and self._total_scanned > 0:
+            c.create_text(cx, text_y + 20,
+                          text=f"{self._total_scanned} fichier(s) analysé(s)",
+                          fill=self.FG_DIM, font=("Courier", 8),
                           anchor=tk.CENTER)
 
-        interval = 40 if st == "scanning" else 200
+        interval = 33 if st == "scanning" else 100
         self._anim_after_id = self.root.after(interval, self._animate)
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -580,9 +786,8 @@ class VirusScannerGUI:
         for row in self.usb_tree.get_children():
             self.usb_tree.delete(row)
 
+        # Charger toutes les partitions puis exclure le disque système
         self._usb_partitions = self.usb.list_partitions()
-
-        # Exclure les partitions du disque système
         system_devs = self._get_system_devices()
         self._usb_partitions = [
             p for p in self._usb_partitions
@@ -590,11 +795,9 @@ class VirusScannerGUI:
             and os.path.basename(p.parent) not in system_devs
         ]
 
-        self._usb_partitions = self.usb.list_partitions()
-
         if not self._usb_partitions:
             self.usb_tree.insert("", tk.END,
-                                  values=("—", "—", "—",
+                                  values=("—", "—",
                                           "Aucune clé USB détectée"))
             return
 
@@ -603,7 +806,7 @@ class VirusScannerGUI:
         for p in self._usb_partitions:
             mp = self.usb.get_mountpoint(p.device)
             if p.device in scanning_devs:
-                status = f"🔍 Analyse en cours…"
+                status = "🔍 Analyse en cours…"
                 tag    = "scanning"
             elif mp:
                 ro     = self.usb._is_ro(p.device, mp)
@@ -613,9 +816,9 @@ class VirusScannerGUI:
                 status = "⏏  Non monté"
                 tag    = "unmount"
 
+            # L'iid reste p.device (usage interne) ; la colonne device n'est plus affichée
             self.usb_tree.insert("", tk.END, iid=p.device,
-                                  values=(p.device,
-                                          p.label or "—",
+                                  values=(p.label or "—",
                                           p.size,
                                           status),
                                   tags=(tag,))
@@ -636,8 +839,8 @@ class VirusScannerGUI:
         iid = self.usb_tree.identify_row(event.y)
         if not iid:
             return "break"
-        vals = self.usb_tree.item(iid, "values")
-        if not vals or vals[0] == "—":
+        # Seules les vraies lignes périphérique ont un iid commençant par /dev/
+        if not iid.startswith("/dev/"):
             return "break"
         # Toggle : sélectionné → désélectionner, sinon → ajouter à la sélection
         current = set(self.usb_tree.selection())
@@ -668,12 +871,9 @@ class VirusScannerGUI:
             self.usb_info_var.set(f"{len(devs)} périphérique(s) sélectionné(s)")
 
     def _selected_usb_list(self) -> List[str]:
-        devs = []
-        for iid in self.usb_tree.selection():
-            vals = self.usb_tree.item(iid, "values")
-            if vals and vals[0] != "—":
-                devs.append(vals[0])
-        return devs
+        """Retourne la liste des chemins /dev/… sélectionnés (iid = p.device)."""
+        return [iid for iid in self.usb_tree.selection()
+                if iid.startswith("/dev/")]
 
     def _mount_usb(self) -> None:
         devs = self._selected_usb_list()
