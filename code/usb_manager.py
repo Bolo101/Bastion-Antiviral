@@ -215,8 +215,25 @@ class UsbManager:
                 uuid = self.get_uuid(device)
                 log_info(f"USB remonté RW (export) : {device}  UUID={uuid or '?'}  → {current_mp}")
                 return True, f"{device} remonté RW pour export.", current_mp, "remounted_rw"
-            log_error(f"Remontage RW échoué pour {device} : {err.strip()}")
-            return False, f"Impossible de remonter en RW : {err.strip()}", None, "error"
+
+            # Fallback : certains FS (FAT32, exFAT) refusent remount,rw.
+            # On démonte proprement puis on remonte en RW sur le même point.
+            log_warning(f"remount,rw échoué pour {device} ({err.strip()}) — tentative umount+mount RW")
+            if progress_cb:
+                progress_cb(f"Fallback : démontage puis remontage RW de {device}…")
+            _run(["umount", current_mp], timeout=20)
+            self._managed.pop(device, None)
+
+            fstype = self._detect_fstype(device)
+            extra  = ["-t", fstype] if fstype in ("vfat", "exfat", "ntfs", "ntfs3") else []
+            rc2, _, err2 = _run(["mount", "-o", "rw"] + extra + [device, current_mp], timeout=30)
+            if rc2 == 0:
+                uuid = self.get_uuid(device)
+                log_info(f"USB remonté RW (fallback export) : {device}  UUID={uuid or '?'}  → {current_mp}")
+                return True, f"{device} remonté RW (fallback) pour export.", current_mp, "remounted_rw"
+
+            log_error(f"Remontage RW fallback échoué pour {device} : {err2.strip()}")
+            return False, f"Impossible de remonter en RW : {err2.strip()}", None, "error"
 
         # ── Cas 3 : non monté → montage RW ───────────────────────────────────
         dev_name = device.replace("/dev/", "").replace("/", "_")
@@ -246,6 +263,16 @@ class UsbManager:
         err_clean = err.strip() or out.strip()
         log_error(f"Montage RW échoué {device} : {err_clean}")
         return False, f"Échec du montage RW : {err_clean}", None, "error"
+
+    def mount_rw(self, device: str,
+                 progress_cb: ProgressCB = None) -> Tuple[bool, str, Optional[str], str]:
+        """
+        Monte le périphérique en lecture/écriture pour un scan avec suppression.
+
+        Identique à mount_for_export mais utilisé avant le scan (pas l'export).
+        Retourne (ok, message, mountpoint, action) — mêmes valeurs qu'mount_for_export.
+        """
+        return self.mount_for_export(device, progress_cb=progress_cb)
 
     def restore_after_export(self, device: str, action: str) -> None:
         """

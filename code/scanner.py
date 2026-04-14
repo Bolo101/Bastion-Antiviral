@@ -205,23 +205,27 @@ class ScanEngine:
              use_avast:        bool,
              use_yara:         bool,
              remove_infected:  bool,
-             progress_cb:      ProgressCB) -> ScanResult:
+             progress_cb:      ProgressCB,
+             file_count_cb:    Optional[Callable[[int, int], None]] = None) -> ScanResult:
         """
         Lance le scan complet et retourne le résultat agrégé.
         Ordre : ClamAV → Avast → YARA.
+
+        file_count_cb(scanned, infected) est appelé après chaque fichier traité
+        pour permettre une mise à jour temps réel du compteur dans l'UI.
         """
         self._reset()
         result = ScanResult()
         start  = time.time()
 
         if use_clamav:
-            self._scan_clamav(targets, remove_infected, result, progress_cb)
+            self._scan_clamav(targets, remove_infected, result, progress_cb, file_count_cb)
 
         if use_avast and not result.stopped:
-            self._scan_avast(targets, remove_infected, result, progress_cb)
+            self._scan_avast(targets, remove_infected, result, progress_cb, file_count_cb)
 
         if use_yara and not result.stopped:
-            self._scan_yara(targets, result, progress_cb)
+            self._scan_yara(targets, result, progress_cb, file_count_cb)
 
         result.duration = time.time() - start
         log_info(
@@ -310,7 +314,8 @@ class ScanEngine:
         return total
 
     def _scan_clamav(self, targets: List[str], remove: bool,
-                     result: ScanResult, cb: ProgressCB) -> None:
+                     result: ScanResult, cb: ProgressCB,
+                     fcc: Optional[Callable[[int, int], None]] = None) -> None:
 
         # ── 1. Pré-validation : base chargeable ? ─────────────────────────────
         if not self._check_clamav_db(cb):
@@ -339,6 +344,8 @@ class ScanEngine:
             "clamscan",
             "--recursive",
             "--stdout",
+            "--verbose",                     # émet "/path: OK" pour chaque fichier sain
+                                             # → permet le comptage en temps réel
             f"--database={CLAMAV_DB_DIR}",  # charge TOUTES les sigs du répertoire,
                                              # officielles ET tierces (.ndb/.hdb/.ldb…)
             "--max-filesize=0",
@@ -366,7 +373,7 @@ class ScanEngine:
                 if self._stop:
                     result.stopped = True
                     break
-                self._parse_clamav(line.rstrip(), result, cb)
+                self._parse_clamav(line.rstrip(), result, cb, fcc)
             self._proc.wait()
             rc = self._proc.returncode
         except Exception as e:
@@ -399,7 +406,8 @@ class ScanEngine:
                     cb(f"[ClamAV] {estimated} fichier(s) parcourus (comptage direct).",
                        "info")
 
-    def _parse_clamav(self, line: str, result: ScanResult, cb: ProgressCB) -> None:
+    def _parse_clamav(self, line: str, result: ScanResult, cb: ProgressCB,
+                      fcc: Optional[Callable[[int, int], None]] = None) -> None:
         if not line:
             return
 
@@ -416,6 +424,8 @@ class ScanEngine:
             result.threats.append(ThreatInfo(path=path, threat=threat, engine="ClamAV"))
             if cb:
                 cb(f"🚨 ClamAV : {threat}  →  {path}", "threat")
+            if fcc:
+                fcc(result.scanned, result.infected)
             return
 
         # ── Résumé final : "Scanned files: N" ────────────────────────────────
@@ -426,14 +436,21 @@ class ScanEngine:
                 if n > 0:
                     result.scanned_clamav = max(result.scanned_clamav, n)
                     result.scanned        = max(result.scanned, n)
+                    if fcc:
+                        fcc(result.scanned, result.infected)
             except (ValueError, IndexError):
                 pass
             return
 
-        # ── Fichier sain (émis seulement avec --verbose) ──────────────────────
+        # ── Fichier sain (activé par --verbose) ───────────────────────────────
+        # Avec --verbose, ClamAV émet "/chemin/fichier: OK" pour chaque fichier propre.
+        # On compte sans loguer (évite de saturer le journal).
         if line.endswith(": OK") or line.endswith(": Empty file"):
             result.scanned_clamav += 1
             result.scanned        += 1
+            # Mise à jour UI toutes les 20 lignes pour limiter les appels callback
+            if fcc and result.scanned_clamav % 20 == 0:
+                fcc(result.scanned, result.infected)
             return
 
         # ── Erreurs de chargement DB (à logger sans bloquer) ─────────────────
@@ -455,7 +472,8 @@ class ScanEngine:
     # ══════════════════════════════════════════════════════════════════════════
 
     def _scan_avast(self, targets: List[str], remove: bool,
-                    result: ScanResult, cb: ProgressCB) -> None:
+                    result: ScanResult, cb: ProgressCB,
+                    fcc: Optional[Callable[[int, int], None]] = None) -> None:
         """
         Lance le scan Avast Business via la commande `scan` (CLI Avast Linux).
 
@@ -520,7 +538,7 @@ class ScanEngine:
                 if self._stop:
                     result.stopped = True
                     break
-                self._parse_avast(line.rstrip(), result, cb)
+                self._parse_avast(line.rstrip(), result, cb, fcc)
             self._proc.wait()
             rc = self._proc.returncode
 
@@ -543,7 +561,8 @@ class ScanEngine:
         finally:
             self._proc = None
 
-    def _parse_avast(self, line: str, result: ScanResult, cb: ProgressCB) -> None:
+    def _parse_avast(self, line: str, result: ScanResult, cb: ProgressCB,
+                     fcc: Optional[Callable[[int, int], None]] = None) -> None:
         """
         Parse une ligne de sortie du CLI Avast for Linux.
 
@@ -573,11 +592,15 @@ class ScanEngine:
                     )
                     if cb:
                         cb(f"🚨 Avast : {threat}  →  {path}", "threat")
+                    if fcc:
+                        fcc(result.scanned, result.infected)
                     return
             # Sain
             if len(parts) >= 2 and parts[1].strip() in ("[+]", "OK", ""):
                 result.scanned_avast += 1
                 result.scanned       += 1
+                if fcc:
+                    fcc(result.scanned, result.infected)
             return
 
         # Format "[+]" sans tabulation
@@ -585,6 +608,8 @@ class ScanEngine:
         if stripped.endswith("[+]"):
             result.scanned_avast += 1
             result.scanned       += 1
+            if fcc:
+                fcc(result.scanned, result.infected)
             return
 
         # Format "chemin: Menace" (certaines versions)
@@ -600,6 +625,8 @@ class ScanEngine:
                 )
                 if cb:
                     cb(f"🚨 Avast : {threat}  →  {path.strip()}", "threat")
+                if fcc:
+                    fcc(result.scanned, result.infected)
             return
 
         # Lignes d'info (version, statistiques)
@@ -612,7 +639,8 @@ class ScanEngine:
     # ══════════════════════════════════════════════════════════════════════════
 
     def _scan_yara(self, targets: List[str],
-                   result: ScanResult, cb: ProgressCB) -> None:
+                   result: ScanResult, cb: ProgressCB,
+                   fcc: Optional[Callable[[int, int], None]] = None) -> None:
         ok, method = self.detect_yara()
         if not ok:
             msg = ("⚠ YARA non disponible.\n"
@@ -636,14 +664,15 @@ class ScanEngine:
             cb(f"YARA : démarrage ({count} règle(s), méthode : {method})…", "info")
 
         if method == "python":
-            self._yara_python(targets, result, cb)
+            self._yara_python(targets, result, cb, fcc)
         else:
-            self._yara_binary(targets, result, cb)
+            self._yara_binary(targets, result, cb, fcc)
 
     # ── YARA / python-yara ────────────────────────────────────────────────────
 
     def _yara_python(self, targets: List[str],
-                     result: ScanResult, cb: ProgressCB) -> None:
+                     result: ScanResult, cb: ProgressCB,
+                     fcc: Optional[Callable[[int, int], None]] = None) -> None:
         import yara   # type: ignore
 
         rule_files    = self._collect_rules()
@@ -704,6 +733,9 @@ class ScanEngine:
             finally:
                 scanned_yara[0] += 1
                 result.scanned_yara = scanned_yara[0]
+                # Notification UI toutes les 20 lignes
+                if fcc and scanned_yara[0] % 20 == 0:
+                    fcc(result.scanned, result.infected)
                 if scanned_yara[0] % 200 == 0 and cb:
                     cb(f"YARA : {scanned_yara[0]} fichiers analysés…", "info")
 
@@ -729,7 +761,8 @@ class ScanEngine:
     # ── YARA / binaire ────────────────────────────────────────────────────────
 
     def _yara_binary(self, targets: List[str],
-                     result: ScanResult, cb: ProgressCB) -> None:
+                     result: ScanResult, cb: ProgressCB,
+                     fcc: Optional[Callable[[int, int], None]] = None) -> None:
         rule_files = self._collect_rules()
         for rf in rule_files:
             if self._stop:
@@ -766,6 +799,8 @@ class ScanEngine:
                                 )
                                 if cb:
                                     cb(f"🚨 YARA : {rule_name}  →  {fpath}", "threat")
+                                if fcc:
+                                    fcc(result.scanned, result.infected)
                     self._proc.wait()
                 except Exception as e:
                     log_warning(f"YARA binaire ({os.path.basename(rf)}) : {e}")
