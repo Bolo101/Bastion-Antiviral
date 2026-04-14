@@ -80,6 +80,8 @@ class VirusScannerGUI:
         self._active_scans   = 0
         self._total_scanned  = 0
         self._total_infected = 0
+        self._per_dev_scanned:  Dict[str, int] = {}   # comptage temps réel par device
+        self._per_dev_infected: Dict[str, int] = {}   # menaces temps réel par device
 
         # ── Animation ─────────────────────────────────────────────────────────
         self._anim_after_id: Optional[str] = None
@@ -151,13 +153,13 @@ class VirusScannerGUI:
         body.pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
 
         left   = tk.Frame(body, bg=self.BG, width=420)
-        center = tk.Frame(body, bg=self.BG)
+        center = tk.Frame(body, bg=self.BG, width=260)
         right  = tk.Frame(body, bg=self.BG, width=360)
         left.pack(side=tk.LEFT,  fill=tk.BOTH, expand=False, padx=(0, 4))
         left.pack_propagate(False)
-        right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=False, padx=(4, 0))
-        right.pack_propagate(False)
-        center.pack(side=tk.LEFT, fill=tk.BOTH, expand=True,  padx=(0, 4))
+        center.pack(side=tk.LEFT, fill=tk.BOTH, expand=False, padx=(0, 4))
+        center.pack_propagate(False)
+        right.pack(side=tk.LEFT,  fill=tk.BOTH, expand=True,  padx=(4, 0))
 
         self._build_usb_panel(left)
         self._build_scan_controls(left)
@@ -427,42 +429,6 @@ class VirusScannerGUI:
                     c.create_oval(px_p - size_p, py_p - size_p,
                                    px_p + size_p, py_p + size_p,
                                    fill=alpha_color, outline="")
-
-            # ── Compteurs en temps réel (affichage proéminent) ────────────────
-            ns = self._total_scanned
-            ni = self._total_infected
-            na = self._active_scans
-
-            # Position : deux colonnes au-dessus du bouclier
-            stat_y  = cy - sr - 52
-            left_x  = cx - sr * 1.1
-            right_x = cx + sr * 1.1
-
-            # Fond semi-transparent (rectangles)
-            pad = 8
-            for bx, val_text, lbl_text, col in [
-                (left_x,  str(ns), "fichiers analysés", "#88ccff"),
-                (right_x, str(ni),
-                 "menace(s)",
-                 self.RED if ni > 0 else self.GREEN),
-            ]:
-                tw = max(60, len(str(max(ns, ni))) * 14 + 30)
-                c.create_rectangle(bx - tw//2 - pad, stat_y - 4,
-                                    bx + tw//2 + pad, stat_y + 36,
-                                    fill="#0d1528", outline="#223355",
-                                    width=1)
-                c.create_text(bx, stat_y + 2,
-                              text=val_text, fill=col,
-                              font=("Courier", 20, "bold"), anchor=tk.N)
-                c.create_text(bx, stat_y + 30,
-                              text=lbl_text, fill=self.FG_DIM,
-                              font=("Arial", 8), anchor=tk.N)
-
-            if na > 1:
-                c.create_text(cx, stat_y + 52,
-                              text=f"⚡ {na} scans en parallèle",
-                              fill="#5577aa", font=("Arial", 9, "bold"),
-                              anchor=tk.CENTER)
 
         elif st == "ok":
             # ── Éclat de lumière verte ────────────────────────────────────────
@@ -976,16 +942,38 @@ class VirusScannerGUI:
                 return
 
         # Prépare les cibles
+        remove = self.remove_var.get()
         targets_map: Dict[str, str] = {}
         for dev in devs_to_scan:
             mp = self.usb.get_mountpoint(dev)
-            if not mp:
-                ok, msg = self.usb.mount(dev)
-                if not ok:
-                    messagebox.showerror("Montage", msg, parent=self.root)
-                    continue
-                self._refresh_usb()
-                mp = self.usb.get_mountpoint(dev)
+
+            if remove:
+                # Suppression activée → le disque doit être monté en RW
+                if mp and self.usb._is_ro(dev, mp):
+                    # Déjà monté RO → remonter en RW
+                    ok_rw, msg_rw, mp_rw, _ = self.usb.mount_rw(dev)
+                    if not ok_rw:
+                        messagebox.showerror("Montage RW", msg_rw, parent=self.root)
+                        continue
+                    mp = mp_rw
+                elif not mp:
+                    # Non monté → montage direct en RW
+                    ok_rw, msg_rw, mp_rw, _ = self.usb.mount_rw(dev)
+                    if not ok_rw:
+                        messagebox.showerror("Montage RW", msg_rw, parent=self.root)
+                        continue
+                    mp = mp_rw
+                # else : déjà monté RW → utiliser tel quel
+            else:
+                # Suppression désactivée → montage RO normal
+                if not mp:
+                    ok, msg = self.usb.mount(dev)
+                    if not ok:
+                        messagebox.showerror("Montage", msg, parent=self.root)
+                        continue
+                    self._refresh_usb()
+                    mp = self.usb.get_mountpoint(dev)
+
             if not mp:
                 messagebox.showerror(
                     "Erreur", f"Impossible de monter {dev}.", parent=self.root)
@@ -998,9 +986,11 @@ class VirusScannerGUI:
         self._targets_map.update(targets_map)
 
         with self._scan_lock:
-            self._active_scans   += len(targets_map)
-            self._total_scanned   = 0
-            self._total_infected  = 0
+            self._active_scans    += len(targets_map)
+            self._total_scanned    = 0
+            self._total_infected   = 0
+            self._per_dev_scanned  = {}
+            self._per_dev_infected = {}
 
         self.stop_btn.configure(state=tk.NORMAL, bg=self.ACCENT)
         self._anim_state = "scanning"
@@ -1037,8 +1027,25 @@ class VirusScannerGUI:
 
     def _scan_thread(self, dev: str, targets: List[str],
                      eng: ScanEngine) -> None:
+        # Initialiser les compteurs temps réel pour ce périphérique
+        self._per_dev_scanned[dev]  = 0
+        self._per_dev_infected[dev] = 0
+
         def _progress(msg: str, tag: str = "normal") -> None:
             self.root.after(0, self._log, msg, tag)
+
+        def _file_count_cb(scanned: int, infected: int) -> None:
+            """
+            Appelé par ScanEngine après chaque fichier traité (ou toutes les N lignes).
+            scanned/infected = totaux cumulés pour CE périphérique.
+            Mis à jour sur le thread principal pour cohérence avec l'animation.
+            """
+            def _update(s=scanned, i=infected, d=dev):
+                self._per_dev_scanned[d]  = s
+                self._per_dev_infected[d] = i
+                self._total_scanned  = sum(self._per_dev_scanned.values())
+                self._total_infected = sum(self._per_dev_infected.values())
+            self.root.after(0, _update)
 
         try:
             result = eng.scan(
@@ -1048,6 +1055,7 @@ class VirusScannerGUI:
                 use_yara         = self.use_yara_var.get(),
                 remove_infected  = self.remove_var.get(),
                 progress_cb      = _progress,
+                file_count_cb    = _file_count_cb,
             )
         except Exception as e:
             result = None
@@ -1061,9 +1069,19 @@ class VirusScannerGUI:
         """Appelé quand un scan individuel se termine."""
         with self._scan_lock:
             self._active_scans = max(0, self._active_scans - 1)
-            if result:
-                self._total_scanned  += result.scanned
-                self._total_infected += result.infected
+
+        # Nettoyer les entrées temps réel et figer avec les valeurs exactes du moteur
+        self._per_dev_scanned.pop(dev, None)
+        self._per_dev_infected.pop(dev, None)
+        if result:
+            # Recalculer les totaux globaux depuis les valeurs exactes
+            # (les estimations per_dev sont retirées, on ajoute result.scanned/infected)
+            self._total_scanned  = (
+                sum(self._per_dev_scanned.values()) + result.scanned
+            )
+            self._total_infected = (
+                sum(self._per_dev_infected.values()) + result.infected
+            )
 
         if result:
             tag  = "threat" if result.infected > 0 else "ok"
@@ -1174,16 +1192,33 @@ class VirusScannerGUI:
                 "licensed":  avast_licensed,
             }
 
-            # Remontage RW
-            ok_mnt, msg_mnt, mp_rw, action = self.usb.mount_for_export(
-                dev,
-                progress_cb=lambda m: self.root.after(0, self._log, m, "info")
-            )
-            if not ok_mnt:
-                self.root.after(0, self._log,
-                                f"⚠ PDF non écrit sur {dev} : {msg_mnt}",
-                                "warning")
-                return
+            # ── Obtenir un point de montage RW ────────────────────────────────
+            current_mp = self.usb.get_mountpoint(dev)
+
+            if current_mp and not self.usb._is_ro(dev, current_mp):
+                # Déjà monté en RW (scan avec suppression activée)
+                # → utiliser directement, sans démonter/remonter
+                mp_rw  = current_mp
+                action = "existing_rw"
+            else:
+                # Monté RO ou non monté → démonter proprement, puis remonter RW
+                if current_mp:
+                    ok_u, msg_u = self.usb.umount(dev)
+                    if not ok_u:
+                        self.root.after(
+                            0, self._log,
+                            f"⚠ Démontage RO impossible ({msg_u}) — "
+                            f"tentative de remontage RW forcé…", "warning"
+                        )
+                ok_mnt, msg_mnt, mp_rw, action = self.usb.mount_for_export(
+                    dev,
+                    progress_cb=lambda m: self.root.after(0, self._log, m, "info")
+                )
+                if not ok_mnt:
+                    self.root.after(0, self._log,
+                                    f"⚠ PDF non écrit sur {dev} : {msg_mnt}",
+                                    "warning")
+                    return
             try:
                 from log_handler import write_device_scan_report_pdf
                 report_path = write_device_scan_report_pdf(
