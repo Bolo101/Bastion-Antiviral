@@ -178,6 +178,9 @@ ca-certificates
 python3
 python3-tk
 python3-pip
+python3-pil
+python3-pil.imagetk
+python3-fitz
 # YARA
 yara
 python3-yara
