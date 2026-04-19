@@ -4,8 +4,8 @@ gui.py – Interface principale du scanner antiviral USB.
 
 Interface utilisateur :
   • Sélection multi-clés USB → scans parallèles par threading
-  • Animation canvas (bouclier pulsant)
-  • Journal d'activité
+  • Journal d'activité (colonne centrale)
+  • Visionneuse PDF cyclique (colonne droite) — ../pdf/, tri alpha, 35 s/page
   • Bouton lancer / annuler
 
 Administration (protégée par code) :
@@ -15,9 +15,11 @@ Administration (protégée par code) :
   • Planification crontab
   • Journaux : export, purge
   • Sécurité (code admin), Arrêt, Quitter
+
+Dépendances optionnelles pour la visionneuse PDF :
+  pip install pymupdf pillow
 """
 
-import math
 import os
 import subprocess
 import sys
@@ -26,6 +28,8 @@ import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 from typing import Dict, List, Optional
+
+from pdf_viewer import PdfViewer, RenderedPage
 
 from admin_auth import AdminAuthManager, AdminPanel
 from config import YARA_RULES_DIR
@@ -83,10 +87,15 @@ class VirusScannerGUI:
         self._per_dev_scanned:  Dict[str, int] = {}   # comptage temps réel par device
         self._per_dev_infected: Dict[str, int] = {}   # menaces temps réel par device
 
-        # ── Animation ─────────────────────────────────────────────────────────
+        # ── Animation (état conservé pour compatibilité scan) ─────────────────
         self._anim_after_id: Optional[str] = None
         self._anim_phase    = 0.0
         self._anim_state    = "idle"   # idle | scanning | ok | threat
+
+        # ── Visionneuse PDF ───────────────────────────────────────────────────
+        self._pdf_viewer:   Optional[PdfViewer] = None
+        self._pdf_tk_image: Optional[object]    = None   # référence anti-GC
+        self._pdf_canvas:   Optional[tk.Canvas]  = None
 
         if os.geteuid() != 0:
             messagebox.showerror("Droits insuffisants",
@@ -97,7 +106,7 @@ class VirusScannerGUI:
         self._build_ui()
         self._refresh_status()
         self._refresh_usb()
-        self._animate()
+        self._init_pdf_viewer()
         self.root.protocol("WM_DELETE_WINDOW", self._request_admin)
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -163,8 +172,8 @@ class VirusScannerGUI:
 
         self._build_usb_panel(left)
         self._build_scan_controls(left)
-        self._build_animation_panel(center)
-        self._build_log_panel(right)
+        self._build_log_panel(center)
+        self._build_pdf_viewer_panel(right)
 
     # ── Panneau USB (simplifié utilisateur) ───────────────────────────────────
 
@@ -271,60 +280,71 @@ class VirusScannerGUI:
         )
         self.stop_btn.pack(fill=tk.X)
 
-    # ── Panneau animation ─────────────────────────────────────────────────────
+    # ── Visionneuse PDF ───────────────────────────────────────────────────────
 
-    def _build_animation_panel(self, parent: tk.Frame) -> None:
-        # ── Zone logo ──────────────────────────────────────────────────────────
-        logo_frame = tk.Frame(parent, bg=self.CARD, bd=1, relief=tk.SOLID,
-                              height=88)
-        logo_frame.pack(fill=tk.X, pady=(0, 4))
-        logo_frame.pack_propagate(False)
+    def _build_pdf_viewer_panel(self, parent: tk.Frame) -> None:
+        """
+        Panneau droit : affiche en boucle les PDFs (1 page A4 portrait)
+        présents dans ../pdf/, triés alphabétiquement, 35 s par document.
+        """
+        outer = tk.Frame(parent, bg=self.CARD, bd=1, relief=tk.SOLID)
+        outer.pack(fill=tk.BOTH, expand=True)
 
-        logo_path = os.path.normpath(
-            os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                         "..", "img", "logo.png"))
-        self._logo_img: Optional[tk.PhotoImage] = None
-        try:
-            img = tk.PhotoImage(file=logo_path)
-            # Sous-échantillonnage si trop grand (PhotoImage natif)
-            iw, ih = img.width(), img.height()
-            max_h = 76
-            if ih > max_h:
-                factor = max(1, ih // max_h)
-                img = img.subsample(factor, factor)
-            self._logo_img = img
-            tk.Label(logo_frame, image=self._logo_img,
-                     bg=self.CARD, cursor="arrow").pack(expand=True)
-        except Exception:
-            # Fallback texte si l'image est introuvable
-            tk.Label(logo_frame,
-                     text="🛡  USB Antivirus Scanner",
-                     bg=self.CARD, fg="#3a6498",
-                     font=("Arial", 18, "bold italic")).pack(expand=True)
+        # ── Entête avec nom du fichier en cours ───────────────────────────────
+        hdr = tk.Frame(outer, bg=self.TOPBAR)
+        hdr.pack(fill=tk.X)
+        self._pdf_name_var = tk.StringVar(value="Chargement des PDFs…")
+        self._pdf_counter_var = tk.StringVar(value="")
+        tk.Label(hdr, textvariable=self._pdf_name_var,
+                 bg=self.TOPBAR, fg=self.FG,
+                 font=("Arial", 9, "bold"),
+                 anchor=tk.W, padx=8, pady=4).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Label(hdr, textvariable=self._pdf_counter_var,
+                 bg=self.TOPBAR, fg=self.FG_DIM,
+                 font=("Courier", 8), padx=8).pack(side=tk.RIGHT)
 
-        # ── Canvas d'animation (remplit tout l'espace restant) ─────────────────
-        anim_outer = tk.Frame(parent, bg=self.CARD, bd=1, relief=tk.SOLID)
-        anim_outer.pack(fill=tk.BOTH, expand=True)
-
-        self._anim_canvas = tk.Canvas(
-            anim_outer, bg=self.CARD, highlightthickness=0
+        # ── Canvas pour afficher la page rendue ───────────────────────────────
+        self._pdf_canvas = tk.Canvas(
+            outer, bg="#2a2a2a", highlightthickness=0
         )
-        self._anim_canvas.pack(fill=tk.BOTH, expand=True)
+        self._pdf_canvas.pack(fill=tk.BOTH, expand=True)
 
-        # Vars conservées pour compatibilité avec le reste du code
-        self.status_var   = tk.StringVar(value="Prêt — insérez une clé USB")
-        self.scanned_var  = tk.StringVar(value="")
-        self.infected_var = tk.StringVar(value="")
+        # ── Barre de progression 35 s ─────────────────────────────────────────
+        self._pdf_progress_var = tk.DoubleVar(value=0.0)
+        prog_frame = tk.Frame(outer, bg=self.CARD, pady=3)
+        prog_frame.pack(fill=tk.X)
+        self._pdf_progressbar = ttk.Progressbar(
+            prog_frame, variable=self._pdf_progress_var,
+            maximum=100, mode="determinate", length=300
+        )
+        self._pdf_progressbar.pack(fill=tk.X, padx=8, pady=2)
+
+        # ── Navigation manuelle ───────────────────────────────────────────────
+        nav = tk.Frame(outer, bg=self.CARD, pady=3)
+        nav.pack(fill=tk.X)
+        tk.Button(nav, text="◀  Précédent",
+                  command=self._pdf_prev,
+                  bg=self.TOPBAR, fg=self.FG, relief=tk.FLAT,
+                  font=("Arial", 9), pady=4, padx=10).pack(side=tk.LEFT, padx=(8, 4))
+        tk.Button(nav, text="Suivant  ▶",
+                  command=self._pdf_next,
+                  bg=self.TOPBAR, fg=self.FG, relief=tk.FLAT,
+                  font=("Arial", 9), pady=4, padx=10).pack(side=tk.RIGHT, padx=(4, 8))
 
     # ── Journal ───────────────────────────────────────────────────────────────
 
     def _build_log_panel(self, parent: tk.Frame) -> None:
+        # Vars de compatibilité (utilisées par les méthodes de scan)
+        self.status_var   = tk.StringVar(value="Prêt — insérez une clé USB")
+        self.scanned_var  = tk.StringVar(value="")
+        self.infected_var = tk.StringVar(value="")
+
         hdr = tk.Frame(parent, bg=self.BG)
         hdr.pack(fill=tk.X, pady=(0, 4))
-        tk.Label(hdr, text="  Journal d'activité",
+        tk.Label(hdr, text="  Journal",
                  bg=self.BG, fg=self.FG_DIM,
                  font=("Arial", 10, "bold")).pack(side=tk.LEFT)
-        tk.Button(hdr, text="🧹 Vider",
+        tk.Button(hdr, text="🧹",
                   command=self._clear_log,
                   bg=self.CARD, fg=self.FG_DIM, relief=tk.FLAT,
                   font=("Arial", 8)).pack(side=tk.RIGHT)
@@ -348,277 +368,94 @@ class VirusScannerGUI:
         sb.pack(side=tk.RIGHT, fill=tk.Y)
 
     # ══════════════════════════════════════════════════════════════════════════
-    # Animation canvas
+    # Visionneuse PDF – wrappers UI vers PdfViewer
     # ══════════════════════════════════════════════════════════════════════════
 
-    def _animate(self) -> None:
-        c  = self._anim_canvas
-        cw = c.winfo_width()  or 500
-        ch = c.winfo_height() or 340
-        cx, cy = cw // 2, ch // 2
-        c.delete("all")
+    def _init_pdf_viewer(self) -> None:
+        """Instancie PdfViewer et démarre le cycle une fois l'UI prête."""
+        def _canvas_size():
+            if self._pdf_canvas is None:
+                return (595, 842)
+            return (self._pdf_canvas.winfo_width(),
+                    self._pdf_canvas.winfo_height())
 
-        st = self._anim_state
-        ph = self._anim_phase
+        self._pdf_viewer = PdfViewer(
+            base_dir       = os.path.dirname(os.path.abspath(__file__)),
+            canvas_size_cb = _canvas_size,
+            on_page        = self._on_pdf_page,
+            on_progress    = self._on_pdf_progress,
+            on_no_files    = self._on_pdf_no_files,
+            after_cb       = self.root.after,
+            cancel_cb      = self.root.after_cancel,
+            log_error_cb   = log_error,
+        )
+        # Démarrer après que la fenêtre soit complètement dessinée
+        self.root.after(200, self._pdf_viewer.start)
 
-        # ── Avancer la phase ──────────────────────────────────────────────────
-        speed = {"scanning": 3.5, "ok": 1.2, "threat": 2.0, "idle": 0.7}
-        self._anim_phase = (ph + speed.get(st, 0.7)) % 360
+    def _on_pdf_page(self, rp: RenderedPage) -> None:
+        """Appelé par PdfViewer quand une nouvelle page est prête à afficher."""
+        if self._pdf_canvas is None:
+            return
 
-        # ── Rayon du bouclier (adapté à la taille du canvas) ──────────────────
-        sr = max(44, min(int(min(cw, ch) * 0.22), 88))
+        # ── Mettre à jour l'entête ────────────────────────────────────────────
+        self._pdf_name_var.set(rp.pdf_name)
+        # Format :  document N/total  •  page P/total
+        self._pdf_counter_var.set(
+            f"doc {rp.pdf_index + 1}/{rp.pdf_count}"
+            f"  •  p. {rp.page_index + 1}/{rp.page_count}"
+        )
 
-        # ══ 1. FOND — grille de points hexagonaux ════════════════════════════
-        spacing = 30
-        for row_i, gy in enumerate(range(0, ch + spacing, spacing)):
-            for gx in range(-(spacing if row_i % 2 else 0),
-                             cw + spacing, spacing):
-                dx, dy = gx - cx, gy - cy
-                dist = math.sqrt(dx*dx + dy*dy)
-                if dist < sr * 1.1:
-                    continue
-                brightness = max(0, 1.0 - dist / (max(cw, ch) * 0.65))
-                if brightness > 0.06:
-                    c.create_oval(gx-1, gy-1, gx+1, gy+1,
-                                   fill="#1e2a4a", outline="")
+        # ── Afficher l'image ──────────────────────────────────────────────────
+        self._pdf_canvas.delete("all")
+        cw = self._pdf_canvas.winfo_width()  or 595
+        ch = self._pdf_canvas.winfo_height() or 842
 
-        # ══ 2. EFFETS SPÉCIFIQUES À L'ÉTAT ═══════════════════════════════════
-
-        if st == "scanning":
-            # ── Anneaux radars concentriques ──────────────────────────────────
-            for i in range(6):
-                ring_ph = (ph + i * 60) % 360
-                fade    = abs(math.sin(math.radians(ring_ph)))
-                r_ring  = sr * (1.6 + i * 0.55) + fade * 5
-                if r_ring > max(cw, ch):
-                    break
-                stip = ("gray75", "gray50", "gray50", "gray25",
-                         "gray25", "gray12")[i]
-                c.create_oval(cx - r_ring, cy - r_ring,
-                               cx + r_ring, cy + r_ring,
-                               outline="#2244aa", width=1, stipple=stip)
-
-            # ── Balayage radar ────────────────────────────────────────────────
-            sweep_deg  = (ph * 2.2) % 360
-            sweep_rad  = math.radians(sweep_deg)
-            radar_r    = sr * 3.0
-            # Traînée en arc (dégradé simulé par plusieurs arcs)
-            for arc_i, (ext, w, stip) in enumerate(
-                    [(90, 6, "gray50"), (60, 4, "gray25"), (30, 2, "gray12")]):
-                c.create_arc(cx - radar_r, cy - radar_r,
-                              cx + radar_r, cy + radar_r,
-                              start=sweep_deg, extent=ext,
-                              outline="#4488ff", width=w,
-                              style=tk.ARC, stipple=stip)
-            # Ligne de balayage
-            c.create_line(cx, cy,
-                           cx + math.cos(sweep_rad) * radar_r,
-                           cy - math.sin(sweep_rad) * radar_r,
-                           fill="#88bbff", width=2)
-
-            # ── Particules / points scannés ───────────────────────────────────
-            for i in range(12):
-                angle    = math.radians((ph * 2.8 + i * 30) % 360)
-                progress = ((ph / 360.0) * 0.7 + i / 12.0) % 1.0
-                r_p      = sr * 1.3 + progress * sr * 2.8
-                px_p     = cx + math.cos(angle) * r_p
-                py_p     = cy - math.sin(angle) * r_p
-                size_p   = max(1.5, 3.5 * (1 - progress))
-                if 0 < px_p < cw and 0 < py_p < ch:
-                    alpha_color = "#4488ff" if progress < 0.5 else "#224466"
-                    c.create_oval(px_p - size_p, py_p - size_p,
-                                   px_p + size_p, py_p + size_p,
-                                   fill=alpha_color, outline="")
-
-        elif st == "ok":
-            # ── Éclat de lumière verte ────────────────────────────────────────
-            pulse = abs(math.sin(math.radians(ph * 2.5)))
-            for i in range(4):
-                r_g = sr * (1.35 + i * 0.35 + pulse * 0.12)
-                stip = ("gray75", "gray50", "gray25", "gray12")[i]
-                c.create_oval(cx - r_g, cy - r_g, cx + r_g, cy + r_g,
-                               fill="", outline=self.GREEN,
-                               width=2, stipple=stip)
-            # Étincelles
-            for i in range(10):
-                angle = math.radians(ph * 2.5 + i * 36)
-                r_sp  = sr * (1.55 + pulse * 0.45)
-                sx    = cx + math.cos(angle) * r_sp
-                sy    = cy - math.sin(angle) * r_sp
-                if 0 < sx < cw and 0 < sy < ch:
-                    c.create_oval(sx-2, sy-2, sx+2, sy+2,
-                                   fill=self.GREEN, outline="")
-            # Résultats finaux
-            res_y = cy - sr - 44
-            c.create_rectangle(cx - 110, res_y - 6, cx + 110, res_y + 32,
-                                fill="#071a0f", outline="#1a5e2a", width=1)
-            c.create_text(cx, res_y + 2,
-                          text=f"✓  {self._total_scanned} fichier(s) analysé(s) — propre",
-                          fill=self.GREEN,
-                          font=("Arial", 11, "bold"), anchor=tk.N)
-
-        elif st == "threat":
-            # ── Pulsations rouges ─────────────────────────────────────────────
-            pulse = abs(math.sin(math.radians(ph * 3.5)))
-            for i in range(4):
-                r_t = sr * (1.3 + i * 0.4 + pulse * 0.2)
-                stip = ("gray75", "gray50", "gray25", "gray12")[i]
-                c.create_oval(cx - r_t, cy - r_t, cx + r_t, cy + r_t,
-                               fill="", outline=self.RED,
-                               width=2, stipple=stip)
-            # Triangles d'alerte aux coins
-            for i in range(4):
-                angle = math.radians(ph * 1.8 + i * 90 + 45)
-                r_tri = sr * 2.2
-                tx    = cx + math.cos(angle) * r_tri
-                ty    = cy - math.sin(angle) * r_tri
-                sz    = 10
-                tri_pts = [tx,       ty - sz,
-                            tx - sz * 0.87, ty + sz * 0.5,
-                            tx + sz * 0.87, ty + sz * 0.5]
-                c.create_polygon(tri_pts, fill=self.RED,
-                                  outline="", stipple="gray75")
-            # Résultats
-            res_y = cy - sr - 44
-            c.create_rectangle(cx - 130, res_y - 6, cx + 130, res_y + 32,
-                                fill="#1a0000", outline="#5e1a1a", width=1)
-            c.create_text(cx, res_y + 2,
-                          text=f"⚠  {self._total_infected} menace(s) / "
-                               f"{self._total_scanned} fichier(s)",
-                          fill=self.RED,
-                          font=("Arial", 11, "bold"), anchor=tk.N)
-
-        else:  # idle
-            # ── Halo pulsant ──────────────────────────────────────────────────
-            pulse = abs(math.sin(math.radians(ph * 1.8)))
-            for i in range(3):
-                r_h = sr * (1.25 + i * 0.45 + pulse * 0.12)
-                stip = ("gray50", "gray25", "gray12")[i]
-                c.create_oval(cx - r_h, cy - r_h, cx + r_h, cy + r_h,
-                               fill="", outline="#2a4a78",
-                               width=1, stipple=stip)
-            # Trois petits USB en orbite
-            for i in range(3):
-                orbit_angle = math.radians(ph * 1.4 + i * 120)
-                orbit_r     = sr * 1.75
-                ox = cx + math.cos(orbit_angle) * orbit_r
-                oy = cy - math.sin(orbit_angle) * orbit_r
-                # Corps USB
-                c.create_rectangle(ox-6, oy-4, ox+6, oy+4,
-                                    fill="#2a4a78", outline="#4a7ab8", width=1)
-                c.create_rectangle(ox-3, oy+4, ox+3, oy+8,
-                                    fill="#2a4a78", outline="#4a7ab8", width=1)
-                # Connecteur
-                c.create_rectangle(ox-2, oy-8, ox+2, oy-4,
-                                    fill="#4a7ab8", outline="#88aacc", width=1)
-
-        # ══ 3. BOUCLIER CENTRAL ══════════════════════════════════════════════
-        if st == "scanning":
-            sf, so, gc = "#0f1e55", "#4488ff", "#4488ff"
-        elif st == "ok":
-            sf, so, gc = "#062210", self.GREEN, self.GREEN
-        elif st == "threat":
-            sf, so, gc = "#3a0000", self.RED, self.RED
+        if rp.img_tk is not None:
+            self._pdf_tk_image = rp.img_tk   # anti-GC
+            self._pdf_canvas.create_image(cw // 2, ch // 2,
+                                           anchor=tk.CENTER, image=rp.img_tk)
         else:
-            sf, so, gc = "#0f2244", "#3a6498", "#3a6498"
+            # Fallback : PyMuPDF ou Pillow absent
+            self._pdf_canvas.create_text(
+                cw // 2, ch // 2,
+                text=(f"{rp.pdf_name}\n\nPage {rp.page_index + 1}"
+                      f" / {rp.page_count}\n\n"
+                      "(PyMuPDF et Pillow requis\npour l'affichage)"),
+                fill=self.FG_DIM,
+                font=("Arial", 12, "italic"),
+                justify=tk.CENTER,
+            )
 
-        # Forme bouclier
-        pts = [
-            cx,      cy - sr,
-            cx + int(sr * 0.76), cy - int(sr * 0.50),
-            cx + int(sr * 0.76), cy + int(sr * 0.30),
-            cx,      cy + sr,
-            cx - int(sr * 0.76), cy + int(sr * 0.30),
-            cx - int(sr * 0.76), cy - int(sr * 0.50),
-        ]
-        # Ombre
-        c.create_polygon([p + 5 for p in pts],
-                          fill="#000000", outline="", stipple="gray25")
-        # Corps
-        c.create_polygon(pts, fill=sf, outline=so, width=2)
-        # Reflet haut-gauche
-        hl = [
-            cx - int(sr * 0.30), cy - int(sr * 0.72),
-            cx + int(sr * 0.10), cy - int(sr * 0.72),
-            cx - int(sr * 0.08), cy - int(sr * 0.20),
-            cx - int(sr * 0.40), cy - int(sr * 0.32),
-        ]
-        c.create_polygon(hl, fill="white", outline="", stipple="gray25")
-        # Bord interne
-        inset = 5
-        inner_pts = [
-            cx,           cy - sr + inset,
-            cx + int((sr - inset) * 0.74), cy - int((sr - inset) * 0.50),
-            cx + int((sr - inset) * 0.74), cy + int((sr - inset) * 0.28),
-            cx,           cy + sr - inset,
-            cx - int((sr - inset) * 0.74), cy + int((sr - inset) * 0.28),
-            cx - int((sr - inset) * 0.74), cy - int((sr - inset) * 0.50),
-        ]
-        c.create_polygon(inner_pts, fill="", outline=gc, width=1,
-                          stipple="gray50")
+    def _on_pdf_progress(self, pct: float) -> None:
+        """Met à jour la barre de progression (0.0 – 100.0)."""
+        self._pdf_progress_var.set(pct)
 
-        # ── Icône dans le bouclier ────────────────────────────────────────────
-        ic = int(sr * 0.38)
-        lw = max(2, sr // 18)
-        if st == "ok":
-            c.create_line(cx - ic, cy + ic//5,
-                           cx - ic//4, cy + ic,
-                           cx + ic,    cy - ic,
-                           fill=self.GREEN, width=lw + 1,
-                           joinstyle=tk.ROUND, capstyle=tk.ROUND)
-        elif st == "threat":
-            c.create_line(cx - ic * 0.75, cy - ic * 0.75,
-                           cx + ic * 0.75, cy + ic * 0.75,
-                           fill=self.RED, width=lw + 1, capstyle=tk.ROUND)
-            c.create_line(cx + ic * 0.75, cy - ic * 0.75,
-                           cx - ic * 0.75, cy + ic * 0.75,
-                           fill=self.RED, width=lw + 1, capstyle=tk.ROUND)
-        elif st == "scanning":
-            # Arc tournant double
-            a0 = (ph * 2.2) % 360
-            c.create_arc(cx - ic, cy - ic, cx + ic, cy + ic,
-                          start=a0, extent=250,
-                          outline="#88bbff", width=lw + 1, style=tk.ARC)
-            c.create_arc(cx - ic//2, cy - ic//2, cx + ic//2, cy + ic//2,
-                          start=a0 + 180, extent=200,
-                          outline="#4466aa", width=lw, style=tk.ARC)
-        else:
-            # Clé USB stylisée
-            c.create_rectangle(cx - ic//2, cy - ic//5,
-                                cx + ic//2, cy + ic//2,
-                                fill=sf, outline=gc, width=1)
-            c.create_rectangle(cx - ic//4, cy + ic//2,
-                                cx + ic//4, cy + int(ic * 0.85),
-                                fill=sf, outline=gc, width=1)
-            c.create_rectangle(cx - ic//6, cy - int(ic * 0.65),
-                                cx + ic//6, cy - ic//5,
-                                fill=gc, outline=gc, width=1)
+    def _on_pdf_no_files(self) -> None:
+        """Affiche un message quand aucun PDF n'est présent dans ../pdf/."""
+        if self._pdf_canvas is None:
+            return
+        self._pdf_canvas.delete("all")
+        cw = self._pdf_canvas.winfo_width()  or 595
+        ch = self._pdf_canvas.winfo_height() or 842
+        self._pdf_canvas.create_text(
+            cw // 2, ch // 2,
+            text="Aucun PDF trouvé\ndans ../pdf/",
+            fill=self.FG_DIM,
+            font=("Arial", 14, "italic"),
+            justify=tk.CENTER,
+        )
+        self._pdf_name_var.set("Aucun PDF disponible")
+        self._pdf_counter_var.set("")
 
-        # ══ 4. TEXTE D'ÉTAT sous le bouclier ═════════════════════════════════
-        text_y = cy + sr + 18
-        if st == "scanning":
-            dots  = "." * (int(ph / 90) % 4)
-            label = f"Analyse en cours{dots}"
-        elif st == "ok":
-            label = "✓  Aucune menace détectée"
-        elif st == "threat":
-            label = f"⚠  {self._total_infected} menace(s) !"
-        else:
-            label = "Prêt — insérez une clé USB"
+    def _pdf_next(self) -> None:
+        """Navigation manuelle : page / document suivant."""
+        if self._pdf_viewer:
+            self._pdf_viewer.next_page()
 
-        c.create_text(cx, text_y,
-                      text=label, fill=gc,
-                      font=("Arial", 11, "bold"), anchor=tk.CENTER)
-
-        # Sous-texte résultats (hors scan)
-        if st not in ("scanning", "idle") and self._total_scanned > 0:
-            c.create_text(cx, text_y + 20,
-                          text=f"{self._total_scanned} fichier(s) analysé(s)",
-                          fill=self.FG_DIM, font=("Courier", 8),
-                          anchor=tk.CENTER)
-
-        interval = 33 if st == "scanning" else 100
-        self._anim_after_id = self.root.after(interval, self._animate)
+    def _pdf_prev(self) -> None:
+        """Navigation manuelle : page / document précédent."""
+        if self._pdf_viewer:
+            self._pdf_viewer.prev_page()
 
     # ══════════════════════════════════════════════════════════════════════════
     # Helpers UI
@@ -1646,6 +1483,8 @@ class VirusScannerGUI:
                 eng.request_stop()
         if self._anim_after_id:
             self.root.after_cancel(self._anim_after_id)
+        if self._pdf_viewer:
+            self._pdf_viewer.stop()
         self.usb.umount_all()
         log_info("Application fermée.")
         self.root.destroy()
