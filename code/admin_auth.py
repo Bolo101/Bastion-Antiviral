@@ -204,6 +204,11 @@ class AdminPanel:
         # Supports exhaustifs
         get_usb_partitions: Callable,
         refresh_usb:        Callable,
+        # PDFs
+        pdf_dir:             str,
+        on_pdf_reload_viewer: Callable,
+        # Statistiques
+        get_scan_stats:      Callable,
     ) -> None:
         self._parent = parent
         self._auth   = auth
@@ -235,6 +240,9 @@ class AdminPanel:
         }
         self._get_usb_partitions = get_usb_partitions
         self._refresh_usb        = refresh_usb
+        self._pdf_dir            = pdf_dir
+        self._on_pdf_reload      = on_pdf_reload_viewer
+        self._get_scan_stats     = get_scan_stats
 
     def show(self) -> None:
         code = ask_admin_code(
@@ -277,6 +285,7 @@ class AdminPanel:
         self._tab_avast(nb)
         self._tab_yara(nb)
         self._tab_cron(nb)
+        self._tab_pdf(nb, dlg)
         self._tab_logs(nb)
         self._tab_security(nb)
         self._tab_poweroff(nb, dlg)
@@ -986,46 +995,414 @@ class AdminPanel:
         ttk.Button(row3, text="✓ Appliquer",  command=_apply,  width=16).pack(side=tk.LEFT, padx=4)
         ttk.Button(row3, text="🗑 Supprimer", command=_remove, width=16).pack(side=tk.LEFT, padx=4)
 
+    # ── Onglet PDFs ────────────────────────────────────────────────────────────
+
+    def _tab_pdf(self, nb: ttk.Notebook, dlg: tk.Toplevel) -> None:
+        """Onglet de gestion des PDFs affichés en boucle sur l'interface."""
+        tab = ttk.Frame(nb, padding=10)
+        nb.add(tab, text="📄 PDFs")
+
+        ttk.Label(tab, text="Gestion des PDFs de la visionneuse",
+                  font=("Arial", 11, "bold")).pack(anchor=tk.W, pady=(0, 6))
+
+        pdf_dir = self._pdf_dir
+
+        # ── Liste des PDFs présents ────────────────────────────────────────────
+        list_frame = ttk.LabelFrame(tab, text=f"PDFs dans {pdf_dir}", padding=8)
+        list_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+
+        cols = ("name", "size")
+        tree = ttk.Treeview(list_frame, columns=cols, show="headings",
+                            height=8, selectmode="extended")
+        tree.heading("name", text="Fichier")
+        tree.heading("size", text="Taille")
+        tree.column("name", width=360, anchor=tk.W)
+        tree.column("size", width=80,  anchor=tk.CENTER)
+        sb_tree = ttk.Scrollbar(list_frame, orient=tk.VERTICAL,
+                                command=tree.yview)
+        tree.configure(yscrollcommand=sb_tree.set)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb_tree.pack(side=tk.RIGHT, fill=tk.Y)
+
+        status_var = tk.StringVar()
+        ttk.Label(tab, textvariable=status_var,
+                  foreground="navy", wraplength=520).pack(anchor=tk.W, pady=2)
+
+        def _refresh_list():
+            for row in tree.get_children():
+                tree.delete(row)
+            try:
+                os.makedirs(pdf_dir, exist_ok=True)
+                files = sorted(
+                    (f for f in os.listdir(pdf_dir)
+                     if f.lower().endswith(".pdf")),
+                    key=str.casefold
+                )
+                for fname in files:
+                    fpath = os.path.join(pdf_dir, fname)
+                    try:
+                        sz = os.path.getsize(fpath)
+                        sz_str = (f"{sz // 1024} Ko" if sz >= 1024
+                                  else f"{sz} o")
+                    except OSError:
+                        sz_str = "?"
+                    tree.insert("", tk.END, iid=fpath,
+                                values=(fname, sz_str))
+                count = len(files)
+                status_var.set(f"{count} PDF(s) présent(s).")
+            except Exception as e:
+                status_var.set(f"Erreur lecture dossier : {e}")
+
+        _refresh_list()
+
+        # ── Boutons de gestion ────────────────────────────────────────────────
+        btn_frame = ttk.Frame(tab)
+        btn_frame.pack(fill=tk.X, pady=(0, 8))
+
+        def _delete_selected():
+            sel = tree.selection()
+            if not sel:
+                messagebox.showwarning("Aucune sélection",
+                                       "Sélectionnez au moins un PDF.",
+                                       parent=dlg)
+                return
+            names = "\n".join(f"• {os.path.basename(p)}" for p in sel)
+            if not messagebox.askyesno(
+                "Confirmer la suppression",
+                f"Supprimer définitivement :\n{names}",
+                icon="warning", parent=dlg
+            ):
+                return
+            errors = []
+            for fpath in sel:
+                try:
+                    os.remove(fpath)
+                except Exception as e:
+                    errors.append(f"{os.path.basename(fpath)}: {e}")
+            if errors:
+                messagebox.showerror("Erreurs",
+                                     "\n".join(errors), parent=dlg)
+            else:
+                status_var.set(f"✅ {len(sel)} fichier(s) supprimé(s).")
+            _refresh_list()
+            self._on_pdf_reload()
+
+        ttk.Button(btn_frame, text="🗑  Supprimer sélection",
+                   command=_delete_selected,
+                   width=24).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(btn_frame, text="↺  Actualiser",
+                   command=_refresh_list,
+                   width=14).pack(side=tk.LEFT)
+
+        # ── Import depuis clé USB ──────────────────────────────────────────────
+        usb_frame = ttk.LabelFrame(tab, text="Importer des PDFs depuis une clé USB",
+                                   padding=10)
+        usb_frame.pack(fill=tk.X)
+
+        # Étape 1 : sélection de la clé
+        r1 = ttk.Frame(usb_frame); r1.pack(fill=tk.X, pady=2)
+        ttk.Label(r1, text="1. Clé USB :", width=14).pack(side=tk.LEFT)
+        usb_var = tk.StringVar(value="— sélectionner —")
+        usb_combo = ttk.Combobox(r1, textvariable=usb_var,
+                                  state="readonly", width=28)
+        usb_combo.pack(side=tk.LEFT, padx=4)
+
+        usb_status_var = tk.StringVar()
+        ttk.Label(usb_frame, textvariable=usb_status_var,
+                  foreground="navy", font=("Courier", 8)).pack(anchor=tk.W)
+
+        def _refresh_usb_combo():
+            parts = self._get_usb_partitions()
+            names = [p.device + (f" [{p.label}]" if p.label else "")
+                     for p in parts]
+            usb_combo["values"] = names
+            if names:
+                usb_combo.current(0)
+
+        ttk.Button(r1, text="↺", width=4,
+                   command=_refresh_usb_combo).pack(side=tk.LEFT)
+        _refresh_usb_combo()
+
+        # Étape 2 : montage
+        r2 = ttk.Frame(usb_frame); r2.pack(fill=tk.X, pady=2)
+        ttk.Label(r2, text="2. Monter :", width=14).pack(side=tk.LEFT)
+        _mp_holder: list = [None]   # point de montage actif
+
+        def _mount_usb_pdf():
+            parts = self._get_usb_partitions()
+            idx   = usb_combo.current()
+            if idx < 0 or idx >= len(parts):
+                usb_status_var.set("⚠ Sélectionnez une clé USB.")
+                return
+            part = parts[idx]
+            import subprocess as _sp
+            try:
+                mp = f"/mnt/pdf_import_{part.device.replace('/', '_')}"
+                os.makedirs(mp, exist_ok=True)
+                r = _sp.run(["mount", "-o", "ro", part.device, mp],
+                            capture_output=True, text=True)
+                if r.returncode != 0:
+                    usb_status_var.set(f"❌ mount : {r.stderr.strip()[:60]}")
+                    return
+                _mp_holder[0] = mp
+                usb_status_var.set(f"✅ Monté en lecture seule → {mp}")
+                _scan_usb_files()
+            except Exception as e:
+                usb_status_var.set(f"❌ {e}")
+
+        ttk.Button(r2, text="▲  Monter en RO",
+                   command=_mount_usb_pdf, width=18).pack(side=tk.LEFT, padx=4)
+
+        # Étape 3 : liste des PDFs sur la clé
+        r3 = ttk.Frame(usb_frame); r3.pack(fill=tk.X, pady=(6, 2))
+        ttk.Label(r3, text="3. PDFs sur la clé :").pack(anchor=tk.W)
+
+        usb_cols = ("fname",)
+        usb_tree = ttk.Treeview(usb_frame, columns=usb_cols, show="headings",
+                                 height=5, selectmode="extended")
+        usb_tree.heading("fname", text="Fichier PDF")
+        usb_tree.column("fname", width=460, anchor=tk.W)
+        usb_sb = ttk.Scrollbar(usb_frame, orient=tk.VERTICAL,
+                                command=usb_tree.yview)
+        usb_tree.configure(yscrollcommand=usb_sb.set)
+        usb_tree_frame = ttk.Frame(usb_frame)
+        usb_tree_frame.pack(fill=tk.X)
+        usb_tree.pack(in_=usb_tree_frame, side=tk.LEFT, fill=tk.X, expand=True)
+        usb_sb.pack(in_=usb_tree_frame, side=tk.RIGHT, fill=tk.Y)
+
+        def _scan_usb_files():
+            for row in usb_tree.get_children():
+                usb_tree.delete(row)
+            mp = _mp_holder[0]
+            if not mp or not os.path.isdir(mp):
+                usb_status_var.set("⚠ Montez d'abord la clé.")
+                return
+            pdfs = []
+            for root_dir, _, fnames in os.walk(mp):
+                for fn in sorted(fnames, key=str.casefold):
+                    if fn.lower().endswith(".pdf"):
+                        full = os.path.join(root_dir, fn)
+                        rel  = os.path.relpath(full, mp)
+                        pdfs.append((rel, full))
+            for rel, full in pdfs:
+                usb_tree.insert("", tk.END, iid=full, values=(rel,))
+            usb_status_var.set(f"{len(pdfs)} PDF(s) trouvé(s) sur la clé.")
+
+        ttk.Button(usb_frame, text="🔍  Scanner la clé",
+                   command=_scan_usb_files, width=18).pack(anchor=tk.W,
+                                                            pady=(4, 0))
+
+        # Étape 4 : téléverser
+        r4 = ttk.Frame(usb_frame); r4.pack(fill=tk.X, pady=(8, 2))
+        ttk.Label(r4, text="4. Téléverser :", width=16).pack(side=tk.LEFT)
+        import_status_var = tk.StringVar()
+        ttk.Label(usb_frame, textvariable=import_status_var,
+                  foreground="green").pack(anchor=tk.W)
+
+        def _import_selected():
+            sel = usb_tree.selection()
+            if not sel:
+                messagebox.showwarning("Aucune sélection",
+                                       "Cochez au moins un fichier.",
+                                       parent=dlg)
+                return
+            os.makedirs(pdf_dir, exist_ok=True)
+            copied, errors = 0, []
+            import shutil as _sh
+            for src in sel:
+                fname = os.path.basename(src)
+                dst   = os.path.join(pdf_dir, fname)
+                try:
+                    _sh.copy2(src, dst)
+                    copied += 1
+                except Exception as e:
+                    errors.append(f"{fname}: {e}")
+            if errors:
+                import_status_var.set(
+                    f"⚠ {copied} copié(s), {len(errors)} erreur(s) : "
+                    + " | ".join(errors[:2]))
+            else:
+                import_status_var.set(f"✅ {copied} PDF(s) téléversé(s).")
+            _refresh_list()
+            self._on_pdf_reload()
+
+        def _umount_usb_pdf():
+            mp = _mp_holder[0]
+            if not mp:
+                usb_status_var.set("⚠ Aucun montage actif.")
+                return
+            import subprocess as _sp
+            r = _sp.run(["umount", mp], capture_output=True, text=True)
+            if r.returncode == 0:
+                _mp_holder[0] = None
+                for row in usb_tree.get_children():
+                    usb_tree.delete(row)
+                usb_status_var.set("✅ Clé démontée.")
+            else:
+                usb_status_var.set(f"❌ umount : {r.stderr.strip()[:60]}")
+
+        r4_btns = ttk.Frame(usb_frame); r4_btns.pack(fill=tk.X, pady=2)
+        ttk.Button(r4_btns, text="⬆  Copier vers ../pdf/",
+                   command=_import_selected, width=24).pack(side=tk.LEFT,
+                                                             padx=(0, 8))
+        ttk.Button(r4_btns, text="▼  Démonter la clé",
+                   command=_umount_usb_pdf, width=20).pack(side=tk.LEFT)
+
     # ── Onglet Journaux ────────────────────────────────────────────────────────
 
     def _tab_logs(self, nb: ttk.Notebook) -> None:
         tab = ttk.Frame(nb, padding=16)
         nb.add(tab, text="📋 Journaux")
 
-        ttk.Label(tab, text="Gestion des journaux d'activité",
+        ttk.Label(tab, text="Journaux d'activité et statistiques",
                   font=("Arial", 11, "bold")).pack(anchor=tk.W, pady=(0, 6))
 
+        # ── Statistiques de scan ───────────────────────────────────────────────
+        stats_frame = ttk.LabelFrame(tab, text="Statistiques de la session", padding=8)
+        stats_frame.pack(fill=tk.X, pady=(0, 8))
+
+        stats_var = tk.StringVar(value="Chargement…")
+        stats_lbl = ttk.Label(stats_frame, textvariable=stats_var,
+                               font=("Courier", 9), foreground="navy")
+        stats_lbl.pack(anchor=tk.W)
+
+        def _refresh_stats():
+            try:
+                s = self._get_scan_stats()
+                stats_var.set(
+                    f"Clés USB analysées  : {s['keys']}\n"
+                    f"Menaces détectées   : {s['threats']}"
+                )
+            except Exception as e:
+                stats_var.set(f"Erreur stats : {e}")
+
+        _refresh_stats()
+        ttk.Button(stats_frame, text="↺  Actualiser",
+                   command=_refresh_stats, width=14).pack(anchor=tk.W,
+                                                           pady=(6, 0))
+
+        # ── Tableau fichiers malveillants ──────────────────────────────────────
+        threat_frame = ttk.LabelFrame(
+            tab, text="Fichiers malveillants détectés (session courante)",
+            padding=8)
+        threat_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+
+        th_cols = ("ts", "file", "threat", "hash")
+        th_tree = ttk.Treeview(threat_frame, columns=th_cols, show="headings",
+                                height=6)
+        th_tree.heading("ts",     text="Horodatage")
+        th_tree.heading("file",   text="Fichier")
+        th_tree.heading("threat", text="Menace")
+        th_tree.heading("hash",   text="SHA-256")
+        th_tree.column("ts",     width=130, anchor=tk.W)
+        th_tree.column("file",   width=200, anchor=tk.W)
+        th_tree.column("threat", width=130, anchor=tk.W)
+        th_tree.column("hash",   width=280, anchor=tk.W,
+                        stretch=True)
+        th_sb = ttk.Scrollbar(threat_frame, orient=tk.VERTICAL,
+                               command=th_tree.yview)
+        th_tree.configure(yscrollcommand=th_sb.set)
+        th_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        th_sb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        def _refresh_threats():
+            for row in th_tree.get_children():
+                th_tree.delete(row)
+            try:
+                s = self._get_scan_stats()
+                for d in s["details"]:
+                    th_tree.insert("", tk.END, values=(
+                        d.get("ts",     ""),
+                        os.path.basename(d.get("file",   "")),
+                        d.get("threat", ""),
+                        d.get("hash",   "N/A"),
+                    ), tags=("threat",))
+                th_tree.tag_configure("threat", foreground="#8B0000")
+                if not s["details"]:
+                    th_tree.insert("", tk.END,
+                                   values=("—", "Aucune menace cette session",
+                                           "", ""))
+            except Exception as e:
+                th_tree.insert("", tk.END,
+                               values=("ERR", str(e), "", ""))
+
+        _refresh_threats()
+
+        def _export_threats_csv():
+            from tkinter import filedialog
+            try:
+                s = self._get_scan_stats()
+                if not s["details"]:
+                    messagebox.showinfo("Vide",
+                                        "Aucun fichier malveillant à exporter.",
+                                        parent=tab.winfo_toplevel())
+                    return
+                path = filedialog.asksaveasfilename(
+                    parent=tab.winfo_toplevel(),
+                    title="Exporter les menaces",
+                    defaultextension=".csv",
+                    filetypes=[("CSV", "*.csv"), ("Tous", "*.*")],
+                )
+                if not path:
+                    return
+                import csv
+                with open(path, "w", newline="", encoding="utf-8") as f:
+                    w = csv.DictWriter(
+                        f, fieldnames=["ts","file","threat","hash","dev"])
+                    w.writeheader()
+                    w.writerows(s["details"])
+                messagebox.showinfo("Export terminé",
+                                    f"Exporté : {path}",
+                                    parent=tab.winfo_toplevel())
+            except Exception as e:
+                messagebox.showerror("Erreur export",
+                                     str(e), parent=tab.winfo_toplevel())
+
+        th_btn_row = ttk.Frame(threat_frame)
+        th_btn_row.pack(side=tk.BOTTOM, fill=tk.X, pady=(4, 0))
+        ttk.Button(th_btn_row, text="↺  Actualiser",
+                   command=lambda: [_refresh_stats(), _refresh_threats()],
+                   width=14).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(th_btn_row, text="💾  Exporter CSV",
+                   command=_export_threats_csv,
+                   width=16).pack(side=tk.LEFT)
+
+        # ── Volumétrie des logs ────────────────────────────────────────────────
         from log_handler import get_log_size_info
         from config import LOG_FILE as _LOG_FILE
 
         self._log_size_var = tk.StringVar(value=get_log_size_info())
 
-        info_frame = ttk.LabelFrame(tab, text="Volumétrie", padding=8)
-        info_frame.pack(fill=tk.X, pady=(0, 10))
+        info_frame = ttk.LabelFrame(tab, text="Volumétrie des journaux", padding=8)
+        info_frame.pack(fill=tk.X, pady=(0, 8))
 
         r1 = ttk.Frame(info_frame); r1.pack(fill=tk.X)
         ttk.Label(r1, text="Fichier principal :").pack(side=tk.LEFT)
         ttk.Label(r1, text=_LOG_FILE,
-                  foreground="navy", font=("Courier", 9)).pack(side=tk.LEFT, padx=6)
-
+                  foreground="navy", font=("Courier", 9)).pack(side=tk.LEFT,
+                                                                padx=6)
         r2 = ttk.Frame(info_frame); r2.pack(fill=tk.X, pady=(4, 0))
         ttk.Label(r2, text="Taille totale :").pack(side=tk.LEFT)
         ttk.Label(r2, textvariable=self._log_size_var,
-                  foreground="navy", font=("Courier", 9)).pack(side=tk.LEFT, padx=6)
+                  foreground="navy", font=("Courier", 9)).pack(side=tk.LEFT,
+                                                                padx=6)
 
         def _refresh_size():
             from log_handler import get_log_size_info
             self._log_size_var.set(get_log_size_info())
 
         ttk.Button(info_frame, text="↺  Actualiser",
-                   command=_refresh_size, width=14).pack(anchor=tk.W, pady=(6, 0))
+                   command=_refresh_size, width=14).pack(anchor=tk.W,
+                                                          pady=(6, 0))
         ttk.Label(info_frame,
                   text="Rotation : fichiers 5 Mo max, 5 archives.",
-                  foreground="#666", font=("Arial", 8)).pack(anchor=tk.W, pady=(4, 0))
+                  foreground="#666", font=("Arial", 8)).pack(anchor=tk.W,
+                                                              pady=(4, 0))
 
-        # Export
-        export_frame = ttk.LabelFrame(tab, text="Export vers support externe", padding=8)
-        export_frame.pack(fill=tk.X, pady=(0, 10))
+        # ── Export / Purge ─────────────────────────────────────────────────────
+        export_frame = ttk.LabelFrame(tab, text="Export vers support externe",
+                                      padding=8)
+        export_frame.pack(fill=tk.X, pady=(0, 8))
 
         ttk.Label(export_frame,
                   text="Monte une clé USB en écriture, ouvre un sélecteur\n"
@@ -1039,7 +1416,6 @@ class AdminPanel:
         ttk.Button(export_frame, text="💾  Exporter les logs vers USB",
                    command=_do_export, width=32).pack(anchor=tk.W)
 
-        # Purge
         purge_frame = ttk.LabelFrame(tab, text="Purge des logs", padding=8)
         purge_frame.pack(fill=tk.X)
 
