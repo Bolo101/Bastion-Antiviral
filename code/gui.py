@@ -92,10 +92,23 @@ class VirusScannerGUI:
         self._anim_phase    = 0.0
         self._anim_state    = "idle"   # idle | scanning | ok | threat
 
+        # ── Auto-actualisation USB ─────────────────────────────────────────────
+        self._auto_refresh_id: Optional[str] = None
+
+        # ── Statistiques cumulées (toutes sessions) ───────────────────────────
+        self._total_keys_scanned: int       = 0   # nombre de clés USB analysées
+        self._cumul_threats:      int       = 0   # menaces cumulées toutes sessions
+        self._threat_details:     List[dict] = []  # [{file, hash, threat, ts}]
+
         # ── Visionneuse PDF ───────────────────────────────────────────────────
         self._pdf_viewer:   Optional[PdfViewer] = None
         self._pdf_tk_image: Optional[object]    = None   # référence anti-GC
         self._pdf_canvas:   Optional[tk.Canvas]  = None
+
+        # ── Répertoire PDF ────────────────────────────────────────────────────
+        self._pdf_dir = os.path.normpath(
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pdf")
+        )
 
         if os.geteuid() != 0:
             messagebox.showerror("Droits insuffisants",
@@ -105,7 +118,7 @@ class VirusScannerGUI:
 
         self._build_ui()
         self._refresh_status()
-        self._refresh_usb()
+        self._start_auto_refresh()
         self._init_pdf_viewer()
         self.root.protocol("WM_DELETE_WINDOW", self._request_admin)
 
@@ -227,23 +240,6 @@ class VirusScannerGUI:
         self.usb_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         usb_sb.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # ── Boutons en ligne sous le tableau ──────────────────────────────────
-        btn_row = tk.Frame(outer, bg=self.CARD, padx=6, pady=4)
-        btn_row.pack(fill=tk.X)
-        btn_row.columnconfigure(0, weight=1)
-        btn_row.columnconfigure(1, weight=1)
-        btn_row.columnconfigure(2, weight=1)
-        for col, (txt, cmd, color) in enumerate([
-            ("↺  Actualiser", self._refresh_usb,  self.TOPBAR),
-            ("▲  Monter",     self._mount_usb,    "#1a4a1a"),
-            ("▼  Démonter",   self._umount_usb,   "#3a1a00"),
-        ]):
-            tk.Button(btn_row, text=txt, command=cmd,
-                      bg=color, fg=self.FG, relief=tk.FLAT,
-                      font=("Arial", 9, "bold"), pady=8,
-                      cursor="hand2").grid(row=0, column=col,
-                                           sticky=tk.EW, padx=2)
-
         # ── Info périphérique sélectionné ─────────────────────────────────────
         self.usb_info_var = tk.StringVar(value="")
         tk.Label(outer, textvariable=self.usb_info_var,
@@ -339,6 +335,33 @@ class VirusScannerGUI:
         self.scanned_var  = tk.StringVar(value="")
         self.infected_var = tk.StringVar(value="")
 
+        # ── Zone logo ──────────────────────────────────────────────────────────
+        logo_frame = tk.Frame(parent, bg=self.CARD, bd=1, relief=tk.SOLID,
+                              height=88)
+        logo_frame.pack(fill=tk.X, pady=(0, 4))
+        logo_frame.pack_propagate(False)
+
+        logo_path = os.path.normpath(
+            os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "..", "img", "logo.png"))
+        self._logo_img: Optional[tk.PhotoImage] = None
+        try:
+            img = tk.PhotoImage(file=logo_path)
+            iw, ih = img.width(), img.height()
+            max_h = 76
+            if ih > max_h:
+                factor = max(1, ih // max_h)
+                img = img.subsample(factor, factor)
+            self._logo_img = img
+            tk.Label(logo_frame, image=self._logo_img,
+                     bg=self.CARD).pack(expand=True)
+        except Exception:
+            tk.Label(logo_frame,
+                     text="🛡  USB Antivirus",
+                     bg=self.CARD, fg="#3a6498",
+                     font=("Arial", 13, "bold italic")).pack(expand=True)
+
+        # ── Entête journal ─────────────────────────────────────────────────────
         hdr = tk.Frame(parent, bg=self.BG)
         hdr.pack(fill=tk.X, pady=(0, 4))
         tk.Label(hdr, text="  Journal",
@@ -456,6 +479,12 @@ class VirusScannerGUI:
         """Navigation manuelle : page / document précédent."""
         if self._pdf_viewer:
             self._pdf_viewer.prev_page()
+
+    def _pdf_viewer_reload(self) -> None:
+        """Redémarre le cycle PDF (appelé après ajout/suppression de PDFs)."""
+        if self._pdf_viewer:
+            self._pdf_viewer.stop()
+        self.root.after(300, self._init_pdf_viewer)
 
     # ══════════════════════════════════════════════════════════════════════════
     # Helpers UI
@@ -632,6 +661,13 @@ class VirusScannerGUI:
                 self.usb_tree.selection_add(dev)
             except Exception:
                 pass
+
+    # ── Actualisation automatique toutes les secondes ─────────────────────────
+
+    def _start_auto_refresh(self) -> None:
+        """Lance la boucle d'actualisation automatique USB (toutes les 1 s)."""
+        self._refresh_usb()
+        self._auto_refresh_id = self.root.after(1000, self._start_auto_refresh)
 
     def _on_usb_tap(self, event: tk.Event) -> str:
         """
@@ -911,14 +947,15 @@ class VirusScannerGUI:
         self._per_dev_scanned.pop(dev, None)
         self._per_dev_infected.pop(dev, None)
         if result:
-            # Recalculer les totaux globaux depuis les valeurs exactes
-            # (les estimations per_dev sont retirées, on ajoute result.scanned/infected)
             self._total_scanned  = (
                 sum(self._per_dev_scanned.values()) + result.scanned
             )
             self._total_infected = (
                 sum(self._per_dev_infected.values()) + result.infected
             )
+
+        # ── Compteurs globaux ─────────────────────────────────────────────────
+        self._total_keys_scanned += 1
 
         if result:
             tag  = "threat" if result.infected > 0 else "ok"
@@ -928,6 +965,34 @@ class VirusScannerGUI:
                 f"{result.infected} menace(s)  ({result.duration:.1f}s)",
                 tag
             )
+            # ── Enregistrement des détails de menaces avec hash SHA-256 ───────
+            threats = getattr(result, "threats", []) or []
+            if threats:
+                import hashlib as _hl
+                ts = time.strftime("%Y-%m-%d %H:%M:%S")
+                for item in threats:
+                    # item peut être (filepath, threat_name) ou juste filepath
+                    if isinstance(item, (list, tuple)) and len(item) >= 2:
+                        fpath, tname = str(item[0]), str(item[1])
+                    else:
+                        fpath, tname = str(item), "inconnu"
+                    sha = "N/A"
+                    try:
+                        h = _hl.sha256()
+                        with open(fpath, "rb") as _f:
+                            for chunk in iter(lambda: _f.read(65536), b""):
+                                h.update(chunk)
+                        sha = h.hexdigest()
+                    except Exception:
+                        pass
+                    self._threat_details.append({
+                        "ts":     ts,
+                        "file":   fpath,
+                        "threat": tname,
+                        "hash":   sha,
+                        "dev":    dev,
+                    })
+                    self._cumul_threats += 1
         else:
             self._log(f"❌ {dev} : erreur durant le scan.", "threat")
 
@@ -1122,6 +1187,15 @@ class VirusScannerGUI:
             # Support exhaustif
             get_usb_partitions        = lambda: self._usb_partitions,
             refresh_usb               = self._refresh_usb,
+            # PDFs
+            pdf_dir                   = self._pdf_dir,
+            on_pdf_reload_viewer      = self._pdf_viewer_reload,
+            # Statistiques pour onglet Journaux
+            get_scan_stats            = lambda: {
+                "keys":    self._total_keys_scanned,
+                "threats": self._cumul_threats,
+                "details": list(self._threat_details),
+            },
         )
         panel.show()
 
@@ -1483,6 +1557,8 @@ class VirusScannerGUI:
                 eng.request_stop()
         if self._anim_after_id:
             self.root.after_cancel(self._anim_after_id)
+        if self._auto_refresh_id:
+            self.root.after_cancel(self._auto_refresh_id)
         if self._pdf_viewer:
             self._pdf_viewer.stop()
         self.usb.umount_all()
