@@ -26,10 +26,25 @@ from config import ADMIN_CFG_DIR, ADMIN_CFG_PATH
 
 DEFAULT_CODE    = "0000"
 MIN_CODE_LENGTH = 4
-FRESHCLAM_CMD   = (
-    "freshclam --datadir=/var/lib/clamav "
-    ">> /var/log/virusscanner_auto.log 2>&1"
-)
+
+# ── Commandes planifiées ──────────────────────────────────────────────────────
+FRESHCLAM_CMD    = ("freshclam --datadir=/var/lib/clamav "
+                    ">> /var/log/virusscanner_auto.log 2>&1")
+THIRDPARTY_CMD   = ("python3 -c \"from db_manager import DBManager; "
+                    "DBManager(None).download_third_party_sigs()\" "
+                    ">> /var/log/virusscanner_auto.log 2>&1")
+AVAST_UPDATE_CMD = ("avast update "
+                    ">> /var/log/virusscanner_auto.log 2>&1")
+YARA_UPDATE_CMD  = ("python3 -c \"from db_manager import DBManager; "
+                    "DBManager(None).update_yara_online()\" "
+                    ">> /var/log/virusscanner_auto.log 2>&1")
+
+_CRON_TASKS: dict = {
+    "clamav":     ("# virusscanner_clamav",     FRESHCLAM_CMD),
+    "thirdparty": ("# virusscanner_thirdparty",  THIRDPARTY_CMD),
+    "avast":      ("# virusscanner_avast",       AVAST_UPDATE_CMD),
+    "yara":       ("# virusscanner_yara",        YARA_UPDATE_CMD),
+}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -84,25 +99,48 @@ class AdminAuthManager:
         except Exception as e:
             return False, f"Erreur lors de la sauvegarde : {e}"
 
-    _CRON_TAG = "# virusscanner_auto"
+    _CRON_TAG = "# virusscanner_auto"   # tag legacy (compatibilité)
 
     def get_cron_schedule(self) -> Optional[str]:
+        """Retourne la planification ClamAV (legacy, pour compatibilité)."""
+        return self.get_cron_task("clamav")
+
+    def get_cron_task(self, task: str) -> Optional[str]:
+        """Retourne l'expression cron d'une tâche, ou None si désactivée."""
+        tag = _CRON_TASKS.get(task, (None, None))[0]
+        if not tag:
+            return None
         try:
             r = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
             for line in r.stdout.splitlines():
-                if self._CRON_TAG in line:
-                    return line.replace(self._CRON_TAG, "").strip()
+                if tag in line:
+                    return line.split(tag)[0].strip()
         except Exception:
             pass
         return None
 
+    def get_all_cron_tasks(self) -> dict:
+        """Retourne un dict {task_key: cron_expr_or_None} pour toutes les tâches."""
+        return {key: self.get_cron_task(key) for key in _CRON_TASKS}
+
     def set_cron_schedule(self, cron_expr: Optional[str]) -> Tuple[bool, str]:
+        """Définit la planification ClamAV (legacy, pour compatibilité)."""
+        return self.set_cron_task("clamav", cron_expr)
+
+    def set_cron_task(self, task: str, cron_expr: Optional[str]) -> Tuple[bool, str]:
+        """Définit ou supprime la planification d'une tâche."""
+        entry = _CRON_TASKS.get(task)
+        if not entry:
+            return False, f"Tâche inconnue : {task}"
+        tag, cmd = entry
         try:
             r        = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
             existing = r.stdout if r.returncode == 0 else ""
-            lines    = [l for l in existing.splitlines() if self._CRON_TAG not in l]
+            # Supprimer aussi l'éventuelle entrée legacy
+            lines    = [l for l in existing.splitlines()
+                        if tag not in l and self._CRON_TAG not in l]
             if cron_expr:
-                lines.append(f"{cron_expr} {FRESHCLAM_CMD} {self._CRON_TAG}")
+                lines.append(f"{cron_expr} {cmd} {tag}")
             new_cron = "\n".join(lines) + "\n"
             proc = subprocess.run(["crontab", "-"], input=new_cron,
                                    capture_output=True, text=True)
@@ -267,14 +305,9 @@ class AdminPanel:
     def _open(self) -> None:
         dlg = tk.Toplevel(self._parent)
         dlg.title("⚙  Panneau d'administration")
-        dlg.resizable(True, True)
+        dlg.attributes("-fullscreen", True)
         dlg.grab_set()
         dlg.transient(self._parent)
-
-        w, h = 700, 580
-        px = self._parent.winfo_rootx() + (self._parent.winfo_width()  - w) // 2
-        py = self._parent.winfo_rooty() + (self._parent.winfo_height() - h) // 2
-        dlg.geometry(f"{w}x{h}+{px}+{py}")
 
         nb = ttk.Notebook(dlg)
         nb.pack(fill=tk.BOTH, expand=True, padx=10, pady=8)
@@ -291,7 +324,9 @@ class AdminPanel:
         self._tab_poweroff(nb, dlg)
         self._tab_quit(nb, dlg)
 
-        ttk.Button(dlg, text="Fermer", command=dlg.destroy).pack(pady=6)
+        ttk.Button(dlg, text="✕  Fermer le panneau",
+                   command=dlg.destroy,
+                   width=30).pack(pady=8, ipady=4)
 
     # ── Onglet Moteurs ────────────────────────────────────────────────────────
 
@@ -310,7 +345,7 @@ class AdminPanel:
             eng_frm,
             text="Sélectionnez les moteurs utilisés lors des analyses.\n"
                  "Les moteurs non installés ou non licenciés sont automatiquement désactivés.",
-            foreground="#555"
+            foreground="#bbbbbb"
         ).pack(anchor=tk.W, pady=(0, 8))
 
         chk_row = ttk.Frame(eng_frm)
@@ -343,7 +378,7 @@ class AdminPanel:
             del_frm,
             text="⚠  DANGER — Activez uniquement si vous voulez que les fichiers\n"
                  "    infectés soient supprimés DÉFINITIVEMENT et automatiquement.",
-            foreground="#8B0000"
+            foreground="#ff6b6b"
         ).pack(anchor=tk.W, pady=(0, 6))
 
         ttk.Checkbutton(
@@ -373,7 +408,7 @@ class AdminPanel:
 
         summary_var = tk.StringVar()
         ttk.Label(tab, textvariable=summary_var,
-                  foreground="navy", font=("Courier", 9)).pack(anchor=tk.W, pady=4)
+                  foreground="#7ec8e3", font=("Courier", 9)).pack(anchor=tk.W, pady=4)
         ttk.Button(tab, text="↺  Actualiser le résumé",
                    command=_refresh_summary, width=24).pack(anchor=tk.W)
         _refresh_summary()
@@ -412,8 +447,8 @@ class AdminPanel:
         )
         style.configure(
             "Usb.Treeview.Heading",
-            background="#d9d9d9",
-            foreground="#000000",
+            background="#1e2a4a",
+            foreground="#e0e0e0",
             font=("Arial", 9, "bold"),
             relief="raised"
         )
@@ -451,10 +486,10 @@ class AdminPanel:
             tree.heading(cid, text=heading)
             tree.column(cid, width=width, minwidth=40, anchor=tk.W)
 
-        tree.tag_configure("system",  background="#fff3cd", foreground="#856404")
-        tree.tag_configure("mounted", background="#e6f4ea", foreground="#000000")
-        tree.tag_configure("unmount", background="#f0f0f0", foreground="#000000")
-        tree.tag_configure("disk",    background="#e8eaf6", foreground="#333333")
+        tree.tag_configure("system",  background="#3a2e00", foreground="#ffd666")
+        tree.tag_configure("mounted", background="#0d3320", foreground="#88e0a0")
+        tree.tag_configure("unmount", background="#1e1e2e", foreground="#a0a0c0")
+        tree.tag_configure("disk",    background="#1a1a3e", foreground="#9090d0")
 
         sb = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=tree.yview)
         tree.configure(yscrollcommand=sb.set)
@@ -466,7 +501,7 @@ class AdminPanel:
             tab,
             textvariable=detail_var,
             font=("Courier", 8),
-            foreground="navy",
+            foreground="#7ec8e3",
             wraplength=660,
             justify=tk.LEFT
         ).pack(anchor=tk.W, pady=4)
@@ -637,10 +672,10 @@ class AdminPanel:
         legend = ttk.Frame(tab)
         legend.pack(anchor=tk.W, pady=(2, 0))
         for color, text in [
-            ("#856404", "⚙ Disque système"),
-            ("#2e7d32", "✅ Monté"),
-            ("#555555", "⏏ Non monté"),
-            ("#3949ab", "💾 Disque physique"),
+            ("#ffd666", "⚙ Disque système"),
+            ("#88e0a0", "✅ Monté"),
+            ("#a0a0c0", "⏏ Non monté"),
+            ("#9090d0", "💾 Disque physique"),
         ]:
             ttk.Label(
                 legend,
@@ -694,7 +729,7 @@ class AdminPanel:
             text="• En ligne : freshclam contacte les serveurs ClamAV (Internet requis).\n"
                  "• Hors-ligne : copiez main.cvd, daily.cvd et bytecode.cvd\n"
                  "  à la racine d'une clé USB (source : database.clamav.net).",
-            justify=tk.LEFT, foreground="#444"
+            justify=tk.LEFT, foreground="#cccccc"
         ).pack(anchor=tk.W, pady=(0, 8))
 
         row1 = ttk.Frame(tab)
@@ -712,7 +747,7 @@ class AdminPanel:
             tab,
             text="• URLhaus (abuse.ch), Sanesecurity, InterServer\n"
                  "  Installés dans /var/lib/clamav/ — Internet requis.",
-            justify=tk.LEFT, foreground="#444"
+            justify=tk.LEFT, foreground="#cccccc"
         ).pack(anchor=tk.W, pady=(0, 8))
 
         row2 = ttk.Frame(tab)
@@ -736,7 +771,7 @@ class AdminPanel:
 
         self._avast_status_var = tk.StringVar(value="Vérification…")
         ttk.Label(status_frame, textvariable=self._avast_status_var,
-                  foreground="navy", font=("Courier", 9)).pack(anchor=tk.W)
+                  foreground="#7ec8e3", font=("Courier", 9)).pack(anchor=tk.W)
         ttk.Button(status_frame, text="↺  Actualiser",
                    command=self._refresh_avast_status_display,
                    width=20).pack(anchor=tk.W, pady=(4, 0))
@@ -755,7 +790,7 @@ class AdminPanel:
                  "  2. Ajout du dépôt APT avast\n"
                  "  3. apt-get install avast\n"
                  "  4. Activation du service systemd",
-            justify=tk.LEFT, foreground="#444"
+            justify=tk.LEFT, foreground="#cccccc"
         ).pack(anchor=tk.W, pady=(0, 6))
 
         install_row = ttk.Frame(install_frame)
@@ -772,7 +807,7 @@ class AdminPanel:
                  "  echo 'deb https://repo.avcdn.net/linux stable avast' "
                  "| tee /etc/apt/sources.list.d/avast.list\n"
                  "  apt-get update && apt-get install avast",
-            justify=tk.LEFT, foreground="#666",
+            justify=tk.LEFT, foreground="#aaaaaa",
             font=("Courier", 7)
         ).pack(anchor=tk.W, pady=(6, 0))
 
@@ -782,7 +817,7 @@ class AdminPanel:
 
         ttk.Label(lic_frame,
                   text="A — Code d'activation (Internet requis) :",
-                  foreground="#444").grid(row=0, column=0, columnspan=3,
+                  foreground="#cccccc").grid(row=0, column=0, columnspan=3,
                                           sticky=tk.W, pady=(0, 4))
 
         code_var  = tk.StringVar()
@@ -807,7 +842,7 @@ class AdminPanel:
 
         ttk.Label(lic_frame,
                   text="B — Fichier .avastlic depuis USB :",
-                  foreground="#444").grid(row=3, column=0, columnspan=3,
+                  foreground="#cccccc").grid(row=3, column=0, columnspan=3,
                                           sticky=tk.W, pady=(0, 4))
         ttk.Button(lic_frame, text="🔌  Import depuis USB",
                    command=self._cb["avast_license_usb"],
@@ -818,12 +853,12 @@ class AdminPanel:
 
         ttk.Label(lic_frame,
                   text="C — Fichier .avastlic depuis le système :",
-                  foreground="#444").grid(row=6, column=0, columnspan=3,
+                  foreground="#cccccc").grid(row=6, column=0, columnspan=3,
                                           sticky=tk.W, pady=(0, 4))
 
         self._avast_lic_path_var = tk.StringVar(value="Aucun fichier sélectionné")
         ttk.Label(lic_frame, textvariable=self._avast_lic_path_var,
-                  foreground="navy", font=("Courier", 8),
+                  foreground="#7ec8e3", font=("Courier", 8),
                   wraplength=360).grid(row=7, column=0, columnspan=2,
                                        sticky=tk.W, pady=2)
 
@@ -867,7 +902,7 @@ class AdminPanel:
         ttk.Label(vps_frame,
                   text="• En ligne : Avast télécharge la dernière VPS.\n"
                        "• Hors-ligne : copiez un fichier .vps/.vpz sur une clé USB.",
-                  foreground="#444").pack(anchor=tk.W, pady=(0, 6))
+                  foreground="#cccccc").pack(anchor=tk.W, pady=(0, 6))
 
         vps_row = ttk.Frame(vps_frame)
         vps_row.pack(anchor=tk.W)
@@ -923,7 +958,7 @@ class AdminPanel:
                  "  Connexion Internet requise — ~30 Mo.\n"
                  "• Hors-ligne : placez des fichiers .yar/.yara ou un .zip\n"
                  "  contenant des règles à la racine d'une clé USB.",
-            justify=tk.LEFT, foreground="#444"
+            justify=tk.LEFT, foreground="#cccccc"
         ).pack(anchor=tk.W, pady=(0, 12))
 
         row = ttk.Frame(tab)
@@ -941,59 +976,121 @@ class AdminPanel:
 
         auth = self._auth
 
-        ttk.Label(tab, text="Mise à jour automatique ClamAV (crontab)",
-                  font=("Arial", 11, "bold")).pack(anchor=tk.W, pady=(0, 8))
+        ttk.Label(tab,
+                  text="Mise à jour automatique (crontab)",
+                  font=("Arial", 11, "bold")).pack(anchor=tk.W, pady=(0, 4))
+        ttk.Label(tab,
+                  text="Configurez indépendamment chaque tâche de mise à jour.\n"
+                       "Chaque tâche possède sa propre fréquence et son heure d'exécution.",
+                  foreground="#cccccc").pack(anchor=tk.W, pady=(0, 10))
 
-        current = auth.get_cron_schedule()
-        cur_var = tk.StringVar(
-            value=f"Actuelle : {current}" if current else "Aucune planification active"
-        )
-        ttk.Label(tab, textvariable=cur_var, foreground="navy").pack(anchor=tk.W, pady=4)
-        ttk.Separator(tab, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=8)
+        ttk.Separator(tab, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(0, 10))
 
-        freq_var = tk.StringVar(value="daily")
-        row1 = ttk.Frame(tab); row1.pack(anchor=tk.W)
-        ttk.Label(row1, text="Fréquence :").pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Radiobutton(row1, text="Quotidienne",
-                        variable=freq_var, value="daily").pack(side=tk.LEFT, padx=4)
-        ttk.Radiobutton(row1, text="Hebdomadaire (lundi)",
-                        variable=freq_var, value="weekly").pack(side=tk.LEFT, padx=4)
+        _TASK_LABELS = [
+            ("clamav",      "🛡  ClamAV",             "freshclam — base de signatures virale"),
+            ("thirdparty",  "🌐  Signatures tierces",  "URLhaus, Sanesecurity, InterServer…"),
+            ("avast",       "🔐  Avast VPS",           "Base de définitions Avast Business"),
+            ("yara",        "🔍  YARA",                "Règles signature-base (Florian Roth / GitHub)"),
+        ]
 
-        hour_var = tk.StringVar(value="2")
-        row2 = ttk.Frame(tab); row2.pack(anchor=tk.W, pady=6)
-        ttk.Label(row2, text="Heure (0-23) :").pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Spinbox(row2, from_=0, to=23, textvariable=hour_var,
-                    width=5, format="%02.0f").pack(side=tk.LEFT)
+        current_schedules = auth.get_all_cron_tasks()
 
-        status_var = tk.StringVar()
-        status_lbl = ttk.Label(tab, textvariable=status_var, wraplength=420)
-        status_lbl.pack(pady=6)
+        # Canvas + scrollbar pour que les 4 cadres tiennent en plein écran
+        canvas_frame = ttk.Frame(tab)
+        canvas_frame.pack(fill=tk.BOTH, expand=True)
+        scroll_canvas = tk.Canvas(canvas_frame, highlightthickness=0)
+        vsb = ttk.Scrollbar(canvas_frame, orient=tk.VERTICAL,
+                             command=scroll_canvas.yview)
+        scroll_canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        scroll_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        def _apply():
-            try:
-                h = int(hour_var.get())
-                assert 0 <= h <= 23
-            except Exception:
-                messagebox.showerror("Valeur invalide", "Heure entre 0 et 23.",
-                                     parent=tab.winfo_toplevel())
-                return
-            expr = f"0 {h} * * *" if freq_var.get() == "daily" else f"0 {h} * * 1"
-            ok, msg = auth.set_cron_schedule(expr)
-            status_lbl.configure(foreground="green" if ok else "red")
-            status_var.set(("✅ " if ok else "❌ ") + msg)
-            if ok:
-                cur_var.set(f"Actuelle : {expr}")
+        inner = ttk.Frame(scroll_canvas)
+        win_id = scroll_canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda e: (
+            scroll_canvas.configure(scrollregion=scroll_canvas.bbox("all")),
+            scroll_canvas.itemconfig(win_id, width=scroll_canvas.winfo_width())
+        ))
+        scroll_canvas.bind("<Configure>",
+                           lambda e: scroll_canvas.itemconfig(win_id, width=e.width))
 
-        def _remove():
-            ok, msg = auth.set_cron_schedule(None)
-            status_lbl.configure(foreground="green" if ok else "red")
-            status_var.set(("✅ " if ok else "❌ ") + msg)
-            if ok:
-                cur_var.set("Aucune planification active")
+        for task_key, task_name, task_desc in _TASK_LABELS:
+            current = current_schedules.get(task_key)
 
-        row3 = ttk.Frame(tab); row3.pack(anchor=tk.W, pady=4)
-        ttk.Button(row3, text="✓ Appliquer",  command=_apply,  width=16).pack(side=tk.LEFT, padx=4)
-        ttk.Button(row3, text="🗑 Supprimer", command=_remove, width=16).pack(side=tk.LEFT, padx=4)
+            frm = ttk.LabelFrame(inner,
+                                  text=f"{task_name}  —  {task_desc}",
+                                  padding=10)
+            frm.pack(fill=tk.X, pady=(0, 12), padx=4)
+
+            cur_text = (f"Planification active : {current}"
+                        if current else "⏸  Désactivée")
+            cur_var = tk.StringVar(value=cur_text)
+            ttk.Label(frm, textvariable=cur_var,
+                      foreground="#7ec8e3").pack(anchor=tk.W, pady=(0, 6))
+
+            ctrl_row = ttk.Frame(frm)
+            ctrl_row.pack(anchor=tk.W)
+
+            ttk.Label(ctrl_row, text="Fréquence :").pack(side=tk.LEFT, padx=(0, 6))
+            freq_var = tk.StringVar(value="daily")
+            ttk.Radiobutton(ctrl_row, text="Quotidienne",
+                            variable=freq_var, value="daily").pack(side=tk.LEFT, padx=4)
+            ttk.Radiobutton(ctrl_row, text="Hebdomadaire (lundi)",
+                            variable=freq_var, value="weekly").pack(side=tk.LEFT, padx=4)
+            ttk.Label(ctrl_row, text="  Heure (0-23) :").pack(side=tk.LEFT, padx=(10, 4))
+            hour_var = tk.StringVar(value="2")
+            ttk.Spinbox(ctrl_row, from_=0, to=23, textvariable=hour_var,
+                        width=5, format="%02.0f").pack(side=tk.LEFT)
+
+            if current:
+                parts = current.split()
+                if len(parts) >= 2:
+                    try:
+                        hour_var.set(str(int(parts[1])))
+                    except ValueError:
+                        pass
+                if len(parts) >= 5 and parts[4] == "1":
+                    freq_var.set("weekly")
+
+            sv = tk.StringVar()
+            sl = ttk.Label(frm, textvariable=sv, wraplength=560)
+            sl.pack(anchor=tk.W, pady=(4, 0))
+
+            def _make_apply(tk=task_key, fv=freq_var, hv=hour_var,
+                             cv=cur_var, sv=sv, sl=sl):
+                def _apply():
+                    try:
+                        h = int(hv.get())
+                        assert 0 <= h <= 23
+                    except Exception:
+                        sv.set("❌ Heure invalide (0-23)")
+                        sl.configure(foreground="#ff6b6b")
+                        return
+                    expr = f"0 {h} * * *" if fv.get() == "daily" else f"0 {h} * * 1"
+                    ok, msg = auth.set_cron_task(tk, expr)
+                    sl.configure(foreground="#66cc66" if ok else "#ff6b6b")
+                    sv.set(("✅ " if ok else "❌ ") + msg)
+                    if ok:
+                        cv.set(f"Planification active : {expr}")
+                return _apply
+
+            def _make_remove(tk=task_key, cv=cur_var, sv=sv, sl=sl):
+                def _remove():
+                    ok, msg = auth.set_cron_task(tk, None)
+                    sl.configure(foreground="#66cc66" if ok else "#ff6b6b")
+                    sv.set(("✅ " if ok else "❌ ") + msg)
+                    if ok:
+                        cv.set("⏸  Désactivée")
+                return _remove
+
+            btn_row = ttk.Frame(frm)
+            btn_row.pack(anchor=tk.W, pady=(6, 0))
+            ttk.Button(btn_row, text="✓ Appliquer",
+                       command=_make_apply(),
+                       width=16).pack(side=tk.LEFT, padx=(0, 6))
+            ttk.Button(btn_row, text="🗑 Désactiver",
+                       command=_make_remove(),
+                       width=16).pack(side=tk.LEFT)
 
     # ── Onglet PDFs ────────────────────────────────────────────────────────────
 
@@ -1026,7 +1123,7 @@ class AdminPanel:
 
         status_var = tk.StringVar()
         ttk.Label(tab, textvariable=status_var,
-                  foreground="navy", wraplength=520).pack(anchor=tk.W, pady=2)
+                  foreground="#7ec8e3", wraplength=520).pack(anchor=tk.W, pady=2)
 
         def _refresh_list():
             for row in tree.get_children():
@@ -1109,7 +1206,7 @@ class AdminPanel:
 
         usb_status_var = tk.StringVar()
         ttk.Label(usb_frame, textvariable=usb_status_var,
-                  foreground="navy", font=("Courier", 8)).pack(anchor=tk.W)
+                  foreground="#7ec8e3", font=("Courier", 8)).pack(anchor=tk.W)
 
         def _refresh_usb_combo():
             parts = self._get_usb_partitions()
@@ -1197,7 +1294,7 @@ class AdminPanel:
         ttk.Label(r4, text="4. Téléverser :", width=16).pack(side=tk.LEFT)
         import_status_var = tk.StringVar()
         ttk.Label(usb_frame, textvariable=import_status_var,
-                  foreground="green").pack(anchor=tk.W)
+                  foreground="#66cc66").pack(anchor=tk.W)
 
         def _import_selected():
             sel = usb_tree.selection()
@@ -1263,7 +1360,7 @@ class AdminPanel:
 
         stats_var = tk.StringVar(value="Chargement…")
         stats_lbl = ttk.Label(stats_frame, textvariable=stats_var,
-                               font=("Courier", 9), foreground="navy")
+                               font=("Courier", 9), foreground="#7ec8e3")
         stats_lbl.pack(anchor=tk.W)
 
         def _refresh_stats():
@@ -1317,7 +1414,7 @@ class AdminPanel:
                         d.get("threat", ""),
                         d.get("hash",   "N/A"),
                     ), tags=("threat",))
-                th_tree.tag_configure("threat", foreground="#8B0000")
+                th_tree.tag_configure("threat", foreground="#ff6b6b")
                 if not s["details"]:
                     th_tree.insert("", tk.END,
                                    values=("—", "Aucune menace cette session",
@@ -1379,12 +1476,12 @@ class AdminPanel:
         r1 = ttk.Frame(info_frame); r1.pack(fill=tk.X)
         ttk.Label(r1, text="Fichier principal :").pack(side=tk.LEFT)
         ttk.Label(r1, text=_LOG_FILE,
-                  foreground="navy", font=("Courier", 9)).pack(side=tk.LEFT,
+                  foreground="#7ec8e3", font=("Courier", 9)).pack(side=tk.LEFT,
                                                                 padx=6)
         r2 = ttk.Frame(info_frame); r2.pack(fill=tk.X, pady=(4, 0))
         ttk.Label(r2, text="Taille totale :").pack(side=tk.LEFT)
         ttk.Label(r2, textvariable=self._log_size_var,
-                  foreground="navy", font=("Courier", 9)).pack(side=tk.LEFT,
+                  foreground="#7ec8e3", font=("Courier", 9)).pack(side=tk.LEFT,
                                                                 padx=6)
 
         def _refresh_size():
@@ -1396,7 +1493,7 @@ class AdminPanel:
                                                           pady=(6, 0))
         ttk.Label(info_frame,
                   text="Rotation : fichiers 5 Mo max, 5 archives.",
-                  foreground="#666", font=("Arial", 8)).pack(anchor=tk.W,
+                  foreground="#aaaaaa", font=("Arial", 8)).pack(anchor=tk.W,
                                                               pady=(4, 0))
 
         # ── Export / Purge ─────────────────────────────────────────────────────
@@ -1407,7 +1504,7 @@ class AdminPanel:
         ttk.Label(export_frame,
                   text="Monte une clé USB en écriture, ouvre un sélecteur\n"
                        "de dossier, copie les logs, puis démonte le support.",
-                  foreground="#444").pack(anchor=tk.W, pady=(0, 6))
+                  foreground="#cccccc").pack(anchor=tk.W, pady=(0, 6))
 
         def _do_export():
             self._cb["export_logs_usb"]()
@@ -1421,7 +1518,7 @@ class AdminPanel:
 
         ttk.Label(purge_frame,
                   text="⚠  Supprime définitivement tous les fichiers de log.",
-                  foreground="#8B0000").pack(anchor=tk.W, pady=(0, 6))
+                  foreground="#ff6b6b").pack(anchor=tk.W, pady=(0, 6))
 
         def _do_purge():
             if not messagebox.askyesno(
@@ -1468,7 +1565,7 @@ class AdminPanel:
 
         def _apply():
             ok, msg = auth.change_code(svars[0].get(), svars[1].get(), svars[2].get())
-            status_lbl.configure(foreground="green" if ok else "red")
+            status_lbl.configure(foreground="#66cc66" if ok else "red")
             status_var.set(("✅ " if ok else "❌ ") + msg)
             if ok:
                 for sv in svars:
@@ -1480,7 +1577,7 @@ class AdminPanel:
         if auth.is_default_code():
             ttk.Label(tab,
                       text="⚠  Code par défaut (0000) – changez-le maintenant !",
-                      foreground="red",
+                      foreground="#ff6b6b",
                       font=("Arial", 9, "bold")).grid(
                 row=6, column=0, columnspan=2, pady=4)
 
@@ -1499,7 +1596,7 @@ class AdminPanel:
                  "• L'application est fermée.\n"
                  "• La commande 'poweroff' est exécutée.\n\n"
                  "⚠  Assurez-vous d'avoir sauvegardé votre travail.",
-            justify=tk.LEFT, foreground="#444"
+            justify=tk.LEFT, foreground="#cccccc"
         ).pack(anchor=tk.W, pady=(0, 16))
 
         def _do():
