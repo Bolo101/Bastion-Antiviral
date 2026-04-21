@@ -24,7 +24,6 @@ set -euo pipefail
 ISO_NAME="$(pwd)/usb-antivirus-scanner-v1.0.iso"
 WORK_DIR="$(pwd)/debian-live-build"
 CODE_DIR="$(pwd)/../../code"
-DATABASE_DIR="$(pwd)/../database"
 SIGBASE_URL="https://github.com/Neo23x0/signature-base/archive/refs/heads/master.zip"
 
 # Paramètres de boot communs (réutilisés dans syslinux + GRUB)
@@ -45,7 +44,7 @@ for cmd in lb wget curl python3 unzip rsync xorriso; do
 done
 [[ -d "$CODE_DIR" ]] || err "Répertoire code introuvable : $CODE_DIR"
 for f in config.py log_handler.py admin_auth.py usb_manager.py \
-          db_manager.py scanner.py gui.py main.py; do
+          db_manager.py scanner.py gui.py main.py pdf_viewer.py; do
     [[ -f "$CODE_DIR/$f" ]] || err "Fichier manquant dans $CODE_DIR : $f"
 done
 ok "Pré-requis OK"
@@ -787,6 +786,10 @@ mkdir -p /etc/virusscanner && chmod 700 /etc/virusscanner
 mkdir -p /var/lib/yara-rules/signature-base /var/lib/yara-rules/custom
 chmod -R 755 /var/lib/yara-rules
 
+# Répertoires de données applicatifs (../pdf/ et ../img/ relatifs au code)
+mkdir -p /opt/pdf && chmod 775 /opt/pdf && chown scanner:scanner /opt/pdf 2>/dev/null || true
+mkdir -p /opt/img && chmod 755 /opt/img
+
 # Wrapper de lancement
 cat > /usr/local/bin/usb-antivirus << 'WRAPPER'
 #!/bin/bash
@@ -1365,8 +1368,38 @@ step "Copie des fichiers dans le chroot..."
 APP_CHROOT="config/includes.chroot/opt/usb-antivirus"
 mkdir -p "$APP_CHROOT"
 cp -v "$CODE_DIR"/{config.py,log_handler.py,admin_auth.py,\
-usb_manager.py,db_manager.py,scanner.py,gui.py,main.py} "$APP_CHROOT/"
+usb_manager.py,db_manager.py,scanner.py,gui.py,main.py,pdf_viewer.py} "$APP_CHROOT/"
 ok "Fichiers Python copiés → $APP_CHROOT"
+
+# ── Répertoire PDFs (../pdf/ relatif au code = /opt/pdf/) ─────────────────────
+PDF_CHROOT="config/includes.chroot/opt/pdf"
+mkdir -p "$PDF_CHROOT"
+# Copier les PDFs présents dans ../pdf/ sur la machine de build, si disponibles
+PDF_SRC="$(pwd)/../../pdf"
+if [[ -d "$PDF_SRC" ]]; then
+    PDF_COUNT=$(find "$PDF_SRC" -maxdepth 1 -name "*.pdf" | wc -l)
+    if [[ "$PDF_COUNT" -gt 0 ]]; then
+        cp -v "$PDF_SRC"/*.pdf "$PDF_CHROOT/"
+        ok "$PDF_COUNT PDF(s) intégré(s) dans le chroot ($PDF_CHROOT)"
+    else
+        ok "Dossier pdf/ trouvé mais vide — le répertoire /opt/pdf/ sera créé vide"
+    fi
+else
+    warn "Dossier pdf/ introuvable ($PDF_SRC) — /opt/pdf/ sera vide au démarrage"
+    warn "Ajoutez des PDFs via le panneau Admin → onglet 📄 PDFs"
+fi
+
+# ── Logo (../img/logo.png relatif au code = /opt/img/logo.png) ────────────────
+IMG_CHROOT="config/includes.chroot/opt/img"
+mkdir -p "$IMG_CHROOT"
+LOGO_SRC="$(pwd)/../../img/logo.png"
+if [[ -f "$LOGO_SRC" ]]; then
+    cp -v "$LOGO_SRC" "$IMG_CHROOT/logo.png"
+    ok "Logo copié → $IMG_CHROOT/logo.png"
+else
+    warn "Logo introuvable ($LOGO_SRC) — l'interface utilisera le texte de remplacement"
+    warn "Placez votre logo dans ../img/logo.png et relancez le build"
+fi
 
 # ── Bases ClamAV : pré-téléchargement sur la machine de build ─────────────────
 step "Pré-téléchargement de la base ClamAV (machine de build)..."
