@@ -309,6 +309,18 @@ class AdminPanel:
         dlg.grab_set()
         dlg.transient(self._parent)
 
+        # ── Barre de titre avec bouton fermer ─────────────────────────────────
+        top_bar = tk.Frame(dlg, bg="#0f3460", pady=6)
+        top_bar.pack(fill=tk.X)
+        tk.Label(top_bar, text="⚙  Panneau d'administration",
+                 font=("Arial", 13, "bold"),
+                 bg="#0f3460", fg="#e0e0e0").pack(side=tk.LEFT, padx=14)
+        tk.Button(top_bar, text="✕  Fermer",
+                  command=dlg.destroy,
+                  bg="#e94560", fg="white", relief=tk.FLAT,
+                  font=("Arial", 10, "bold"), padx=14, pady=2,
+                  cursor="hand2").pack(side=tk.RIGHT, padx=10)
+
         nb = ttk.Notebook(dlg)
         nb.pack(fill=tk.BOTH, expand=True, padx=10, pady=8)
 
@@ -320,13 +332,10 @@ class AdminPanel:
         self._tab_cron(nb)
         self._tab_pdf(nb, dlg)
         self._tab_logs(nb)
+        self._tab_system(nb)
         self._tab_security(nb)
         self._tab_poweroff(nb, dlg)
         self._tab_quit(nb, dlg)
-
-        ttk.Button(dlg, text="✕  Fermer le panneau",
-                   command=dlg.destroy,
-                   width=30).pack(pady=8, ipady=4)
 
     # ── Onglet Moteurs ────────────────────────────────────────────────────────
 
@@ -1104,13 +1113,13 @@ class AdminPanel:
 
         pdf_dir = self._pdf_dir
 
-        # ── Liste des PDFs présents ────────────────────────────────────────────
+        # ── Liste des PDFs présents dans ../pdf/ ──────────────────────────────
         list_frame = ttk.LabelFrame(tab, text=f"PDFs dans {pdf_dir}", padding=8)
         list_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
 
         cols = ("name", "size")
         tree = ttk.Treeview(list_frame, columns=cols, show="headings",
-                            height=8, selectmode="extended")
+                            height=6, selectmode="extended")
         tree.heading("name", text="Fichier")
         tree.heading("size", text="Taille")
         tree.column("name", width=360, anchor=tk.W)
@@ -1152,7 +1161,7 @@ class AdminPanel:
 
         _refresh_list()
 
-        # ── Boutons de gestion ────────────────────────────────────────────────
+        # ── Boutons de gestion des PDFs locaux ────────────────────────────────
         btn_frame = ttk.Frame(tab)
         btn_frame.pack(fill=tk.X, pady=(0, 8))
 
@@ -1196,83 +1205,124 @@ class AdminPanel:
                                    padding=10)
         usb_frame.pack(fill=tk.X)
 
-        # Étape 1 : sélection de la clé
-        r1 = ttk.Frame(usb_frame); r1.pack(fill=tk.X, pady=2)
-        ttk.Label(r1, text="1. Clé USB :", width=14).pack(side=tk.LEFT)
+        # ── Ligne 1 : sélection de la partition + montage ─────────────────────
+        r1 = ttk.Frame(usb_frame); r1.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(r1, text="Partition USB :", width=14).pack(side=tk.LEFT)
         usb_var = tk.StringVar(value="— sélectionner —")
         usb_combo = ttk.Combobox(r1, textvariable=usb_var,
-                                  state="readonly", width=28)
+                                  state="readonly", width=26)
         usb_combo.pack(side=tk.LEFT, padx=4)
 
+        _mp_holder: list = [None]   # point de montage actif
         usb_status_var = tk.StringVar()
-        ttk.Label(usb_frame, textvariable=usb_status_var,
-                  foreground="#7ec8e3", font=("Courier", 8)).pack(anchor=tk.W)
 
         def _refresh_usb_combo():
             parts = self._get_usb_partitions()
-            names = [p.device + (f" [{p.label}]" if p.label else "")
+            names = [p.device + (f"  [{p.label}]" if p.label else "")
                      for p in parts]
             usb_combo["values"] = names
             if names:
                 usb_combo.current(0)
+            else:
+                usb_var.set("— aucune clé détectée —")
 
-        ttk.Button(r1, text="↺", width=4,
-                   command=_refresh_usb_combo).pack(side=tk.LEFT)
+        ttk.Button(r1, text="↺", width=3,
+                   command=_refresh_usb_combo).pack(side=tk.LEFT, padx=2)
         _refresh_usb_combo()
-
-        # Étape 2 : montage
-        r2 = ttk.Frame(usb_frame); r2.pack(fill=tk.X, pady=2)
-        ttk.Label(r2, text="2. Monter :", width=14).pack(side=tk.LEFT)
-        _mp_holder: list = [None]   # point de montage actif
 
         def _mount_usb_pdf():
             parts = self._get_usb_partitions()
             idx   = usb_combo.current()
             if idx < 0 or idx >= len(parts):
-                usb_status_var.set("⚠ Sélectionnez une clé USB.")
+                usb_status_var.set("⚠ Sélectionnez une clé USB valide.")
                 return
             part = parts[idx]
-            import subprocess as _sp
+            # Déjà monté ?
+            existing_mp = None
+            try:
+                with open("/proc/mounts") as f:
+                    for line in f:
+                        tok = line.split()
+                        if len(tok) >= 2 and tok[0] == part.device:
+                            existing_mp = tok[1]
+                            break
+            except Exception:
+                pass
+            if existing_mp:
+                _mp_holder[0] = existing_mp
+                usb_status_var.set(f"✅ Déjà monté → {existing_mp}")
+                _populate_usb_tree()
+                return
             try:
                 mp = f"/mnt/pdf_import_{part.device.replace('/', '_')}"
                 os.makedirs(mp, exist_ok=True)
-                r = _sp.run(["mount", "-o", "ro", part.device, mp],
-                            capture_output=True, text=True)
+                r = subprocess.run(["mount", "-o", "ro", part.device, mp],
+                                   capture_output=True, text=True)
                 if r.returncode != 0:
-                    usb_status_var.set(f"❌ mount : {r.stderr.strip()[:60]}")
+                    usb_status_var.set(f"❌ mount : {r.stderr.strip()[:80]}")
                     return
                 _mp_holder[0] = mp
                 usb_status_var.set(f"✅ Monté en lecture seule → {mp}")
-                _scan_usb_files()
+                _populate_usb_tree()
             except Exception as e:
                 usb_status_var.set(f"❌ {e}")
 
-        ttk.Button(r2, text="▲  Monter en RO",
-                   command=_mount_usb_pdf, width=18).pack(side=tk.LEFT, padx=4)
+        def _umount_usb_pdf():
+            mp = _mp_holder[0]
+            if not mp:
+                usb_status_var.set("⚠ Aucun montage actif.")
+                return
+            r = subprocess.run(["umount", mp], capture_output=True, text=True)
+            if r.returncode == 0:
+                _mp_holder[0] = None
+                for row in usb_tree.get_children():
+                    usb_tree.delete(row)
+                usb_status_var.set("✅ Clé démontée.")
+            else:
+                usb_status_var.set(f"❌ umount : {r.stderr.strip()[:80]}")
 
-        # Étape 3 : liste des PDFs sur la clé
-        r3 = ttk.Frame(usb_frame); r3.pack(fill=tk.X, pady=(6, 2))
-        ttk.Label(r3, text="3. PDFs sur la clé :").pack(anchor=tk.W)
+        mount_row = ttk.Frame(usb_frame); mount_row.pack(fill=tk.X, pady=(0, 4))
+        ttk.Button(mount_row, text="▲  Monter la clé",
+                   command=_mount_usb_pdf, width=18).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(mount_row, text="▼  Démonter la clé",
+                   command=_umount_usb_pdf, width=18).pack(side=tk.LEFT)
 
-        usb_cols = ("fname",)
-        usb_tree = ttk.Treeview(usb_frame, columns=usb_cols, show="headings",
-                                 height=5, selectmode="extended")
-        usb_tree.heading("fname", text="Fichier PDF")
-        usb_tree.column("fname", width=460, anchor=tk.W)
-        usb_sb = ttk.Scrollbar(usb_frame, orient=tk.VERTICAL,
+        ttk.Label(usb_frame, textvariable=usb_status_var,
+                  foreground="#7ec8e3", font=("Courier", 8)).pack(anchor=tk.W,
+                                                                   pady=(0, 4))
+
+        # ── Navigateur de fichiers PDF sur la clé ─────────────────────────────
+        nav_frame = ttk.LabelFrame(usb_frame, text="PDFs sur la clé (sélection multiple)",
+                                   padding=6)
+        nav_frame.pack(fill=tk.X, pady=(0, 6))
+
+        usb_tree_wrap = ttk.Frame(nav_frame)
+        usb_tree_wrap.pack(fill=tk.BOTH, expand=True)
+
+        usb_tree = ttk.Treeview(usb_tree_wrap, columns=("fname", "sz"),
+                                 show="headings", height=6,
+                                 selectmode="extended")
+        usb_tree.heading("fname", text="Fichier PDF (chemin relatif)")
+        usb_tree.heading("sz",    text="Taille")
+        usb_tree.column("fname", width=400, anchor=tk.W)
+        usb_tree.column("sz",    width=80,  anchor=tk.CENTER)
+        usb_sb = ttk.Scrollbar(usb_tree_wrap, orient=tk.VERTICAL,
                                 command=usb_tree.yview)
         usb_tree.configure(yscrollcommand=usb_sb.set)
-        usb_tree_frame = ttk.Frame(usb_frame)
-        usb_tree_frame.pack(fill=tk.X)
-        usb_tree.pack(in_=usb_tree_frame, side=tk.LEFT, fill=tk.X, expand=True)
-        usb_sb.pack(in_=usb_tree_frame, side=tk.RIGHT, fill=tk.Y)
+        usb_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        usb_sb.pack(side=tk.RIGHT, fill=tk.Y)
 
-        def _scan_usb_files():
+        usb_count_var = tk.StringVar(value="Montez la clé pour voir les PDFs.")
+        ttk.Label(nav_frame, textvariable=usb_count_var,
+                  foreground="#aaaaaa", font=("Arial", 8)).pack(anchor=tk.W,
+                                                                 pady=(2, 0))
+
+        def _populate_usb_tree():
             for row in usb_tree.get_children():
                 usb_tree.delete(row)
             mp = _mp_holder[0]
             if not mp or not os.path.isdir(mp):
-                usb_status_var.set("⚠ Montez d'abord la clé.")
+                usb_count_var.set("⚠ Montez d'abord la clé.")
                 return
             pdfs = []
             for root_dir, _, fnames in os.walk(mp):
@@ -1280,27 +1330,33 @@ class AdminPanel:
                     if fn.lower().endswith(".pdf"):
                         full = os.path.join(root_dir, fn)
                         rel  = os.path.relpath(full, mp)
-                        pdfs.append((rel, full))
-            for rel, full in pdfs:
-                usb_tree.insert("", tk.END, iid=full, values=(rel,))
-            usb_status_var.set(f"{len(pdfs)} PDF(s) trouvé(s) sur la clé.")
+                        try:
+                            sz = os.path.getsize(full)
+                            sz_str = f"{sz // 1024} Ko" if sz >= 1024 else f"{sz} o"
+                        except OSError:
+                            sz_str = "?"
+                        pdfs.append((rel, full, sz_str))
+            for rel, full, sz_str in pdfs:
+                usb_tree.insert("", tk.END, iid=full,
+                                values=(rel, sz_str))
+            usb_count_var.set(
+                f"{len(pdfs)} PDF(s) trouvé(s) — sélectionnez puis cliquez Copier."
+            )
 
-        ttk.Button(usb_frame, text="🔍  Scanner la clé",
-                   command=_scan_usb_files, width=18).pack(anchor=tk.W,
-                                                            pady=(4, 0))
+        ttk.Button(nav_frame, text="🔍  Scanner la clé",
+                   command=_populate_usb_tree,
+                   width=18).pack(anchor=tk.W, pady=(4, 0))
 
-        # Étape 4 : téléverser
-        r4 = ttk.Frame(usb_frame); r4.pack(fill=tk.X, pady=(8, 2))
-        ttk.Label(r4, text="4. Téléverser :", width=16).pack(side=tk.LEFT)
+        # ── Bouton copier ─────────────────────────────────────────────────────
         import_status_var = tk.StringVar()
         ttk.Label(usb_frame, textvariable=import_status_var,
-                  foreground="#66cc66").pack(anchor=tk.W)
+                  foreground="#66cc66").pack(anchor=tk.W, pady=2)
 
         def _import_selected():
             sel = usb_tree.selection()
             if not sel:
                 messagebox.showwarning("Aucune sélection",
-                                       "Cochez au moins un fichier.",
+                                       "Sélectionnez au moins un fichier PDF.",
                                        parent=dlg)
                 return
             os.makedirs(pdf_dir, exist_ok=True)
@@ -1319,31 +1375,13 @@ class AdminPanel:
                     f"⚠ {copied} copié(s), {len(errors)} erreur(s) : "
                     + " | ".join(errors[:2]))
             else:
-                import_status_var.set(f"✅ {copied} PDF(s) téléversé(s).")
+                import_status_var.set(f"✅ {copied} PDF(s) copiés vers {pdf_dir}.")
             _refresh_list()
             self._on_pdf_reload()
 
-        def _umount_usb_pdf():
-            mp = _mp_holder[0]
-            if not mp:
-                usb_status_var.set("⚠ Aucun montage actif.")
-                return
-            import subprocess as _sp
-            r = _sp.run(["umount", mp], capture_output=True, text=True)
-            if r.returncode == 0:
-                _mp_holder[0] = None
-                for row in usb_tree.get_children():
-                    usb_tree.delete(row)
-                usb_status_var.set("✅ Clé démontée.")
-            else:
-                usb_status_var.set(f"❌ umount : {r.stderr.strip()[:60]}")
-
-        r4_btns = ttk.Frame(usb_frame); r4_btns.pack(fill=tk.X, pady=2)
-        ttk.Button(r4_btns, text="⬆  Copier vers ../pdf/",
-                   command=_import_selected, width=24).pack(side=tk.LEFT,
-                                                             padx=(0, 8))
-        ttk.Button(r4_btns, text="▼  Démonter la clé",
-                   command=_umount_usb_pdf, width=20).pack(side=tk.LEFT)
+        ttk.Button(usb_frame, text="⬆  Copier les PDFs sélectionnés vers ../pdf/",
+                   command=_import_selected,
+                   width=44).pack(anchor=tk.W, pady=(0, 4))
 
     # ── Onglet Journaux ────────────────────────────────────────────────────────
 
@@ -1534,6 +1572,232 @@ class AdminPanel:
 
         ttk.Button(purge_frame, text="🗑  Purger tous les logs",
                    command=_do_purge, width=24).pack(anchor=tk.W)
+
+    # ── Onglet Système ────────────────────────────────────────────────────────
+
+    def _tab_system(self, nb: ttk.Notebook) -> None:
+        """Onglet de maintenance système : mises à jour APT et analyse sécurité."""
+        tab = ttk.Frame(nb, padding=16)
+        nb.add(tab, text="🖥 Système")
+
+        ttk.Label(tab, text="Maintenance et sécurité du système",
+                  font=("Arial", 11, "bold")).pack(anchor=tk.W, pady=(0, 10))
+
+        # ── Zone de sortie terminal ───────────────────────────────────────────
+        out_frame = ttk.LabelFrame(tab, text="Sortie terminal", padding=6)
+        out_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+
+        out_text = tk.Text(
+            out_frame, bg="#0b0d14", fg="#c8d0de",
+            font=("Courier", 8), wrap=tk.WORD,
+            state=tk.DISABLED, relief=tk.FLAT, padx=6, pady=4
+        )
+        out_sb = ttk.Scrollbar(out_frame, orient=tk.VERTICAL,
+                                command=out_text.yview)
+        out_text.configure(yscrollcommand=out_sb.set)
+        out_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        out_sb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        out_text.tag_config("ok",      foreground="#4ec94e")
+        out_text.tag_config("threat",  foreground="#ff4444")
+        out_text.tag_config("warning", foreground="#ffaa00")
+        out_text.tag_config("info",    foreground="#5577aa")
+        out_text.tag_config("normal",  foreground="#c8d0de")
+
+        status_var = tk.StringVar(value="Prêt.")
+
+        def _append(line: str, tag: str = "normal") -> None:
+            out_text.configure(state=tk.NORMAL)
+            out_text.insert(tk.END, line + "\n", tag)
+            out_text.see(tk.END)
+            out_text.configure(state=tk.DISABLED)
+            out_text.update_idletasks()
+
+        def _clear():
+            out_text.configure(state=tk.NORMAL)
+            out_text.delete("1.0", tk.END)
+            out_text.configure(state=tk.DISABLED)
+
+        def _run_cmd_stream(cmd: list, label: str,
+                            on_done=None) -> None:
+            """Lance une commande en streaming ligne par ligne."""
+            import threading as _th
+
+            def _worker():
+                status_var.set(f"⏳ {label} en cours…")
+                _append(f"▶ {label}", "info")
+                _append(f"$ {' '.join(cmd)}", "info")
+                try:
+                    proc = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        bufsize=1
+                    )
+                    for line in proc.stdout:
+                        stripped = line.rstrip()
+                        if stripped:
+                            low = stripped.lower()
+                            if any(w in low for w in ("error", "erreur", "failed",
+                                                       "fail", "infecte", "found")):
+                                tag = "threat"
+                            elif any(w in low for w in ("warning", "warn", "attention")):
+                                tag = "warning"
+                            elif any(w in low for w in ("ok", "done", "succès",
+                                                         "upgraded", "installed",
+                                                         "nothing to do")):
+                                tag = "ok"
+                            else:
+                                tag = "normal"
+                            out_text.after(0, _append, stripped, tag)
+                    proc.wait()
+                    rc = proc.returncode
+                    if rc == 0:
+                        out_text.after(0, _append,
+                                       f"✅ {label} terminé (code {rc}).", "ok")
+                        out_text.after(0, status_var.set,
+                                       f"✅ {label} terminé.")
+                    else:
+                        out_text.after(0, _append,
+                                       f"⚠ {label} terminé avec code {rc}.", "warning")
+                        out_text.after(0, status_var.set,
+                                       f"⚠ {label} — code {rc}.")
+                    if on_done:
+                        out_text.after(0, on_done, rc)
+                except Exception as exc:
+                    out_text.after(0, _append, f"❌ {exc}", "threat")
+                    out_text.after(0, status_var.set, f"❌ Erreur : {exc}")
+                finally:
+                    out_text.after(0, _set_btns_state, tk.NORMAL)
+
+            _set_btns_state(tk.DISABLED)
+            _th.Thread(target=_worker, daemon=True).start()
+
+        # ── Mises à jour APT ─────────────────────────────────────────────────
+        apt_frame = ttk.LabelFrame(tab, text="Mises à jour du système (APT)",
+                                   padding=10)
+        apt_frame.pack(fill=tk.X, pady=(0, 8))
+
+        ttk.Label(
+            apt_frame,
+            text="Lance apt update puis apt full-upgrade de façon non interactive.\n"
+                 "Les paquets obsolètes sont supprimés automatiquement (autoremove).",
+            foreground="#cccccc", justify=tk.LEFT
+        ).pack(anchor=tk.W, pady=(0, 6))
+
+        def _do_apt_upgrade():
+            _clear()
+            cmds = [
+                (["apt-get", "update", "-q"],
+                 "Mise à jour des listes APT"),
+                (["apt-get", "full-upgrade", "-y",
+                  "-o", "Dpkg::Options::=--force-confdef",
+                  "-o", "Dpkg::Options::=--force-confold"],
+                 "Mise à niveau complète"),
+                (["apt-get", "autoremove", "-y"], "Nettoyage paquets obsolètes"),
+            ]
+
+            def _chain(idx: int, _rc=None):
+                if idx >= len(cmds):
+                    _append("━━━ Toutes les étapes terminées ━━━", "ok")
+                    return
+                cmd, label = cmds[idx]
+                _run_cmd_stream(cmd, label,
+                                on_done=lambda rc: _chain(idx + 1, rc))
+
+            # _run_cmd_stream gère lui-même les boutons ; on re-autorise
+            # uniquement à la toute fin via le callback de _chain
+            _chain(0)
+
+        btn_apt = ttk.Button(apt_frame, text="🔄  Mettre à jour",
+                             command=_do_apt_upgrade, width=22)
+        btn_apt.pack(anchor=tk.W)
+
+        # ── Analyse antivirus (ClamAV) ────────────────────────────────────────
+        av_frame = ttk.LabelFrame(tab, text="Analyse antivirale (ClamAV)",
+                                  padding=10)
+        av_frame.pack(fill=tk.X, pady=(0, 8))
+
+        ttk.Label(
+            av_frame,
+            text="Analyse complète de la station avec clamscan.\n"
+                 "Cible : / (avec exclusions /proc /sys /dev /run).\n"
+                 "⚠  Peut durer plusieurs minutes selon la taille du disque.",
+            foreground="#cccccc", justify=tk.LEFT
+        ).pack(anchor=tk.W, pady=(0, 6))
+
+        def _do_clamav_scan():
+            _clear()
+            cmd = [
+                "clamscan", "--recursive",
+                "--exclude-dir=^/proc", "--exclude-dir=^/sys",
+                "--exclude-dir=^/dev",  "--exclude-dir=^/run",
+                "--infected",
+                "/"
+            ]
+            _run_cmd_stream(cmd, "Analyse ClamAV système")
+
+        btn_clam = ttk.Button(av_frame, text="🔍  Analyser avec ClamAV",
+                              command=_do_clamav_scan, width=26)
+        btn_clam.pack(anchor=tk.W)
+
+        # ── Analyse chkrootkit ────────────────────────────────────────────────
+        rk_frame = ttk.LabelFrame(tab, text="Détection de rootkits (chkrootkit)",
+                                  padding=10)
+        rk_frame.pack(fill=tk.X, pady=(0, 8))
+
+        ttk.Label(
+            rk_frame,
+            text="Lance chkrootkit pour détecter les rootkits connus.\n"
+                 "chkrootkit doit être installé (apt install chkrootkit).",
+            foreground="#cccccc", justify=tk.LEFT
+        ).pack(anchor=tk.W, pady=(0, 6))
+
+        def _do_chkrootkit():
+            _clear()
+            # Vérification préalable de la présence de chkrootkit
+            import shutil as _sh
+            if not _sh.which("chkrootkit"):
+                if messagebox.askyesno(
+                    "chkrootkit manquant",
+                    "chkrootkit n'est pas installé.\n"
+                    "L'installer maintenant (apt install chkrootkit) ?",
+                    parent=tab.winfo_toplevel()
+                ):
+                    _run_cmd_stream(
+                        ["apt-get", "install", "-y", "chkrootkit"],
+                        "Installation de chkrootkit",
+                        on_done=lambda rc: (
+                            _run_cmd_stream(["chkrootkit"],
+                                            "Analyse chkrootkit")
+                            if rc == 0 else None
+                        )
+                    )
+                return
+            _run_cmd_stream(["chkrootkit"], "Analyse chkrootkit")
+
+        btn_rk = ttk.Button(rk_frame, text="🕵  Analyser avec chkrootkit",
+                             command=_do_chkrootkit, width=28)
+        btn_rk.pack(anchor=tk.W)
+
+        # ── Barre de statut + bouton vider ────────────────────────────────────
+        foot = ttk.Frame(tab)
+        foot.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(foot, textvariable=status_var,
+                  foreground="#7ec8e3", font=("Arial", 9)).pack(side=tk.LEFT)
+        ttk.Button(foot, text="🧹 Vider",
+                   command=_clear, width=10).pack(side=tk.RIGHT)
+
+        # Liste de tous les boutons d'action pour les désactiver pendant un run
+        _action_btns = [btn_apt, btn_clam, btn_rk]
+
+        def _set_btns_state(state):
+            for b in _action_btns:
+                try:
+                    b.configure(state=state)
+                except Exception:
+                    pass
 
     # ── Onglet Sécurité ────────────────────────────────────────────────────────
 
