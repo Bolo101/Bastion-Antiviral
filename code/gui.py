@@ -174,18 +174,15 @@ class VirusScannerGUI:
         body = tk.Frame(self.root, bg=self.BG)
         body.pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
 
-        left   = tk.Frame(body, bg=self.BG, width=420)
-        center = tk.Frame(body, bg=self.BG, width=260)
-        right  = tk.Frame(body, bg=self.BG, width=360)
-        left.pack(side=tk.LEFT,  fill=tk.BOTH, expand=False, padx=(0, 4))
+        left  = tk.Frame(body, bg=self.BG, width=420)
+        right = tk.Frame(body, bg=self.BG)
+        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=False, padx=(0, 4))
         left.pack_propagate(False)
-        center.pack(side=tk.LEFT, fill=tk.BOTH, expand=False, padx=(0, 4))
-        center.pack_propagate(False)
-        right.pack(side=tk.LEFT,  fill=tk.BOTH, expand=True,  padx=(4, 0))
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(4, 0))
 
         self._build_usb_panel(left)
+        self._build_log_panel(left)
         self._build_scan_controls(left)
-        self._build_log_panel(center)
         self._build_pdf_viewer_panel(right)
 
     # ── Panneau USB (simplifié utilisateur) ───────────────────────────────────
@@ -210,7 +207,7 @@ class VirusScannerGUI:
 
         cols = ("label", "size", "status")
         self.usb_tree = ttk.Treeview(tree_frame, columns=cols, show="headings",
-                                      height=7, selectmode="none")
+                                      height=6, selectmode="none")
 
         style = ttk.Style()
         style.configure("Treeview",
@@ -335,32 +332,6 @@ class VirusScannerGUI:
         self.scanned_var  = tk.StringVar(value="")
         self.infected_var = tk.StringVar(value="")
 
-        # ── Zone logo ──────────────────────────────────────────────────────────
-        logo_frame = tk.Frame(parent, bg=self.CARD, bd=1, relief=tk.SOLID,
-                              height=88)
-        logo_frame.pack(fill=tk.X, pady=(0, 4))
-        logo_frame.pack_propagate(False)
-
-        logo_path = os.path.normpath(
-            os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                         "..", "img", "logo.png"))
-        self._logo_img: Optional[tk.PhotoImage] = None
-        try:
-            img = tk.PhotoImage(file=logo_path)
-            iw, ih = img.width(), img.height()
-            max_h = 76
-            if ih > max_h:
-                factor = max(1, ih // max_h)
-                img = img.subsample(factor, factor)
-            self._logo_img = img
-            tk.Label(logo_frame, image=self._logo_img,
-                     bg=self.CARD).pack(expand=True)
-        except Exception:
-            tk.Label(logo_frame,
-                     text="🛡  USB Antivirus",
-                     bg=self.CARD, fg="#3a6498",
-                     font=("Arial", 13, "bold italic")).pack(expand=True)
-
         # ── Entête journal ─────────────────────────────────────────────────────
         hdr = tk.Frame(parent, bg=self.BG)
         hdr.pack(fill=tk.X, pady=(0, 4))
@@ -372,14 +343,17 @@ class VirusScannerGUI:
                   bg=self.CARD, fg=self.FG_DIM, relief=tk.FLAT,
                   font=("Arial", 8)).pack(side=tk.RIGHT)
 
+        # Cadre englobant pour que le Text+Scrollbar s'étendent ensemble
+        log_wrap = tk.Frame(parent, bg="#0b0d14", bd=1, relief=tk.FLAT)
+        log_wrap.pack(fill=tk.BOTH, expand=True, pady=(0, 4))
         self.log_text = tk.Text(
-            parent, bg="#0b0d14", fg="#c8d0de",
+            log_wrap, bg="#0b0d14", fg="#c8d0de",
             font=("Courier", 9), wrap=tk.WORD,
             state=tk.NORMAL, insertbackground="white",
             relief=tk.FLAT, padx=10, pady=8
         )
-        sb = ttk.Scrollbar(parent, command=self.log_text.yview)
-        self.log_text.configure(yscrollcommand=sb.set)
+        sb2 = ttk.Scrollbar(log_wrap, command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=sb2.set)
 
         self.log_text.tag_config("threat",  foreground=self.RED)
         self.log_text.tag_config("ok",      foreground=self.GREEN)
@@ -388,7 +362,7 @@ class VirusScannerGUI:
         self.log_text.tag_config("normal",  foreground="#c8d0de")
 
         self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        sb2.pack(side=tk.RIGHT, fill=tk.Y)
 
     # ══════════════════════════════════════════════════════════════════════════
     # Visionneuse PDF – wrappers UI vers PdfViewer
