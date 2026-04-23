@@ -340,8 +340,10 @@ class AdminPanel:
     # ── Onglet Moteurs ────────────────────────────────────────────────────────
 
     def _tab_engines(self, nb: ttk.Notebook) -> None:
-        tab = ttk.Frame(nb, padding=16)
-        nb.add(tab, text="🔧 Moteurs")
+        _tab = ttk.Frame(nb, padding=0)
+        nb.add(_tab, text="🔧 Moteurs")
+        s_outer, tab = self._scrollable_frame(_tab)
+        s_outer.pack(fill=tk.BOTH, expand=True)
 
         ttk.Label(tab, text="Configuration des moteurs d'analyse",
                   font=("Arial", 11, "bold")).pack(anchor=tk.W, pady=(0, 10))
@@ -728,56 +730,127 @@ class AdminPanel:
     # ── Onglet ClamAV ──────────────────────────────────────────────────────────
 
     def _tab_clamav(self, nb: ttk.Notebook) -> None:
-        tab = ttk.Frame(nb, padding=16)
+        tab = ttk.Frame(nb, padding=8)
         nb.add(tab, text="🛡 ClamAV")
 
-        ttk.Label(tab, text="Mise à jour de la base ClamAV",
-                  font=("Arial", 11, "bold")).pack(anchor=tk.W, pady=(0, 8))
+        # ── Terminal en bas, contrôles en haut (PanedWindow) ──────────────────
+        pane = tk.PanedWindow(tab, orient=tk.VERTICAL,
+                              sashrelief=tk.FLAT, sashwidth=6,
+                              bg="#1a1a2e")
+        pane.pack(fill=tk.BOTH, expand=True)
+
+        # ── Volet supérieur : contrôles (scrollable) ──────────────────────────
+        top_outer, top_inner = self._scrollable_frame(pane)
+        pane.add(top_outer, minsize=180)
+
+        ttk.Label(top_inner, text="Mise à jour de la base ClamAV",
+                  font=("Arial", 11, "bold")).pack(anchor=tk.W,
+                                                    pady=(6, 4), padx=6)
+
+        upd_frame = ttk.LabelFrame(top_inner, text="Base principale", padding=8)
+        upd_frame.pack(fill=tk.X, padx=6, pady=(0, 6))
         ttk.Label(
-            tab,
-            text="• En ligne : freshclam contacte les serveurs ClamAV (Internet requis).\n"
-                 "• Hors-ligne : copiez main.cvd, daily.cvd et bytecode.cvd\n"
-                 "  à la racine d'une clé USB (source : database.clamav.net).",
+            upd_frame,
+            text="En ligne : freshclam contacte les serveurs ClamAV (Internet requis).\n"
+                 "Hors-ligne : copiez main.cvd, daily.cvd, bytecode.cvd sur une clé USB.",
             justify=tk.LEFT, foreground="#cccccc"
-        ).pack(anchor=tk.W, pady=(0, 8))
+        ).pack(anchor=tk.W, pady=(0, 6))
+        btn_row1 = ttk.Frame(upd_frame)
+        btn_row1.pack(anchor=tk.W)
 
-        row1 = ttk.Frame(tab)
-        row1.pack(anchor=tk.W)
-        ttk.Button(row1, text="🌐  Mise à jour en ligne (freshclam)",
-                   command=self._cb["clamav_online"], width=36).pack(side=tk.LEFT, padx=4)
-        ttk.Button(row1, text="🔌  Importer depuis clé USB",
-                   command=self._cb["clamav_usb"],   width=26).pack(side=tk.LEFT, padx=4)
+        ttk.Separator(top_inner, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=6,
+                                                             pady=4)
 
-        ttk.Separator(tab, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=10)
-
-        ttk.Label(tab, text="Signatures tierces supplémentaires",
-                  font=("Arial", 10, "bold")).pack(anchor=tk.W, pady=(0, 4))
+        tp_frame = ttk.LabelFrame(top_inner, text="Signatures tierces", padding=8)
+        tp_frame.pack(fill=tk.X, padx=6, pady=(0, 6))
         ttk.Label(
-            tab,
-            text="• URLhaus (abuse.ch), Sanesecurity, InterServer\n"
-                 "  Installés dans /var/lib/clamav/ — Internet requis.",
+            tp_frame,
+            text="URLhaus (abuse.ch), Sanesecurity, InterServer…\n"
+                 "Installées dans /var/lib/clamav/ — Internet requis.",
             justify=tk.LEFT, foreground="#cccccc"
-        ).pack(anchor=tk.W, pady=(0, 8))
+        ).pack(anchor=tk.W, pady=(0, 6))
+        btn_row2 = ttk.Frame(tp_frame)
+        btn_row2.pack(anchor=tk.W)
 
-        row2 = ttk.Frame(tab)
-        row2.pack(anchor=tk.W)
-        ttk.Button(row2, text="🌐  Télécharger signatures tierces",
-                   command=self._cb["clamav_thirdparty"],
-                   width=36).pack(side=tk.LEFT, padx=4)
+        # ── Volet inférieur : terminal ─────────────────────────────────────────
+        bot = ttk.Frame(pane, padding=(6, 4))
+        pane.add(bot, minsize=120)
+        term_frame, foot, _append, _clear, status_var, _after = self._make_terminal(
+            bot, height=8)
+        term_frame.pack(fill=tk.BOTH, expand=True)
+        foot.pack(fill=tk.X, pady=(2, 0))
+
+        # ── Wiring des boutons ────────────────────────────────────────────────
+        all_btns: list = []
+
+        def _set_btns(state):
+            for b in all_btns:
+                try:
+                    b.configure(state=state)
+                except Exception:
+                    pass
+
+        def _do_online():
+            _clear()
+            self._stream_to_terminal(
+                ["freshclam", "--datadir=/var/lib/clamav"],
+                "ClamAV — freshclam", _append, status_var,
+                set_btns_fn=_set_btns,
+                on_done=lambda rc: self._cb["avast_refresh"](),
+                after_fn=_after
+            )
+
+        def _do_usb():
+            _append("⚙ Lancement import USB ClamAV…", "info")
+            status_var.set("Import USB en cours…")
+            self._cb["clamav_usb"]()
+
+        def _do_thirdparty():
+            _clear()
+            cmd = [
+                "python3", "-c",
+                "from db_manager import DBManager; "
+                "import sys; db=DBManager(None); "
+                "ok,msg=db.download_third_party_sigs(); "
+                "print(msg); sys.exit(0 if ok else 1)"
+            ]
+            self._stream_to_terminal(cmd, "Signatures tierces",
+                                      _append, status_var,
+                                      set_btns_fn=_set_btns, after_fn=_after)
+
+        b1 = ttk.Button(btn_row1, text="🌐  Mise à jour en ligne (freshclam)",
+                        command=_do_online, width=36)
+        b1.pack(side=tk.LEFT, padx=(0, 6))
+        b2 = ttk.Button(btn_row1, text="🔌  Importer depuis clé USB",
+                        command=_do_usb, width=26)
+        b2.pack(side=tk.LEFT)
+        b3 = ttk.Button(btn_row2,
+                        text="🌐  Télécharger signatures tierces",
+                        command=_do_thirdparty, width=36)
+        b3.pack(side=tk.LEFT)
+        all_btns.extend([b1, b2, b3])
 
     # ── Onglet Avast ───────────────────────────────────────────────────────────
 
     def _tab_avast(self, nb: ttk.Notebook) -> None:
-        tab = ttk.Frame(nb, padding=16)
+        tab = ttk.Frame(nb, padding=8)
         nb.add(tab, text="🔐 Avast")
 
-        ttk.Label(tab, text="Gestion d'Avast Business for Linux",
-                  font=("Arial", 11, "bold")).pack(anchor=tk.W, pady=(0, 6))
+        pane = tk.PanedWindow(tab, orient=tk.VERTICAL,
+                              sashrelief=tk.FLAT, sashwidth=6, bg="#1a1a2e")
+        pane.pack(fill=tk.BOTH, expand=True)
+
+        # ── Volet supérieur : contrôles scrollables ───────────────────────────
+        top_outer, top_inner = self._scrollable_frame(pane)
+        pane.add(top_outer, minsize=260)
+
+        ttk.Label(top_inner, text="Gestion d'Avast Business for Linux",
+                  font=("Arial", 11, "bold")).pack(anchor=tk.W,
+                                                    pady=(6, 4), padx=6)
 
         # ── Statut ────────────────────────────────────────────────────────────
-        status_frame = ttk.LabelFrame(tab, text="Statut", padding=8)
-        status_frame.pack(fill=tk.X, pady=(0, 8))
-
+        status_frame = ttk.LabelFrame(top_inner, text="Statut", padding=8)
+        status_frame.pack(fill=tk.X, padx=6, pady=(0, 6))
         self._avast_status_var = tk.StringVar(value="Vérification…")
         ttk.Label(status_frame, textvariable=self._avast_status_var,
                   foreground="#7ec8e3", font=("Courier", 9)).pack(anchor=tk.W)
@@ -786,50 +859,28 @@ class AdminPanel:
                    width=20).pack(anchor=tk.W, pady=(4, 0))
         self._refresh_avast_status_display()
 
-        # ── Installation (mode installé) ──────────────────────────────────────
-        install_frame = ttk.LabelFrame(tab, text="Installation (mode installé)", padding=8)
-        install_frame.pack(fill=tk.X, pady=(0, 8))
-
+        # ── Installation ──────────────────────────────────────────────────────
+        install_frame = ttk.LabelFrame(top_inner,
+                                       text="Installation (mode installé)",
+                                       padding=8)
+        install_frame.pack(fill=tk.X, padx=6, pady=(0, 6))
         ttk.Label(
             install_frame,
             text="Installe Avast Business for Linux depuis le dépôt officiel.\n"
-                 "Nécessite une connexion Internet et les droits root.\n\n"
-                 "Étapes automatiques :\n"
-                 "  1. Ajout de la clé GPG depuis repo.avcdn.net\n"
-                 "  2. Ajout du dépôt APT avast\n"
-                 "  3. apt-get install avast\n"
-                 "  4. Activation du service systemd",
+                 "Étapes : ajout clé GPG → dépôt APT → apt install avast → systemd.",
             justify=tk.LEFT, foreground="#cccccc"
         ).pack(anchor=tk.W, pady=(0, 6))
-
         install_row = ttk.Frame(install_frame)
         install_row.pack(anchor=tk.W)
-        ttk.Button(install_row, text="📦  Installer Avast Business",
-                   command=self._cb["avast_install"],
-                   width=28).pack(side=tk.LEFT, padx=4)
-
-        ttk.Label(
-            install_frame,
-            text="Installation manuelle :\n"
-                 "  curl -fsSL https://repo.avcdn.net/linux/avast.gpg "
-                 "| tee /etc/apt/trusted.gpg.d/avast.gpg\n"
-                 "  echo 'deb https://repo.avcdn.net/linux stable avast' "
-                 "| tee /etc/apt/sources.list.d/avast.list\n"
-                 "  apt-get update && apt-get install avast",
-            justify=tk.LEFT, foreground="#aaaaaa",
-            font=("Courier", 7)
-        ).pack(anchor=tk.W, pady=(6, 0))
 
         # ── Licence ───────────────────────────────────────────────────────────
-        lic_frame = ttk.LabelFrame(tab, text="Licence Business", padding=8)
-        lic_frame.pack(fill=tk.X, pady=(0, 8))
+        lic_frame = ttk.LabelFrame(top_inner, text="Licence Business", padding=8)
+        lic_frame.pack(fill=tk.X, padx=6, pady=(0, 6))
 
-        ttk.Label(lic_frame,
-                  text="A — Code d'activation (Internet requis) :",
+        ttk.Label(lic_frame, text="A — Code d'activation (Internet requis) :",
                   foreground="#cccccc").grid(row=0, column=0, columnspan=3,
-                                          sticky=tk.W, pady=(0, 4))
-
-        code_var  = tk.StringVar()
+                                           sticky=tk.W, pady=(0, 4))
+        code_var   = tk.StringVar()
         code_entry = ttk.Entry(lic_frame, textvariable=code_var,
                                width=30, font=("Courier", 10))
         code_entry.grid(row=1, column=0, sticky=tk.W, padx=(0, 6))
@@ -837,34 +888,28 @@ class AdminPanel:
         def _activate():
             code = code_var.get().strip()
             if not code:
-                messagebox.showwarning("Code vide",
-                                       "Entrez un code d'activation.",
+                messagebox.showwarning("Code vide", "Entrez un code d'activation.",
                                        parent=tab.winfo_toplevel())
                 return
             self._cb["avast_activate"](code)
 
         ttk.Button(lic_frame, text="🔑 Activer",
                    command=_activate, width=13).grid(row=1, column=1, padx=4)
-
         ttk.Separator(lic_frame, orient=tk.HORIZONTAL).grid(
             row=2, column=0, columnspan=3, sticky=tk.EW, pady=6)
 
-        ttk.Label(lic_frame,
-                  text="B — Fichier .avastlic depuis USB :",
+        ttk.Label(lic_frame, text="B — Fichier .avastlic depuis USB :",
                   foreground="#cccccc").grid(row=3, column=0, columnspan=3,
-                                          sticky=tk.W, pady=(0, 4))
+                                           sticky=tk.W, pady=(0, 4))
         ttk.Button(lic_frame, text="🔌  Import depuis USB",
                    command=self._cb["avast_license_usb"],
                    width=22).grid(row=4, column=0, sticky=tk.W)
-
         ttk.Separator(lic_frame, orient=tk.HORIZONTAL).grid(
             row=5, column=0, columnspan=3, sticky=tk.EW, pady=6)
 
-        ttk.Label(lic_frame,
-                  text="C — Fichier .avastlic depuis le système :",
+        ttk.Label(lic_frame, text="C — Fichier .avastlic depuis le système :",
                   foreground="#cccccc").grid(row=6, column=0, columnspan=3,
-                                          sticky=tk.W, pady=(0, 4))
-
+                                           sticky=tk.W, pady=(0, 4))
         self._avast_lic_path_var = tk.StringVar(value="Aucun fichier sélectionné")
         ttk.Label(lic_frame, textvariable=self._avast_lic_path_var,
                   foreground="#7ec8e3", font=("Courier", 8),
@@ -876,8 +921,7 @@ class AdminPanel:
             path = filedialog.askopenfilename(
                 parent=tab.winfo_toplevel(),
                 title="Sélectionner la licence Avast",
-                filetypes=[("Licence Avast", "*.avastlic"),
-                           ("Tous", "*.*")],
+                filetypes=[("Licence Avast", "*.avastlic"), ("Tous", "*.*")],
                 initialdir=os.path.expanduser("~"),
             )
             if path:
@@ -905,22 +949,89 @@ class AdminPanel:
                    command=_import_browsed, width=16).pack(side=tk.LEFT)
 
         # ── Base VPS ──────────────────────────────────────────────────────────
-        vps_frame = ttk.LabelFrame(tab, text="Base VPS (définitions)", padding=8)
-        vps_frame.pack(fill=tk.X)
-
+        vps_frame = ttk.LabelFrame(top_inner, text="Base VPS (définitions)", padding=8)
+        vps_frame.pack(fill=tk.X, padx=6, pady=(0, 6))
         ttk.Label(vps_frame,
-                  text="• En ligne : Avast télécharge la dernière VPS.\n"
-                       "• Hors-ligne : copiez un fichier .vps/.vpz sur une clé USB.",
+                  text="En ligne : avast update (Internet requis).\n"
+                       "Hors-ligne : copiez un fichier .vps/.vpz sur une clé USB.",
                   foreground="#cccccc").pack(anchor=tk.W, pady=(0, 6))
-
         vps_row = ttk.Frame(vps_frame)
         vps_row.pack(anchor=tk.W)
-        ttk.Button(vps_row, text="🌐  Mise à jour VPS en ligne",
-                   command=self._cb["avast_vps_online"],
-                   width=26).pack(side=tk.LEFT, padx=4)
-        ttk.Button(vps_row, text="🔌  Importer VPS depuis USB",
-                   command=self._cb["avast_vps_usb"],
-                   width=26).pack(side=tk.LEFT, padx=4)
+
+        # ── Volet inférieur : terminal ─────────────────────────────────────────
+        bot = ttk.Frame(pane, padding=(6, 4))
+        pane.add(bot, minsize=100)
+        term_frame, foot, _append, _clear, term_status, _after = self._make_terminal(
+            bot, height=8)
+        term_frame.pack(fill=tk.BOTH, expand=True)
+        foot.pack(fill=tk.X, pady=(2, 0))
+
+        # ── Wiring ────────────────────────────────────────────────────────────
+        all_btns: list = []
+
+        def _set_btns(state):
+            for b in all_btns:
+                try:
+                    b.configure(state=state)
+                except Exception:
+                    pass
+
+        # Install
+        def _do_install():
+            _clear()
+            cmds_install = [
+                (["bash", "-c",
+                  "curl -fsSL https://repo.avcdn.net/linux/avast.gpg "
+                  "| tee /etc/apt/trusted.gpg.d/avast.gpg"],
+                 "Ajout clé GPG Avast"),
+                (["bash", "-c",
+                  "echo 'deb https://repo.avcdn.net/linux stable avast' "
+                  "| tee /etc/apt/sources.list.d/avast.list"],
+                 "Ajout dépôt APT"),
+                (["apt-get", "update", "-q"], "apt update"),
+                (["apt-get", "install", "-y", "avast"], "Installation avast"),
+                (["bash", "-c",
+                  "systemctl enable avast && systemctl start avast"],
+                 "Activation service"),
+            ]
+
+            def _chain(idx: int, _rc=None):
+                if idx >= len(cmds_install):
+                    _append("━━━ Installation terminée ━━━", "ok")
+                    self._refresh_avast_status_display()
+                    return
+                c, lbl = cmds_install[idx]
+                self._stream_to_terminal(c, lbl, _append, term_status,
+                                          set_btns_fn=_set_btns,
+                                          on_done=lambda rc: _chain(idx + 1, rc),
+                                          after_fn=_after)
+            _chain(0)
+
+        b_install = ttk.Button(install_row, text="📦  Installer Avast Business",
+                               command=_do_install, width=28)
+        b_install.pack(side=tk.LEFT, padx=4)
+        all_btns.append(b_install)
+
+        # VPS en ligne
+        def _do_vps_online():
+            _clear()
+            self._stream_to_terminal(
+                ["avast", "update"],
+                "Mise à jour VPS Avast", _append, term_status,
+                set_btns_fn=_set_btns, after_fn=_after
+            )
+
+        def _do_vps_usb():
+            _append("⚙ Lancement import VPS USB…", "info")
+            self._cb["avast_vps_usb"]()
+
+        b_vps_online = ttk.Button(vps_row, text="🌐  Mise à jour VPS en ligne",
+                                   command=_do_vps_online, width=28)
+        b_vps_online.pack(side=tk.LEFT, padx=(0, 6))
+        b_vps_usb = ttk.Button(vps_row, text="🔌  Importer VPS depuis USB",
+                                command=_do_vps_usb, width=26)
+        b_vps_usb.pack(side=tk.LEFT)
+        all_btns.extend([b_vps_online, b_vps_usb])
 
     def _refresh_avast_status_display(self) -> None:
         try:
@@ -953,29 +1064,242 @@ class AdminPanel:
         except Exception as e:
             self._avast_status_var.set(f"Erreur vérification : {e}")
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # Helpers partagés
+    # ══════════════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _scrollable_frame(parent: tk.Widget):
+        """
+        Retourne un tuple (outer, inner) où outer se pack() dans parent
+        et inner est le Frame dans lequel on place le contenu.
+        Le contenu de inner défile verticalement.
+        """
+        outer = ttk.Frame(parent)
+        canvas = tk.Canvas(outer, highlightthickness=0)
+        vsb    = ttk.Scrollbar(outer, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        inner  = ttk.Frame(canvas)
+        win_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda e: (
+            canvas.configure(scrollregion=canvas.bbox("all")),
+            canvas.itemconfig(win_id, width=canvas.winfo_width())
+        ))
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfig(win_id, width=e.width))
+        return outer, inner
+
+    @staticmethod
+    def _make_terminal(parent: tk.Widget, height: int = 10):
+        """
+        Crée un terminal Text dark dans parent.
+        Retourne (frame, foot, append_fn, clear_fn, status_var, after_fn).
+        append_fn et clear_fn sont thread-safe (planifiées via txt.after).
+        after_fn(ms, fn, *args) permet de planifier n'importe quel appel
+        sur le thread principal depuis un thread de fond.
+        """
+        frame = ttk.LabelFrame(parent, text="Terminal", padding=4)
+        txt = tk.Text(
+            frame, bg="#0b0d14", fg="#c8d0de",
+            font=("Courier", 8), wrap=tk.WORD,
+            state=tk.DISABLED, relief=tk.FLAT, height=height,
+            padx=6, pady=4
+        )
+        sb = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        txt.tag_config("ok",      foreground="#4ec94e")
+        txt.tag_config("threat",  foreground="#ff4444")
+        txt.tag_config("warning", foreground="#ffaa00")
+        txt.tag_config("info",    foreground="#5577aa")
+        txt.tag_config("normal",  foreground="#c8d0de")
+        txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        status_var = tk.StringVar(value="Prêt.")
+        foot = ttk.Frame(parent)
+        ttk.Label(foot, textvariable=status_var,
+                  foreground="#7ec8e3", font=("Arial", 8)).pack(side=tk.LEFT)
+
+        # ── Fonctions thread-safe ─────────────────────────────────────────────
+        def _append(line: str, tag: str = "normal") -> None:
+            def _do():
+                try:
+                    txt.configure(state=tk.NORMAL)
+                    txt.insert(tk.END, line + "\n", tag)
+                    txt.see(tk.END)
+                    txt.configure(state=tk.DISABLED)
+                except Exception:
+                    pass
+            try:
+                txt.after(0, _do)
+            except Exception:
+                pass
+
+        def _clear() -> None:
+            def _do():
+                try:
+                    txt.configure(state=tk.NORMAL)
+                    txt.delete("1.0", tk.END)
+                    txt.configure(state=tk.DISABLED)
+                except Exception:
+                    pass
+            try:
+                txt.after(0, _do)
+            except Exception:
+                pass
+
+        def _after(ms: int, fn, *args):
+            """Planifie fn(*args) sur le thread principal depuis n'importe quel thread."""
+            try:
+                txt.after(ms, fn, *args)
+            except Exception:
+                pass
+
+        ttk.Button(foot, text="🧹 Vider", command=_clear,
+                   width=9).pack(side=tk.RIGHT)
+
+        return frame, foot, _append, _clear, status_var, _after
+
+    def _stream_to_terminal(self, cmd: list, label: str,
+                             append_fn, status_var,
+                             set_btns_fn=None, on_done=None,
+                             after_fn=None) -> None:
+        """Lance cmd en streaming dans le terminal fourni via append_fn.
+        after_fn : planificateur thread-safe (issu de _make_terminal).
+        """
+        import threading as _th
+
+        def _schedule(fn, *args):
+            """Appelle fn(*args) en planifiant sur le thread principal si possible."""
+            if after_fn:
+                after_fn(0, fn, *args)
+            else:
+                try:
+                    fn(*args)
+                except Exception:
+                    pass
+
+        def _worker():
+            _schedule(status_var.set, f"⏳ {label}…")
+            append_fn(f"▶ {label}", "info")
+            append_fn(f"$ {' '.join(cmd)}", "info")
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True, bufsize=1
+                )
+                for raw in proc.stdout:
+                    line = raw.rstrip()
+                    if not line:
+                        continue
+                    low = line.lower()
+                    if any(w in low for w in ("error", "erreur", "failed",
+                                              "fail", "infect")):
+                        tag = "threat"
+                    elif any(w in low for w in ("warning", "warn", "attention")):
+                        tag = "warning"
+                    elif any(w in low for w in ("ok", "done", "succès",
+                                                 "upgraded", "installed",
+                                                 "nothing to do",
+                                                 "up-to-date", "à jour")):
+                        tag = "ok"
+                    else:
+                        tag = "normal"
+                    append_fn(line, tag)
+                proc.wait()
+                rc = proc.returncode
+                if rc == 0:
+                    append_fn(f"✅ {label} terminé.", "ok")
+                    _schedule(status_var.set, f"✅ {label} terminé.")
+                else:
+                    append_fn(f"⚠ {label} — code retour {rc}.", "warning")
+                    _schedule(status_var.set, f"⚠ {label} — code {rc}.")
+                if on_done:
+                    _schedule(on_done, rc)
+            except Exception as exc:
+                append_fn(f"❌ {exc}", "threat")
+                _schedule(status_var.set, f"❌ Erreur : {exc}")
+            finally:
+                if set_btns_fn:
+                    _schedule(set_btns_fn, tk.NORMAL)
+
+        if set_btns_fn:
+            set_btns_fn(tk.DISABLED)
+        _th.Thread(target=_worker, daemon=True).start()
+
     # ── Onglet YARA ────────────────────────────────────────────────────────────
 
     def _tab_yara(self, nb: ttk.Notebook) -> None:
-        tab = ttk.Frame(nb, padding=16)
+        tab = ttk.Frame(nb, padding=8)
         nb.add(tab, text="🔍 YARA")
 
-        ttk.Label(tab, text="Gestion des règles YARA",
-                  font=("Arial", 11, "bold")).pack(anchor=tk.W, pady=(0, 8))
-        ttk.Label(
-            tab,
-            text="• En ligne  : télécharge signature-base de Florian Roth (GitHub).\n"
-                 "  Connexion Internet requise — ~30 Mo.\n"
-                 "• Hors-ligne : placez des fichiers .yar/.yara ou un .zip\n"
-                 "  contenant des règles à la racine d'une clé USB.",
-            justify=tk.LEFT, foreground="#cccccc"
-        ).pack(anchor=tk.W, pady=(0, 12))
+        pane = tk.PanedWindow(tab, orient=tk.VERTICAL,
+                              sashrelief=tk.FLAT, sashwidth=6, bg="#1a1a2e")
+        pane.pack(fill=tk.BOTH, expand=True)
 
-        row = ttk.Frame(tab)
-        row.pack(anchor=tk.W)
-        ttk.Button(row, text="🌐  Télécharger signature-base",
-                   command=self._cb["yara_online"], width=30).pack(side=tk.LEFT, padx=4)
-        ttk.Button(row, text="🔌  Importer depuis clé USB",
-                   command=self._cb["yara_usb"],    width=28).pack(side=tk.LEFT, padx=4)
+        # ── Contrôles ─────────────────────────────────────────────────────────
+        top_outer, top_inner = self._scrollable_frame(pane)
+        pane.add(top_outer, minsize=140)
+
+        ttk.Label(top_inner, text="Gestion des règles YARA",
+                  font=("Arial", 11, "bold")).pack(anchor=tk.W,
+                                                    pady=(6, 4), padx=6)
+        ctrl_frame = ttk.LabelFrame(top_inner, text="Règles signature-base", padding=8)
+        ctrl_frame.pack(fill=tk.X, padx=6, pady=(0, 6))
+        ttk.Label(
+            ctrl_frame,
+            text="En ligne  : télécharge signature-base de Florian Roth (GitHub) — ~30 Mo.\n"
+                 "Hors-ligne : placez des fichiers .yar/.yara ou un .zip sur une clé USB.",
+            justify=tk.LEFT, foreground="#cccccc"
+        ).pack(anchor=tk.W, pady=(0, 8))
+        btn_row = ttk.Frame(ctrl_frame)
+        btn_row.pack(anchor=tk.W)
+
+        # ── Terminal ──────────────────────────────────────────────────────────
+        bot = ttk.Frame(pane, padding=(6, 4))
+        pane.add(bot, minsize=100)
+        term_frame, foot, _append, _clear, status_var, _after = self._make_terminal(
+            bot, height=8)
+        term_frame.pack(fill=tk.BOTH, expand=True)
+        foot.pack(fill=tk.X, pady=(2, 0))
+
+        all_btns: list = []
+
+        def _set_btns(state):
+            for b in all_btns:
+                try:
+                    b.configure(state=state)
+                except Exception:
+                    pass
+
+        def _do_online():
+            _clear()
+            cmd = [
+                "python3", "-c",
+                "from db_manager import DBManager; "
+                "import sys; db=DBManager(None); "
+                "ok,msg=db.update_yara_online(); "
+                "print(msg); sys.exit(0 if ok else 1)"
+            ]
+            self._stream_to_terminal(cmd, "YARA — téléchargement signature-base",
+                                      _append, status_var, set_btns_fn=_set_btns, after_fn=_after)
+
+        def _do_usb():
+            _append("⚙ Lancement import USB YARA…", "info")
+            status_var.set("Import USB en cours…")
+            self._cb["yara_usb"]()
+
+        b_online = ttk.Button(btn_row, text="🌐  Télécharger signature-base",
+                              command=_do_online, width=30)
+        b_online.pack(side=tk.LEFT, padx=(0, 6))
+        b_usb = ttk.Button(btn_row, text="🔌  Importer depuis clé USB",
+                           command=_do_usb, width=28)
+        b_usb.pack(side=tk.LEFT)
+        all_btns.extend([b_online, b_usb])
 
     # ── Onglet Planification ───────────────────────────────────────────────────
 
@@ -1115,7 +1439,7 @@ class AdminPanel:
 
         # ── Liste des PDFs présents dans ../pdf/ ──────────────────────────────
         list_frame = ttk.LabelFrame(tab, text=f"PDFs dans {pdf_dir}", padding=8)
-        list_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+        list_frame.pack(fill=tk.X, pady=(0, 8))
 
         cols = ("name", "size")
         tree = ttk.Treeview(list_frame, columns=cols, show="headings",
@@ -1386,11 +1710,14 @@ class AdminPanel:
     # ── Onglet Journaux ────────────────────────────────────────────────────────
 
     def _tab_logs(self, nb: ttk.Notebook) -> None:
-        tab = ttk.Frame(nb, padding=16)
-        nb.add(tab, text="📋 Journaux")
+        _tab = ttk.Frame(nb, padding=0)
+        nb.add(_tab, text="📋 Journaux")
+        s_outer, tab = self._scrollable_frame(_tab)
+        s_outer.pack(fill=tk.BOTH, expand=True)
 
         ttk.Label(tab, text="Journaux d'activité et statistiques",
-                  font=("Arial", 11, "bold")).pack(anchor=tk.W, pady=(0, 6))
+                  font=("Arial", 11, "bold")).pack(anchor=tk.W, pady=(8, 6),
+                                                    padx=8)
 
         # ── Statistiques de scan ───────────────────────────────────────────────
         stats_frame = ttk.LabelFrame(tab, text="Statistiques de la session", padding=8)
@@ -1420,7 +1747,7 @@ class AdminPanel:
         threat_frame = ttk.LabelFrame(
             tab, text="Fichiers malveillants détectés (session courante)",
             padding=8)
-        threat_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+        threat_frame.pack(fill=tk.X, pady=(0, 8))
 
         th_cols = ("ts", "file", "threat", "hash")
         th_tree = ttk.Treeview(threat_frame, columns=th_cols, show="headings",
@@ -1573,190 +1900,107 @@ class AdminPanel:
         ttk.Button(purge_frame, text="🗑  Purger tous les logs",
                    command=_do_purge, width=24).pack(anchor=tk.W)
 
-    # ── Onglet Système ────────────────────────────────────────────────────────
-
     def _tab_system(self, nb: ttk.Notebook) -> None:
         """Onglet de maintenance système : mises à jour APT et analyse sécurité."""
-        tab = ttk.Frame(nb, padding=16)
+        tab = ttk.Frame(nb, padding=8)
         nb.add(tab, text="🖥 Système")
 
-        ttk.Label(tab, text="Maintenance et sécurité du système",
-                  font=("Arial", 11, "bold")).pack(anchor=tk.W, pady=(0, 10))
+        pane = tk.PanedWindow(tab, orient=tk.VERTICAL,
+                              sashrelief=tk.FLAT, sashwidth=6, bg="#1a1a2e")
+        pane.pack(fill=tk.BOTH, expand=True)
 
-        # ── Zone de sortie terminal ───────────────────────────────────────────
-        out_frame = ttk.LabelFrame(tab, text="Sortie terminal", padding=6)
-        out_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        # ── Volet supérieur : contrôles scrollables ───────────────────────────
+        top_outer, top_inner = self._scrollable_frame(pane)
+        pane.add(top_outer, minsize=200)
 
-        out_text = tk.Text(
-            out_frame, bg="#0b0d14", fg="#c8d0de",
-            font=("Courier", 8), wrap=tk.WORD,
-            state=tk.DISABLED, relief=tk.FLAT, padx=6, pady=4
-        )
-        out_sb = ttk.Scrollbar(out_frame, orient=tk.VERTICAL,
-                                command=out_text.yview)
-        out_text.configure(yscrollcommand=out_sb.set)
-        out_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        out_sb.pack(side=tk.RIGHT, fill=tk.Y)
-
-        out_text.tag_config("ok",      foreground="#4ec94e")
-        out_text.tag_config("threat",  foreground="#ff4444")
-        out_text.tag_config("warning", foreground="#ffaa00")
-        out_text.tag_config("info",    foreground="#5577aa")
-        out_text.tag_config("normal",  foreground="#c8d0de")
-
-        status_var = tk.StringVar(value="Prêt.")
-
-        def _append(line: str, tag: str = "normal") -> None:
-            out_text.configure(state=tk.NORMAL)
-            out_text.insert(tk.END, line + "\n", tag)
-            out_text.see(tk.END)
-            out_text.configure(state=tk.DISABLED)
-            out_text.update_idletasks()
-
-        def _clear():
-            out_text.configure(state=tk.NORMAL)
-            out_text.delete("1.0", tk.END)
-            out_text.configure(state=tk.DISABLED)
-
-        def _run_cmd_stream(cmd: list, label: str,
-                            on_done=None) -> None:
-            """Lance une commande en streaming ligne par ligne."""
-            import threading as _th
-
-            def _worker():
-                status_var.set(f"⏳ {label} en cours…")
-                _append(f"▶ {label}", "info")
-                _append(f"$ {' '.join(cmd)}", "info")
-                try:
-                    proc = subprocess.Popen(
-                        cmd,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        text=True,
-                        bufsize=1
-                    )
-                    for line in proc.stdout:
-                        stripped = line.rstrip()
-                        if stripped:
-                            low = stripped.lower()
-                            if any(w in low for w in ("error", "erreur", "failed",
-                                                       "fail", "infecte", "found")):
-                                tag = "threat"
-                            elif any(w in low for w in ("warning", "warn", "attention")):
-                                tag = "warning"
-                            elif any(w in low for w in ("ok", "done", "succès",
-                                                         "upgraded", "installed",
-                                                         "nothing to do")):
-                                tag = "ok"
-                            else:
-                                tag = "normal"
-                            out_text.after(0, _append, stripped, tag)
-                    proc.wait()
-                    rc = proc.returncode
-                    if rc == 0:
-                        out_text.after(0, _append,
-                                       f"✅ {label} terminé (code {rc}).", "ok")
-                        out_text.after(0, status_var.set,
-                                       f"✅ {label} terminé.")
-                    else:
-                        out_text.after(0, _append,
-                                       f"⚠ {label} terminé avec code {rc}.", "warning")
-                        out_text.after(0, status_var.set,
-                                       f"⚠ {label} — code {rc}.")
-                    if on_done:
-                        out_text.after(0, on_done, rc)
-                except Exception as exc:
-                    out_text.after(0, _append, f"❌ {exc}", "threat")
-                    out_text.after(0, status_var.set, f"❌ Erreur : {exc}")
-                finally:
-                    out_text.after(0, _set_btns_state, tk.NORMAL)
-
-            _set_btns_state(tk.DISABLED)
-            _th.Thread(target=_worker, daemon=True).start()
+        ttk.Label(top_inner, text="Maintenance et sécurité du système",
+                  font=("Arial", 11, "bold")).pack(anchor=tk.W,
+                                                    pady=(6, 6), padx=6)
 
         # ── Mises à jour APT ─────────────────────────────────────────────────
-        apt_frame = ttk.LabelFrame(tab, text="Mises à jour du système (APT)",
+        apt_frame = ttk.LabelFrame(top_inner, text="Mises à jour du système (APT)",
                                    padding=10)
-        apt_frame.pack(fill=tk.X, pady=(0, 8))
-
+        apt_frame.pack(fill=tk.X, padx=6, pady=(0, 8))
         ttk.Label(
             apt_frame,
-            text="Lance apt update puis apt full-upgrade de façon non interactive.\n"
-                 "Les paquets obsolètes sont supprimés automatiquement (autoremove).",
+            text="Lance apt update → apt full-upgrade → autoremove de façon non interactive.",
             foreground="#cccccc", justify=tk.LEFT
         ).pack(anchor=tk.W, pady=(0, 6))
 
+        # ── Analyse antivirus (ClamAV) ────────────────────────────────────────
+        av_frame = ttk.LabelFrame(top_inner, text="Analyse antivirale (ClamAV)",
+                                  padding=10)
+        av_frame.pack(fill=tk.X, padx=6, pady=(0, 8))
+        ttk.Label(
+            av_frame,
+            text="Analyse complète : / avec exclusions /proc /sys /dev /run.\n"
+                 "⚠  Peut durer plusieurs minutes.",
+            foreground="#cccccc", justify=tk.LEFT
+        ).pack(anchor=tk.W, pady=(0, 6))
+
+        # ── Analyse chkrootkit ────────────────────────────────────────────────
+        rk_frame = ttk.LabelFrame(top_inner, text="Détection de rootkits (chkrootkit)",
+                                  padding=10)
+        rk_frame.pack(fill=tk.X, padx=6, pady=(0, 8))
+        ttk.Label(
+            rk_frame,
+            text="Lance chkrootkit (apt install chkrootkit si absent).",
+            foreground="#cccccc", justify=tk.LEFT
+        ).pack(anchor=tk.W, pady=(0, 6))
+
+        # ── Volet inférieur : terminal ─────────────────────────────────────────
+        bot = ttk.Frame(pane, padding=(6, 4))
+        pane.add(bot, minsize=120)
+        term_frame, foot, _append, _clear, status_var, _after = self._make_terminal(
+            bot, height=10)
+        term_frame.pack(fill=tk.BOTH, expand=True)
+        foot.pack(fill=tk.X, pady=(2, 0))
+
+        all_btns: list = []
+
+        def _set_btns(state):
+            for b in all_btns:
+                try:
+                    b.configure(state=state)
+                except Exception:
+                    pass
+
+        # ── Actions ───────────────────────────────────────────────────────────
         def _do_apt_upgrade():
             _clear()
             cmds = [
-                (["apt-get", "update", "-q"],
-                 "Mise à jour des listes APT"),
+                (["apt-get", "update", "-q"], "Mise à jour des listes APT"),
                 (["apt-get", "full-upgrade", "-y",
                   "-o", "Dpkg::Options::=--force-confdef",
                   "-o", "Dpkg::Options::=--force-confold"],
                  "Mise à niveau complète"),
                 (["apt-get", "autoremove", "-y"], "Nettoyage paquets obsolètes"),
             ]
-
             def _chain(idx: int, _rc=None):
                 if idx >= len(cmds):
                     _append("━━━ Toutes les étapes terminées ━━━", "ok")
+                    _set_btns(tk.NORMAL)
                     return
-                cmd, label = cmds[idx]
-                _run_cmd_stream(cmd, label,
-                                on_done=lambda rc: _chain(idx + 1, rc))
-
-            # _run_cmd_stream gère lui-même les boutons ; on re-autorise
-            # uniquement à la toute fin via le callback de _chain
+                c, lbl = cmds[idx]
+                self._stream_to_terminal(c, lbl, _append, status_var,
+                                          on_done=lambda rc: _chain(idx + 1, rc),
+                                          after_fn=_after)
+            _set_btns(tk.DISABLED)
             _chain(0)
-
-        btn_apt = ttk.Button(apt_frame, text="🔄  Mettre à jour",
-                             command=_do_apt_upgrade, width=22)
-        btn_apt.pack(anchor=tk.W)
-
-        # ── Analyse antivirus (ClamAV) ────────────────────────────────────────
-        av_frame = ttk.LabelFrame(tab, text="Analyse antivirale (ClamAV)",
-                                  padding=10)
-        av_frame.pack(fill=tk.X, pady=(0, 8))
-
-        ttk.Label(
-            av_frame,
-            text="Analyse complète de la station avec clamscan.\n"
-                 "Cible : / (avec exclusions /proc /sys /dev /run).\n"
-                 "⚠  Peut durer plusieurs minutes selon la taille du disque.",
-            foreground="#cccccc", justify=tk.LEFT
-        ).pack(anchor=tk.W, pady=(0, 6))
 
         def _do_clamav_scan():
             _clear()
-            cmd = [
-                "clamscan", "--recursive",
-                "--exclude-dir=^/proc", "--exclude-dir=^/sys",
-                "--exclude-dir=^/dev",  "--exclude-dir=^/run",
-                "--infected",
-                "/"
-            ]
-            _run_cmd_stream(cmd, "Analyse ClamAV système")
-
-        btn_clam = ttk.Button(av_frame, text="🔍  Analyser avec ClamAV",
-                              command=_do_clamav_scan, width=26)
-        btn_clam.pack(anchor=tk.W)
-
-        # ── Analyse chkrootkit ────────────────────────────────────────────────
-        rk_frame = ttk.LabelFrame(tab, text="Détection de rootkits (chkrootkit)",
-                                  padding=10)
-        rk_frame.pack(fill=tk.X, pady=(0, 8))
-
-        ttk.Label(
-            rk_frame,
-            text="Lance chkrootkit pour détecter les rootkits connus.\n"
-                 "chkrootkit doit être installé (apt install chkrootkit).",
-            foreground="#cccccc", justify=tk.LEFT
-        ).pack(anchor=tk.W, pady=(0, 6))
+            self._stream_to_terminal(
+                ["clamscan", "--recursive",
+                 "--exclude-dir=^/proc", "--exclude-dir=^/sys",
+                 "--exclude-dir=^/dev",  "--exclude-dir=^/run",
+                 "--infected", "/"],
+                "Analyse ClamAV système", _append, status_var,
+                set_btns_fn=_set_btns, after_fn=_after
+            )
 
         def _do_chkrootkit():
             _clear()
-            # Vérification préalable de la présence de chkrootkit
             import shutil as _sh
             if not _sh.which("chkrootkit"):
                 if messagebox.askyesno(
@@ -1765,52 +2009,49 @@ class AdminPanel:
                     "L'installer maintenant (apt install chkrootkit) ?",
                     parent=tab.winfo_toplevel()
                 ):
-                    _run_cmd_stream(
+                    self._stream_to_terminal(
                         ["apt-get", "install", "-y", "chkrootkit"],
-                        "Installation de chkrootkit",
+                        "Installation de chkrootkit", _append, status_var,
+                        set_btns_fn=_set_btns, after_fn=_after,
                         on_done=lambda rc: (
-                            _run_cmd_stream(["chkrootkit"],
-                                            "Analyse chkrootkit")
+                            self._stream_to_terminal(
+                                ["chkrootkit"], "Analyse chkrootkit",
+                                _append, status_var, set_btns_fn=_set_btns,
+                                after_fn=_after)
                             if rc == 0 else None
                         )
                     )
                 return
-            _run_cmd_stream(["chkrootkit"], "Analyse chkrootkit")
+            self._stream_to_terminal(["chkrootkit"], "Analyse chkrootkit",
+                                      _append, status_var, set_btns_fn=_set_btns,
+                                      after_fn=_after)
 
+        btn_apt = ttk.Button(apt_frame, text="🔄  Mettre à jour",
+                             command=_do_apt_upgrade, width=22)
+        btn_apt.pack(anchor=tk.W)
+        btn_clam = ttk.Button(av_frame, text="🔍  Analyser avec ClamAV",
+                              command=_do_clamav_scan, width=26)
+        btn_clam.pack(anchor=tk.W)
         btn_rk = ttk.Button(rk_frame, text="🕵  Analyser avec chkrootkit",
                              command=_do_chkrootkit, width=28)
         btn_rk.pack(anchor=tk.W)
-
-        # ── Barre de statut + bouton vider ────────────────────────────────────
-        foot = ttk.Frame(tab)
-        foot.pack(fill=tk.X, pady=(4, 0))
-        ttk.Label(foot, textvariable=status_var,
-                  foreground="#7ec8e3", font=("Arial", 9)).pack(side=tk.LEFT)
-        ttk.Button(foot, text="🧹 Vider",
-                   command=_clear, width=10).pack(side=tk.RIGHT)
-
-        # Liste de tous les boutons d'action pour les désactiver pendant un run
-        _action_btns = [btn_apt, btn_clam, btn_rk]
-
-        def _set_btns_state(state):
-            for b in _action_btns:
-                try:
-                    b.configure(state=state)
-                except Exception:
-                    pass
+        all_btns.extend([btn_apt, btn_clam, btn_rk])
 
     # ── Onglet Sécurité ────────────────────────────────────────────────────────
 
     def _tab_security(self, nb: ttk.Notebook) -> None:
-        tab = ttk.Frame(nb, padding=16)
-        nb.add(tab, text="🔑 Sécurité")
+        _tab = ttk.Frame(nb, padding=0)
+        nb.add(_tab, text="🔑 Sécurité")
+        s_outer, tab = self._scrollable_frame(_tab)
+        s_outer.pack(fill=tk.BOTH, expand=True)
 
         auth = self._auth
 
         ttk.Label(tab, text="Changer le code administrateur",
                   font=("Arial", 11, "bold")).grid(row=0, column=0,
                                                     columnspan=2,
-                                                    pady=(0, 12), sticky=tk.W)
+                                                    pady=(12, 12), padx=12,
+                                                    sticky=tk.W)
 
         labels = ["Code actuel :", "Nouveau code :", "Confirmer :"]
         svars  = [tk.StringVar() for _ in labels]
@@ -1851,19 +2092,23 @@ class AdminPanel:
         tab = ttk.Frame(nb, padding=16)
         nb.add(tab, text="⏻ Arrêt")
 
-        ttk.Label(tab, text="Arrêt de la station",
-                  font=("Arial", 11, "bold")).pack(pady=(0, 8))
+        ttk.Label(tab, text="Gestion de l'alimentation",
+                  font=("Arial", 11, "bold")).pack(anchor=tk.W, pady=(0, 10))
+
+        # ── Arrêt ─────────────────────────────────────────────────────────────
+        off_frame = ttk.LabelFrame(tab, text="Éteindre la station", padding=12)
+        off_frame.pack(fill=tk.X, pady=(0, 12))
+
         ttk.Label(
-            tab,
-            text="Éteint complètement la station de travail.\n\n"
-                 "• Les clés USB gérées sont démontées proprement.\n"
+            off_frame,
+            text="• Les clés USB gérées sont démontées proprement.\n"
                  "• L'application est fermée.\n"
                  "• La commande 'poweroff' est exécutée.\n\n"
                  "⚠  Assurez-vous d'avoir sauvegardé votre travail.",
             justify=tk.LEFT, foreground="#cccccc"
-        ).pack(anchor=tk.W, pady=(0, 16))
+        ).pack(anchor=tk.W, pady=(0, 10))
 
-        def _do():
+        def _do_poweroff():
             if messagebox.askyesno(
                 "⏻ Confirmer l'arrêt",
                 "Voulez-vous vraiment éteindre la station ?",
@@ -1872,8 +2117,44 @@ class AdminPanel:
                 dlg.destroy()
                 self._cb["poweroff"]()
 
-        ttk.Button(tab, text="⏻  Éteindre la station",
-                   command=_do, width=26).pack(pady=8)
+        ttk.Button(off_frame, text="⏻  Éteindre la station",
+                   command=_do_poweroff, width=28).pack(anchor=tk.W)
+
+        # ── Redémarrage ───────────────────────────────────────────────────────
+        rb_frame = ttk.LabelFrame(tab, text="Redémarrer la station", padding=12)
+        rb_frame.pack(fill=tk.X, pady=(0, 12))
+
+        ttk.Label(
+            rb_frame,
+            text="• Les clés USB gérées sont démontées proprement.\n"
+                 "• L'application est fermée.\n"
+                 "• La commande 'reboot' est exécutée.",
+            justify=tk.LEFT, foreground="#cccccc"
+        ).pack(anchor=tk.W, pady=(0, 10))
+
+        def _do_reboot():
+            if messagebox.askyesno(
+                "🔄 Confirmer le redémarrage",
+                "Voulez-vous vraiment redémarrer la station ?",
+                icon="warning", parent=dlg
+            ):
+                dlg.destroy()
+                # Démontage propre puis reboot
+                try:
+                    from usb_manager import UsbManager as _UsbManager
+                    _UsbManager().umount_all()
+                except Exception:
+                    pass
+                import logging as _log
+                try:
+                    from log_handler import log_info as _log_info
+                    _log_info("Redémarrage système.")
+                except Exception:
+                    pass
+                subprocess.run(["reboot"], check=False)
+
+        ttk.Button(rb_frame, text="🔄  Redémarrer la station",
+                   command=_do_reboot, width=28).pack(anchor=tk.W)
 
     # ── Onglet Quitter ────────────────────────────────────────────────────────
 
