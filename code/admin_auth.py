@@ -276,6 +276,8 @@ class AdminPanel:
             "poweroff":           on_poweroff,
             "quit":               on_quit,
         }
+        # Répertoire de l'application (pour résoudre db_manager et autres modules)
+        self._app_dir = os.path.dirname(os.path.abspath(__file__))
         self._get_usb_partitions = get_usb_partitions
         self._refresh_usb        = refresh_usb
         self._pdf_dir            = pdf_dir
@@ -479,7 +481,7 @@ class AdminPanel:
             tree_frame,           # ← parent = tree_frame (correction clé)
             columns=cols,
             show="headings",
-            height=10,
+            height=4,
             selectmode="browse",
             style="Usb.Treeview"
         )
@@ -741,7 +743,7 @@ class AdminPanel:
 
         # ── Volet supérieur : contrôles (scrollable) ──────────────────────────
         top_outer, top_inner = self._scrollable_frame(pane)
-        pane.add(top_outer, minsize=180)
+        pane.add(top_outer, minsize=100)
 
         ttk.Label(top_inner, text="Mise à jour de la base ClamAV",
                   font=("Arial", 11, "bold")).pack(anchor=tk.W,
@@ -774,9 +776,9 @@ class AdminPanel:
 
         # ── Volet inférieur : terminal ─────────────────────────────────────────
         bot = ttk.Frame(pane, padding=(6, 4))
-        pane.add(bot, minsize=120)
+        pane.add(bot, minsize=70)
         term_frame, foot, _append, _clear, status_var, _after = self._make_terminal(
-            bot, height=8)
+            bot, height=4)
         term_frame.pack(fill=tk.BOTH, expand=True)
         foot.pack(fill=tk.X, pady=(2, 0))
 
@@ -809,8 +811,9 @@ class AdminPanel:
             _clear()
             cmd = [
                 "python3", "-c",
+                "import sys; sys.path.insert(0, " + repr(self._app_dir) + "); "
                 "from db_manager import DBManager; "
-                "import sys; db=DBManager(None); "
+                "db=DBManager(None); "
                 "ok,msg=db.download_third_party_sigs(); "
                 "print(msg); sys.exit(0 if ok else 1)"
             ]
@@ -842,7 +845,7 @@ class AdminPanel:
 
         # ── Volet supérieur : contrôles scrollables ───────────────────────────
         top_outer, top_inner = self._scrollable_frame(pane)
-        pane.add(top_outer, minsize=260)
+        pane.add(top_outer, minsize=100)
 
         ttk.Label(top_inner, text="Gestion d'Avast Business for Linux",
                   font=("Arial", 11, "bold")).pack(anchor=tk.W,
@@ -960,9 +963,9 @@ class AdminPanel:
 
         # ── Volet inférieur : terminal ─────────────────────────────────────────
         bot = ttk.Frame(pane, padding=(6, 4))
-        pane.add(bot, minsize=100)
+        pane.add(bot, minsize=70)
         term_frame, foot, _append, _clear, term_status, _after = self._make_terminal(
-            bot, height=8)
+            bot, height=4)
         term_frame.pack(fill=tk.BOTH, expand=True)
         foot.pack(fill=tk.X, pady=(2, 0))
 
@@ -1243,7 +1246,7 @@ class AdminPanel:
 
         # ── Contrôles ─────────────────────────────────────────────────────────
         top_outer, top_inner = self._scrollable_frame(pane)
-        pane.add(top_outer, minsize=140)
+        pane.add(top_outer, minsize=100)
 
         ttk.Label(top_inner, text="Gestion des règles YARA",
                   font=("Arial", 11, "bold")).pack(anchor=tk.W,
@@ -1261,9 +1264,9 @@ class AdminPanel:
 
         # ── Terminal ──────────────────────────────────────────────────────────
         bot = ttk.Frame(pane, padding=(6, 4))
-        pane.add(bot, minsize=100)
+        pane.add(bot, minsize=70)
         term_frame, foot, _append, _clear, status_var, _after = self._make_terminal(
-            bot, height=8)
+            bot, height=4)
         term_frame.pack(fill=tk.BOTH, expand=True)
         foot.pack(fill=tk.X, pady=(2, 0))
 
@@ -1280,8 +1283,9 @@ class AdminPanel:
             _clear()
             cmd = [
                 "python3", "-c",
+                "import sys; sys.path.insert(0, " + repr(self._app_dir) + "); "
                 "from db_manager import DBManager; "
-                "import sys; db=DBManager(None); "
+                "db=DBManager(None); "
                 "ok,msg=db.update_yara_online(); "
                 "print(msg); sys.exit(0 if ok else 1)"
             ]
@@ -1911,7 +1915,7 @@ class AdminPanel:
 
         # ── Volet supérieur : contrôles scrollables ───────────────────────────
         top_outer, top_inner = self._scrollable_frame(pane)
-        pane.add(top_outer, minsize=200)
+        pane.add(top_outer, minsize=100)
 
         ttk.Label(top_inner, text="Maintenance et sécurité du système",
                   font=("Arial", 11, "bold")).pack(anchor=tk.W,
@@ -1950,9 +1954,9 @@ class AdminPanel:
 
         # ── Volet inférieur : terminal ─────────────────────────────────────────
         bot = ttk.Frame(pane, padding=(6, 4))
-        pane.add(bot, minsize=120)
+        pane.add(bot, minsize=70)
         term_frame, foot, _append, _clear, status_var, _after = self._make_terminal(
-            bot, height=10)
+            bot, height=4)
         term_frame.pack(fill=tk.BOTH, expand=True)
         foot.pack(fill=tk.X, pady=(2, 0))
 
