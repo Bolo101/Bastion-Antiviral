@@ -342,10 +342,8 @@ class AdminPanel:
     # ── Onglet Moteurs ────────────────────────────────────────────────────────
 
     def _tab_engines(self, nb: ttk.Notebook) -> None:
-        _tab = ttk.Frame(nb, padding=0)
-        nb.add(_tab, text="🔧 Moteurs")
-        s_outer, tab = self._scrollable_frame(_tab)
-        s_outer.pack(fill=tk.BOTH, expand=True)
+        tab = ttk.Frame(nb, padding=10)
+        nb.add(tab, text="🔧 Moteurs")
 
         ttk.Label(tab, text="Configuration des moteurs d'analyse",
                   font=("Arial", 11, "bold")).pack(anchor=tk.W, pady=(0, 10))
@@ -732,25 +730,14 @@ class AdminPanel:
     # ── Onglet ClamAV ──────────────────────────────────────────────────────────
 
     def _tab_clamav(self, nb: ttk.Notebook) -> None:
-        tab = ttk.Frame(nb, padding=8)
+        tab = ttk.Frame(nb, padding=10)
         nb.add(tab, text="🛡 ClamAV")
 
-        # ── Terminal en bas, contrôles en haut (PanedWindow) ──────────────────
-        pane = tk.PanedWindow(tab, orient=tk.VERTICAL,
-                              sashrelief=tk.FLAT, sashwidth=6,
-                              bg="#1a1a2e")
-        pane.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(tab, text="Mise à jour de la base ClamAV",
+                  font=("Arial", 11, "bold")).pack(anchor=tk.W, pady=(0, 6))
 
-        # ── Volet supérieur : contrôles (scrollable) ──────────────────────────
-        top_outer, top_inner = self._scrollable_frame(pane)
-        pane.add(top_outer, minsize=100)
-
-        ttk.Label(top_inner, text="Mise à jour de la base ClamAV",
-                  font=("Arial", 11, "bold")).pack(anchor=tk.W,
-                                                    pady=(6, 4), padx=6)
-
-        upd_frame = ttk.LabelFrame(top_inner, text="Base principale", padding=8)
-        upd_frame.pack(fill=tk.X, padx=6, pady=(0, 6))
+        upd_frame = ttk.LabelFrame(tab, text="Base principale", padding=8)
+        upd_frame.pack(fill=tk.X, pady=(0, 6))
         ttk.Label(
             upd_frame,
             text="En ligne : freshclam contacte les serveurs ClamAV (Internet requis).\n"
@@ -760,11 +747,8 @@ class AdminPanel:
         btn_row1 = ttk.Frame(upd_frame)
         btn_row1.pack(anchor=tk.W)
 
-        ttk.Separator(top_inner, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=6,
-                                                             pady=4)
-
-        tp_frame = ttk.LabelFrame(top_inner, text="Signatures tierces", padding=8)
-        tp_frame.pack(fill=tk.X, padx=6, pady=(0, 6))
+        tp_frame = ttk.LabelFrame(tab, text="Signatures tierces", padding=8)
+        tp_frame.pack(fill=tk.X, pady=(0, 6))
         ttk.Label(
             tp_frame,
             text="URLhaus (abuse.ch), Sanesecurity, InterServer…\n"
@@ -774,13 +758,8 @@ class AdminPanel:
         btn_row2 = ttk.Frame(tp_frame)
         btn_row2.pack(anchor=tk.W)
 
-        # ── Volet inférieur : terminal ─────────────────────────────────────────
-        bot = ttk.Frame(pane, padding=(6, 4))
-        pane.add(bot, minsize=70)
-        term_frame, foot, _append, _clear, status_var, _after = self._make_terminal(
-            bot, height=4)
-        term_frame.pack(fill=tk.BOTH, expand=True)
-        foot.pack(fill=tk.X, pady=(2, 0))
+        # ── Terminal mini en bas à droite ─────────────────────────────────────
+        _, _, _append, _clear, status_var, _after = self._mini_terminal(tab)
 
         # ── Wiring des boutons ────────────────────────────────────────────────
         all_btns: list = []
@@ -797,14 +776,11 @@ class AdminPanel:
             self._stream_to_terminal(
                 ["freshclam", "--datadir=/var/lib/clamav"],
                 "ClamAV — freshclam", _append, status_var,
-                set_btns_fn=_set_btns,
-                on_done=lambda rc: self._cb["avast_refresh"](),
-                after_fn=_after
+                set_btns_fn=_set_btns, after_fn=_after
             )
 
         def _do_usb():
             _append("⚙ Lancement import USB ClamAV…", "info")
-            status_var.set("Import USB en cours…")
             self._cb["clamav_usb"]()
 
         def _do_thirdparty():
@@ -836,24 +812,15 @@ class AdminPanel:
     # ── Onglet Avast ───────────────────────────────────────────────────────────
 
     def _tab_avast(self, nb: ttk.Notebook) -> None:
-        tab = ttk.Frame(nb, padding=8)
+        tab = ttk.Frame(nb, padding=10)
         nb.add(tab, text="🔐 Avast")
 
-        pane = tk.PanedWindow(tab, orient=tk.VERTICAL,
-                              sashrelief=tk.FLAT, sashwidth=6, bg="#1a1a2e")
-        pane.pack(fill=tk.BOTH, expand=True)
-
-        # ── Volet supérieur : contrôles scrollables ───────────────────────────
-        top_outer, top_inner = self._scrollable_frame(pane)
-        pane.add(top_outer, minsize=100)
-
-        ttk.Label(top_inner, text="Gestion d'Avast Business for Linux",
-                  font=("Arial", 11, "bold")).pack(anchor=tk.W,
-                                                    pady=(6, 4), padx=6)
+        ttk.Label(tab, text="Gestion d'Avast Business for Linux",
+                  font=("Arial", 11, "bold")).pack(anchor=tk.W, pady=(0, 6))
 
         # ── Statut ────────────────────────────────────────────────────────────
-        status_frame = ttk.LabelFrame(top_inner, text="Statut", padding=8)
-        status_frame.pack(fill=tk.X, padx=6, pady=(0, 6))
+        status_frame = ttk.LabelFrame(tab, text="Statut", padding=8)
+        status_frame.pack(fill=tk.X, pady=(0, 6))
         self._avast_status_var = tk.StringVar(value="Vérification…")
         ttk.Label(status_frame, textvariable=self._avast_status_var,
                   foreground="#7ec8e3", font=("Courier", 9)).pack(anchor=tk.W)
@@ -863,10 +830,9 @@ class AdminPanel:
         self._refresh_avast_status_display()
 
         # ── Installation ──────────────────────────────────────────────────────
-        install_frame = ttk.LabelFrame(top_inner,
-                                       text="Installation (mode installé)",
+        install_frame = ttk.LabelFrame(tab, text="Installation (mode installé)",
                                        padding=8)
-        install_frame.pack(fill=tk.X, padx=6, pady=(0, 6))
+        install_frame.pack(fill=tk.X, pady=(0, 6))
         ttk.Label(
             install_frame,
             text="Installe Avast Business for Linux depuis le dépôt officiel.\n"
@@ -877,8 +843,8 @@ class AdminPanel:
         install_row.pack(anchor=tk.W)
 
         # ── Licence ───────────────────────────────────────────────────────────
-        lic_frame = ttk.LabelFrame(top_inner, text="Licence Business", padding=8)
-        lic_frame.pack(fill=tk.X, padx=6, pady=(0, 6))
+        lic_frame = ttk.LabelFrame(tab, text="Licence Business", padding=8)
+        lic_frame.pack(fill=tk.X, pady=(0, 6))
 
         ttk.Label(lic_frame, text="A — Code d'activation (Internet requis) :",
                   foreground="#cccccc").grid(row=0, column=0, columnspan=3,
@@ -952,8 +918,8 @@ class AdminPanel:
                    command=_import_browsed, width=16).pack(side=tk.LEFT)
 
         # ── Base VPS ──────────────────────────────────────────────────────────
-        vps_frame = ttk.LabelFrame(top_inner, text="Base VPS (définitions)", padding=8)
-        vps_frame.pack(fill=tk.X, padx=6, pady=(0, 6))
+        vps_frame = ttk.LabelFrame(tab, text="Base VPS (définitions)", padding=8)
+        vps_frame.pack(fill=tk.X, pady=(0, 6))
         ttk.Label(vps_frame,
                   text="En ligne : avast update (Internet requis).\n"
                        "Hors-ligne : copiez un fichier .vps/.vpz sur une clé USB.",
@@ -961,13 +927,8 @@ class AdminPanel:
         vps_row = ttk.Frame(vps_frame)
         vps_row.pack(anchor=tk.W)
 
-        # ── Volet inférieur : terminal ─────────────────────────────────────────
-        bot = ttk.Frame(pane, padding=(6, 4))
-        pane.add(bot, minsize=70)
-        term_frame, foot, _append, _clear, term_status, _after = self._make_terminal(
-            bot, height=4)
-        term_frame.pack(fill=tk.BOTH, expand=True)
-        foot.pack(fill=tk.X, pady=(2, 0))
+        # ── Terminal mini en bas à droite ─────────────────────────────────────
+        _, _, _append, _clear, term_status, _after = self._mini_terminal(tab)
 
         # ── Wiring ────────────────────────────────────────────────────────────
         all_btns: list = []
@@ -1072,27 +1033,82 @@ class AdminPanel:
     # ══════════════════════════════════════════════════════════════════════════
 
     @staticmethod
-    def _scrollable_frame(parent: tk.Widget):
+    def _mini_terminal(parent: tk.Widget):
         """
-        Retourne un tuple (outer, inner) où outer se pack() dans parent
-        et inner est le Frame dans lequel on place le contenu.
-        Le contenu de inner défile verticalement.
+        Terminal miniature 3 lignes ancré en bas à droite du parent.
+        Retourne (frame, foot, append_fn, clear_fn, status_var, after_fn).
         """
-        outer = ttk.Frame(parent)
-        canvas = tk.Canvas(outer, highlightthickness=0)
-        vsb    = ttk.Scrollbar(outer, orient=tk.VERTICAL, command=canvas.yview)
-        canvas.configure(yscrollcommand=vsb.set)
-        vsb.pack(side=tk.RIGHT, fill=tk.Y)
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        inner  = ttk.Frame(canvas)
-        win_id = canvas.create_window((0, 0), window=inner, anchor="nw")
-        inner.bind("<Configure>", lambda e: (
-            canvas.configure(scrollregion=canvas.bbox("all")),
-            canvas.itemconfig(win_id, width=canvas.winfo_width())
-        ))
-        canvas.bind("<Configure>",
-                    lambda e: canvas.itemconfig(win_id, width=e.width))
-        return outer, inner
+        bottom_bar = ttk.Frame(parent)
+        bottom_bar.pack(side=tk.BOTTOM, fill=tk.X, pady=(6, 0))
+
+        # Statut à gauche, terminal à droite
+        status_var = tk.StringVar(value="Prêt.")
+        ttk.Label(bottom_bar, textvariable=status_var,
+                  foreground="#7ec8e3", font=("Arial", 8)).pack(side=tk.LEFT,
+                                                                  padx=(0, 8))
+
+        term_wrap = ttk.LabelFrame(bottom_bar, text="Activité", padding=2)
+        term_wrap.pack(side=tk.RIGHT)
+
+        txt = tk.Text(
+            term_wrap, bg="#0b0d14", fg="#c8d0de",
+            font=("Courier", 7), wrap=tk.WORD,
+            state=tk.DISABLED, relief=tk.FLAT,
+            height=6, width=120,
+            padx=4, pady=2
+        )
+        sb = ttk.Scrollbar(term_wrap, orient=tk.VERTICAL, command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        txt.tag_config("ok",      foreground="#4ec94e")
+        txt.tag_config("threat",  foreground="#ff4444")
+        txt.tag_config("warning", foreground="#ffaa00")
+        txt.tag_config("info",    foreground="#5577aa")
+        txt.tag_config("normal",  foreground="#c8d0de")
+        txt.pack(side=tk.LEFT)
+        sb.pack(side=tk.LEFT, fill=tk.Y)
+
+        ttk.Button(term_wrap, text="✕", width=2,
+                   command=lambda: (
+                       txt.configure(state=tk.NORMAL),
+                       txt.delete("1.0", tk.END),
+                       txt.configure(state=tk.DISABLED),
+                       status_var.set("Prêt.")
+                   )).pack(side=tk.LEFT, padx=(2, 0))
+
+        def _append(line: str, tag: str = "normal") -> None:
+            def _do():
+                try:
+                    txt.configure(state=tk.NORMAL)
+                    txt.insert(tk.END, line + "\n", tag)
+                    txt.see(tk.END)
+                    txt.configure(state=tk.DISABLED)
+                except Exception:
+                    pass
+            try:
+                txt.after(0, _do)
+            except Exception:
+                pass
+
+        def _clear() -> None:
+            def _do():
+                try:
+                    txt.configure(state=tk.NORMAL)
+                    txt.delete("1.0", tk.END)
+                    txt.configure(state=tk.DISABLED)
+                except Exception:
+                    pass
+            try:
+                txt.after(0, _do)
+            except Exception:
+                pass
+
+        def _after(ms: int, fn, *args):
+            try:
+                txt.after(ms, fn, *args)
+            except Exception:
+                pass
+
+        return bottom_bar, None, _append, _clear, status_var, _after
 
     @staticmethod
     def _make_terminal(parent: tk.Widget, height: int = 10):
@@ -1237,22 +1253,14 @@ class AdminPanel:
     # ── Onglet YARA ────────────────────────────────────────────────────────────
 
     def _tab_yara(self, nb: ttk.Notebook) -> None:
-        tab = ttk.Frame(nb, padding=8)
+        tab = ttk.Frame(nb, padding=10)
         nb.add(tab, text="🔍 YARA")
 
-        pane = tk.PanedWindow(tab, orient=tk.VERTICAL,
-                              sashrelief=tk.FLAT, sashwidth=6, bg="#1a1a2e")
-        pane.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(tab, text="Gestion des règles YARA",
+                  font=("Arial", 11, "bold")).pack(anchor=tk.W, pady=(0, 6))
 
-        # ── Contrôles ─────────────────────────────────────────────────────────
-        top_outer, top_inner = self._scrollable_frame(pane)
-        pane.add(top_outer, minsize=100)
-
-        ttk.Label(top_inner, text="Gestion des règles YARA",
-                  font=("Arial", 11, "bold")).pack(anchor=tk.W,
-                                                    pady=(6, 4), padx=6)
-        ctrl_frame = ttk.LabelFrame(top_inner, text="Règles signature-base", padding=8)
-        ctrl_frame.pack(fill=tk.X, padx=6, pady=(0, 6))
+        ctrl_frame = ttk.LabelFrame(tab, text="Règles signature-base", padding=8)
+        ctrl_frame.pack(fill=tk.X, pady=(0, 6))
         ttk.Label(
             ctrl_frame,
             text="En ligne  : télécharge signature-base de Florian Roth (GitHub) — ~30 Mo.\n"
@@ -1262,13 +1270,8 @@ class AdminPanel:
         btn_row = ttk.Frame(ctrl_frame)
         btn_row.pack(anchor=tk.W)
 
-        # ── Terminal ──────────────────────────────────────────────────────────
-        bot = ttk.Frame(pane, padding=(6, 4))
-        pane.add(bot, minsize=70)
-        term_frame, foot, _append, _clear, status_var, _after = self._make_terminal(
-            bot, height=4)
-        term_frame.pack(fill=tk.BOTH, expand=True)
-        foot.pack(fill=tk.X, pady=(2, 0))
+        # ── Terminal mini en bas à droite ─────────────────────────────────────
+        _, _, _append, _clear, status_var, _after = self._mini_terminal(tab)
 
         all_btns: list = []
 
@@ -1294,7 +1297,6 @@ class AdminPanel:
 
         def _do_usb():
             _append("⚙ Lancement import USB YARA…", "info")
-            status_var.set("Import USB en cours…")
             self._cb["yara_usb"]()
 
         b_online = ttk.Button(btn_row, text="🌐  Télécharger signature-base",
@@ -1433,8 +1435,26 @@ class AdminPanel:
 
     def _tab_pdf(self, nb: ttk.Notebook, dlg: tk.Toplevel) -> None:
         """Onglet de gestion des PDFs affichés en boucle sur l'interface."""
-        tab = ttk.Frame(nb, padding=10)
-        nb.add(tab, text="📄 PDFs")
+        _outer = ttk.Frame(nb)
+        nb.add(_outer, text="📄 PDFs")
+
+        # ── Canvas scrollable pour que tous les boutons soient accessibles ────
+        _canvas = tk.Canvas(_outer, highlightthickness=0)
+        _vsb    = ttk.Scrollbar(_outer, orient=tk.VERTICAL, command=_canvas.yview)
+        _canvas.configure(yscrollcommand=_vsb.set)
+        _vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        _canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        tab = ttk.Frame(_canvas, padding=10)
+        _win = _canvas.create_window((0, 0), window=tab, anchor="nw")
+        tab.bind("<Configure>", lambda e: (
+            _canvas.configure(scrollregion=_canvas.bbox("all")),
+            _canvas.itemconfig(_win, width=_canvas.winfo_width())
+        ))
+        _canvas.bind("<Configure>",
+                     lambda e: _canvas.itemconfig(_win, width=e.width))
+        # Molette souris
+        _canvas.bind_all("<MouseWheel>",
+                         lambda e: _canvas.yview_scroll(-1*(e.delta//120), "units"))
 
         ttk.Label(tab, text="Gestion des PDFs de la visionneuse",
                   font=("Arial", 11, "bold")).pack(anchor=tk.W, pady=(0, 6))
@@ -1447,7 +1467,7 @@ class AdminPanel:
 
         cols = ("name", "size")
         tree = ttk.Treeview(list_frame, columns=cols, show="headings",
-                            height=6, selectmode="extended")
+                            height=4, selectmode="extended")
         tree.heading("name", text="Fichier")
         tree.heading("size", text="Taille")
         tree.column("name", width=360, anchor=tk.W)
@@ -1628,7 +1648,7 @@ class AdminPanel:
         usb_tree_wrap.pack(fill=tk.BOTH, expand=True)
 
         usb_tree = ttk.Treeview(usb_tree_wrap, columns=("fname", "sz"),
-                                 show="headings", height=6,
+                                 show="headings", height=4,
                                  selectmode="extended")
         usb_tree.heading("fname", text="Fichier PDF (chemin relatif)")
         usb_tree.heading("sz",    text="Taille")
@@ -1709,19 +1729,16 @@ class AdminPanel:
 
         ttk.Button(usb_frame, text="⬆  Copier les PDFs sélectionnés vers ../pdf/",
                    command=_import_selected,
-                   width=44).pack(anchor=tk.W, pady=(0, 4))
+                   width=44).pack(anchor=tk.W, pady=(0, 12))
 
     # ── Onglet Journaux ────────────────────────────────────────────────────────
 
     def _tab_logs(self, nb: ttk.Notebook) -> None:
-        _tab = ttk.Frame(nb, padding=0)
-        nb.add(_tab, text="📋 Journaux")
-        s_outer, tab = self._scrollable_frame(_tab)
-        s_outer.pack(fill=tk.BOTH, expand=True)
+        tab = ttk.Frame(nb, padding=10)
+        nb.add(tab, text="📋 Journaux")
 
         ttk.Label(tab, text="Journaux d'activité et statistiques",
-                  font=("Arial", 11, "bold")).pack(anchor=tk.W, pady=(8, 6),
-                                                    padx=8)
+                  font=("Arial", 11, "bold")).pack(anchor=tk.W, pady=(0, 6))
 
         # ── Statistiques de scan ───────────────────────────────────────────────
         stats_frame = ttk.LabelFrame(tab, text="Statistiques de la session", padding=8)
@@ -1906,25 +1923,16 @@ class AdminPanel:
 
     def _tab_system(self, nb: ttk.Notebook) -> None:
         """Onglet de maintenance système : mises à jour APT et analyse sécurité."""
-        tab = ttk.Frame(nb, padding=8)
+        tab = ttk.Frame(nb, padding=10)
         nb.add(tab, text="🖥 Système")
 
-        pane = tk.PanedWindow(tab, orient=tk.VERTICAL,
-                              sashrelief=tk.FLAT, sashwidth=6, bg="#1a1a2e")
-        pane.pack(fill=tk.BOTH, expand=True)
-
-        # ── Volet supérieur : contrôles scrollables ───────────────────────────
-        top_outer, top_inner = self._scrollable_frame(pane)
-        pane.add(top_outer, minsize=100)
-
-        ttk.Label(top_inner, text="Maintenance et sécurité du système",
-                  font=("Arial", 11, "bold")).pack(anchor=tk.W,
-                                                    pady=(6, 6), padx=6)
+        ttk.Label(tab, text="Maintenance et sécurité du système",
+                  font=("Arial", 11, "bold")).pack(anchor=tk.W, pady=(0, 6))
 
         # ── Mises à jour APT ─────────────────────────────────────────────────
-        apt_frame = ttk.LabelFrame(top_inner, text="Mises à jour du système (APT)",
+        apt_frame = ttk.LabelFrame(tab, text="Mises à jour du système (APT)",
                                    padding=10)
-        apt_frame.pack(fill=tk.X, padx=6, pady=(0, 8))
+        apt_frame.pack(fill=tk.X, pady=(0, 8))
         ttk.Label(
             apt_frame,
             text="Lance apt update → apt full-upgrade → autoremove de façon non interactive.",
@@ -1932,9 +1940,9 @@ class AdminPanel:
         ).pack(anchor=tk.W, pady=(0, 6))
 
         # ── Analyse antivirus (ClamAV) ────────────────────────────────────────
-        av_frame = ttk.LabelFrame(top_inner, text="Analyse antivirale (ClamAV)",
+        av_frame = ttk.LabelFrame(tab, text="Analyse antivirale (ClamAV)",
                                   padding=10)
-        av_frame.pack(fill=tk.X, padx=6, pady=(0, 8))
+        av_frame.pack(fill=tk.X, pady=(0, 8))
         ttk.Label(
             av_frame,
             text="Analyse complète : / avec exclusions /proc /sys /dev /run.\n"
@@ -1943,22 +1951,17 @@ class AdminPanel:
         ).pack(anchor=tk.W, pady=(0, 6))
 
         # ── Analyse chkrootkit ────────────────────────────────────────────────
-        rk_frame = ttk.LabelFrame(top_inner, text="Détection de rootkits (chkrootkit)",
+        rk_frame = ttk.LabelFrame(tab, text="Détection de rootkits (chkrootkit)",
                                   padding=10)
-        rk_frame.pack(fill=tk.X, padx=6, pady=(0, 8))
+        rk_frame.pack(fill=tk.X, pady=(0, 8))
         ttk.Label(
             rk_frame,
             text="Lance chkrootkit (apt install chkrootkit si absent).",
             foreground="#cccccc", justify=tk.LEFT
         ).pack(anchor=tk.W, pady=(0, 6))
 
-        # ── Volet inférieur : terminal ─────────────────────────────────────────
-        bot = ttk.Frame(pane, padding=(6, 4))
-        pane.add(bot, minsize=70)
-        term_frame, foot, _append, _clear, status_var, _after = self._make_terminal(
-            bot, height=4)
-        term_frame.pack(fill=tk.BOTH, expand=True)
-        foot.pack(fill=tk.X, pady=(2, 0))
+        # ── Terminal mini en bas à droite ─────────────────────────────────────
+        _, _, _append, _clear, status_var, _after = self._mini_terminal(tab)
 
         all_btns: list = []
 
@@ -2044,17 +2047,15 @@ class AdminPanel:
     # ── Onglet Sécurité ────────────────────────────────────────────────────────
 
     def _tab_security(self, nb: ttk.Notebook) -> None:
-        _tab = ttk.Frame(nb, padding=0)
-        nb.add(_tab, text="🔑 Sécurité")
-        s_outer, tab = self._scrollable_frame(_tab)
-        s_outer.pack(fill=tk.BOTH, expand=True)
+        tab = ttk.Frame(nb, padding=10)
+        nb.add(tab, text="🔑 Sécurité")
 
         auth = self._auth
 
         ttk.Label(tab, text="Changer le code administrateur",
                   font=("Arial", 11, "bold")).grid(row=0, column=0,
                                                     columnspan=2,
-                                                    pady=(12, 12), padx=12,
+                                                    pady=(0, 12),
                                                     sticky=tk.W)
 
         labels = ["Code actuel :", "Nouveau code :", "Confirmer :"]
