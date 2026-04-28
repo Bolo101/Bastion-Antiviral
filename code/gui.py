@@ -936,6 +936,7 @@ class VirusScannerGUI:
                         "threat": tname,
                         "hash":   sha,
                         "dev":    dev,
+                        "mp":     self._targets_map.get(dev, ""),  # mountpoint au moment du scan
                     })
                     self._session_threats.append(item)
                     self._cumul_threats += 1
@@ -1031,66 +1032,113 @@ class VirusScannerGUI:
     # ── Suppression des fichiers infectés ─────────────────────────────────────
 
     def _delete_threat_files(self, threats: list) -> None:
-        """Supprime les fichiers infectés en remontant les supports en RW si nécessaire."""
+        """
+        Supprime les fichiers infectés en remontant les supports en RW.
+
+        Problème clé : après l'export PDF, le support est démonté.
+        Quand on le remonte, le point de montage peut différer de celui utilisé
+        pendant le scan (ex. /media/user/SANDISK → /mnt/avscan_usb/sdb1).
+        On traduit donc chaque chemin : ancien_mp/rel → nouveau_mp/rel.
+        """
         import threading as _th
 
-        # Construire un index dev → [ThreatInfo] depuis _threat_details
-        file_to_dev = {d["file"]: d.get("dev", "") for d in self._threat_details}
+        # Index : chemin_fichier → (device, mountpoint_au_scan)
+        file_info = {
+            d["file"]: (d.get("dev", ""), d.get("mp", ""))
+            for d in self._threat_details
+        }
 
         def _worker():
             deleted, failed = [], []
 
-            # Regrouper par périphérique
-            by_dev: dict = {}
+            # Regrouper les menaces par (device, mountpoint_scan)
+            by_dev: dict = {}   # dev → {"scan_mp": str, "threats": [...]}
             for t in threats:
-                dev = file_to_dev.get(t.path, "")
-                by_dev.setdefault(dev, []).append(t)
+                dev, scan_mp = file_info.get(t.path, ("", ""))
+                if dev not in by_dev:
+                    by_dev[dev] = {"scan_mp": scan_mp, "threats": []}
+                by_dev[dev]["threats"].append(t)
 
-            for dev, dev_threats in by_dev.items():
-                mp       = self.usb.get_mountpoint(dev) if dev else None
-                action   = None
-                remounted = False
+            for dev, data in by_dev.items():
+                scan_mp    = data["scan_mp"]
+                dev_threats = data["threats"]
+                action     = None
+                new_mp     = None
 
                 if dev:
-                    if not mp:
-                        # Non monté → monter en RW pour pouvoir supprimer
-                        ok_mnt, _, mp, action = self.usb.mount_rw(dev)
-                        remounted = ok_mnt
-                    elif self.usb._is_ro(dev, mp):
+                    cur_mp = self.usb.get_mountpoint(dev)
+                    if not cur_mp:
+                        # Périphérique démonté → remonter en RW
+                        ok_mnt, msg_mnt, new_mp, action = self.usb.mount_rw(dev)
+                        if not ok_mnt:
+                            self.root.after(0, self._log,
+                                            f"❌ Impossible de monter {dev} en RW : {msg_mnt}",
+                                            "threat")
+                            failed.extend(t.path for t in dev_threats)
+                            continue
+                    elif self.usb._is_ro(dev, cur_mp):
                         # Monté RO → remonter en RW
-                        ok_mnt, _, mp, action = self.usb.mount_rw(dev)
-                        remounted = ok_mnt
+                        ok_mnt, msg_mnt, new_mp, action = self.usb.mount_rw(dev)
+                        if not ok_mnt:
+                            self.root.after(0, self._log,
+                                            f"❌ Impossible de remonter {dev} en RW : {msg_mnt}",
+                                            "threat")
+                            failed.extend(t.path for t in dev_threats)
+                            continue
+                    else:
+                        # Déjà monté RW
+                        new_mp = cur_mp
 
                 for t in dev_threats:
+                    # ── Translation du chemin si le mountpoint a changé ───────
+                    # Cas typique : scan sur /media/user/SANDISK,
+                    # remontage sur /mnt/avscan_usb/sdb1
+                    actual_path = t.path
+                    if new_mp and scan_mp and scan_mp != new_mp:
+                        try:
+                            rel = os.path.relpath(t.path, scan_mp)
+                            actual_path = os.path.join(new_mp, rel)
+                        except ValueError:
+                            pass  # relpath impossible (Windows-style paths, etc.)
+
                     try:
-                        if os.path.exists(t.path):
-                            os.remove(t.path)
-                            deleted.append(t.path)
+                        if os.path.exists(actual_path):
+                            os.remove(actual_path)
+                            deleted.append(actual_path)
                             self.root.after(0, self._log,
-                                            f"🗑 Supprimé : {os.path.basename(t.path)}",
+                                            f"🗑 Supprimé : {os.path.basename(actual_path)}",
                                             "warning")
                         else:
-                            self.root.after(0, self._log,
-                                            f"ℹ Déjà absent : {os.path.basename(t.path)}",
-                                            "info")
+                            # Dernière tentative avec le chemin brut original
+                            if actual_path != t.path and os.path.exists(t.path):
+                                os.remove(t.path)
+                                deleted.append(t.path)
+                                self.root.after(0, self._log,
+                                                f"🗑 Supprimé : {os.path.basename(t.path)}",
+                                                "warning")
+                            else:
+                                failed.append(actual_path)
+                                self.root.after(0, self._log,
+                                                f"❌ Introuvable : {os.path.basename(t.path)}"
+                                                f"  (cherché dans {new_mp or scan_mp})",
+                                                "threat")
                     except Exception as exc:
-                        failed.append(t.path)
+                        failed.append(actual_path)
                         self.root.after(0, self._log,
                                         f"❌ Impossible de supprimer "
                                         f"{os.path.basename(t.path)} : {exc}",
                                         "threat")
 
                 # Restaurer le montage RO après suppression
-                if dev and remounted:
+                if dev and action:
                     self.usb.restore_after_export(dev, action)
 
-            # Bilan
+            # ── Bilan ─────────────────────────────────────────────────────────
             summary = f"✅ {len(deleted)} fichier(s) infecté(s) supprimé(s)."
             if failed:
                 summary += (f"\n❌ {len(failed)} fichier(s) non supprimé(s) "
-                            "(voir journal — droits insuffisants ?).")
-            self.root.after(0, messagebox.showinfo,
-                            "Suppression terminée", summary)
+                            "(voir journal).")
+            self.root.after(0, messagebox.showinfo, "Suppression terminée", summary)
             self.root.after(0, self._refresh_usb)
 
         _th.Thread(target=_worker, daemon=True).start()
