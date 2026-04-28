@@ -36,6 +36,7 @@ class ThreatInfo:
     path:   str
     threat: str
     engine: str   # "ClamAV" | "Avast" | "YARA"
+    hash:   str   = ""   # SHA-256 calculé au moment de la détection
 
 
 @dataclass
@@ -97,6 +98,21 @@ class ScanEngine:
     def _reset(self) -> None:
         self._stop = False
         self._proc = None
+
+    # ── Hash SHA-256 ───────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _compute_hash(path: str) -> str:
+        """Calcule le SHA-256 d'un fichier. Retourne '' en cas d'erreur."""
+        import hashlib
+        try:
+            h = hashlib.sha256()
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(65536), b""):
+                    h.update(chunk)
+            return h.hexdigest()
+        except Exception:
+            return ""
 
     # ── Détection : ClamAV ────────────────────────────────────────────────────
 
@@ -355,8 +371,7 @@ class ScanEngine:
             "--alert-broken",
             "--detect-pua=yes",
         ]
-        if remove:
-            cmd.append("--remove")
+        # Note : la suppression est gérée en post-scan par l'interface (pas de --remove ici)
         cmd.extend(targets)
 
         if cb:
@@ -418,10 +433,11 @@ class ScanEngine:
             parts  = line.rsplit(":", 1)
             path   = parts[0].strip()
             threat = parts[1].replace(" FOUND", "").strip() if len(parts) == 2 else line
+            sha    = ScanEngine._compute_hash(path)
             result.infected       += 1
             result.scanned_clamav += 1
             result.scanned        += 1
-            result.threats.append(ThreatInfo(path=path, threat=threat, engine="ClamAV"))
+            result.threats.append(ThreatInfo(path=path, threat=threat, engine="ClamAV", hash=sha))
             if cb:
                 cb(f"🚨 ClamAV : {threat}  →  {path}", "threat")
             if fcc:
@@ -512,16 +528,13 @@ class ScanEngine:
         # Construction de la commande
         # `scan` est le CLI dédié ; s'il n'est pas disponible, on utilise
         # `avast scan` (interface daemon)
+        # Note : la suppression est gérée en post-scan — pas de flag -a / --action remove
         scan_binary_name = os.path.basename(avast_bin)
         if scan_binary_name == "scan":
             cmd = [avast_bin, "-p"]           # -p : afficher chemin + statut
-            if remove:
-                cmd.append("-a")              # -a action=delete (selon version)
             cmd.extend(targets)
         else:
             cmd = [avast_bin, "scan", "-r"]   # avast scan --recursive
-            if remove:
-                cmd += ["--action", "remove"]
             cmd.extend(targets)
 
         if cb:
@@ -584,11 +597,12 @@ class ScanEngine:
                     threat = threat.replace(suffix, "")
                 threat = threat.strip()
                 if threat and threat != "[+]":
+                    sha = ScanEngine._compute_hash(path)
                     result.infected += 1
                     result.scanned_avast += 1
                     result.scanned       += 1
                     result.threats.append(
-                        ThreatInfo(path=path, threat=threat, engine="Avast")
+                        ThreatInfo(path=path, threat=threat, engine="Avast", hash=sha)
                     )
                     if cb:
                         cb(f"🚨 Avast : {threat}  →  {path}", "threat")
@@ -617,11 +631,12 @@ class ScanEngine:
             path, _, threat = stripped.partition(": ")
             threat = threat.strip()
             if threat and threat.upper() not in ("OK", "CLEAN", ""):
+                sha = ScanEngine._compute_hash(path.strip())
                 result.infected      += 1
                 result.scanned_avast += 1
                 result.scanned       += 1
                 result.threats.append(
-                    ThreatInfo(path=path.strip(), threat=threat, engine="Avast")
+                    ThreatInfo(path=path.strip(), threat=threat, engine="Avast", hash=sha)
                 )
                 if cb:
                     cb(f"🚨 Avast : {threat}  →  {path.strip()}", "threat")
@@ -721,10 +736,11 @@ class ScanEngine:
                 for rules in compiled_sets:
                     matches = rules.match(fpath, externals=exts, timeout=15)
                     for m in matches:
+                        sha = ScanEngine._compute_hash(fpath)
                         result.infected      += 1
                         result.scanned_yara  += 1
                         result.threats.append(
-                            ThreatInfo(path=fpath, threat=m.rule, engine="YARA")
+                            ThreatInfo(path=fpath, threat=m.rule, engine="YARA", hash=sha)
                         )
                         if cb:
                             cb(f"🚨 YARA : {m.rule}  →  {fpath}", "threat")
@@ -789,13 +805,15 @@ class ScanEngine:
                             parts = line.split(None, 1)
                             if len(parts) == 2:
                                 rule_name, fpath = parts
+                                sha = ScanEngine._compute_hash(fpath)
                                 result.infected      += 1
                                 result.scanned_yara  += 1
                                 result.scanned       += 1
                                 result.threats.append(
                                     ThreatInfo(path=fpath,
                                                threat=rule_name,
-                                               engine="YARA")
+                                               engine="YARA",
+                                               hash=sha)
                                 )
                                 if cb:
                                     cb(f"🚨 YARA : {rule_name}  →  {fpath}", "threat")

@@ -99,6 +99,7 @@ class VirusScannerGUI:
         self._total_keys_scanned: int       = 0   # nombre de clés USB analysées
         self._cumul_threats:      int       = 0   # menaces cumulées toutes sessions
         self._threat_details:     List[dict] = []  # [{file, hash, threat, ts}]
+        self._session_threats:    List       = []  # ThreatInfo de la session en cours
 
         # ── Visionneuse PDF ───────────────────────────────────────────────────
         self._pdf_viewer:   Optional[PdfViewer] = None
@@ -788,38 +789,18 @@ class VirusScannerGUI:
             ):
                 return
 
-        # Prépare les cibles
-        remove = self.remove_var.get()
+        # Prépare les cibles — toujours en lecture seule pendant le scan
+        # (la suppression éventuelle est effectuée après, en remontant en RW)
         targets_map: Dict[str, str] = {}
         for dev in devs_to_scan:
             mp = self.usb.get_mountpoint(dev)
-
-            if remove:
-                # Suppression activée → le disque doit être monté en RW
-                if mp and self.usb._is_ro(dev, mp):
-                    # Déjà monté RO → remonter en RW
-                    ok_rw, msg_rw, mp_rw, _ = self.usb.mount_rw(dev)
-                    if not ok_rw:
-                        messagebox.showerror("Montage RW", msg_rw, parent=self.root)
-                        continue
-                    mp = mp_rw
-                elif not mp:
-                    # Non monté → montage direct en RW
-                    ok_rw, msg_rw, mp_rw, _ = self.usb.mount_rw(dev)
-                    if not ok_rw:
-                        messagebox.showerror("Montage RW", msg_rw, parent=self.root)
-                        continue
-                    mp = mp_rw
-                # else : déjà monté RW → utiliser tel quel
-            else:
-                # Suppression désactivée → montage RO normal
-                if not mp:
-                    ok, msg = self.usb.mount(dev)
-                    if not ok:
-                        messagebox.showerror("Montage", msg, parent=self.root)
-                        continue
-                    self._refresh_usb()
-                    mp = self.usb.get_mountpoint(dev)
+            if not mp:
+                ok, msg = self.usb.mount(dev)
+                if not ok:
+                    messagebox.showerror("Montage", msg, parent=self.root)
+                    continue
+                self._refresh_usb()
+                mp = self.usb.get_mountpoint(dev)
 
             if not mp:
                 messagebox.showerror(
@@ -838,6 +819,7 @@ class VirusScannerGUI:
             self._total_infected   = 0
             self._per_dev_scanned  = {}
             self._per_dev_infected = {}
+            self._session_threats  = []   # réinitialiser pour cette session
 
         self.stop_btn.configure(state=tk.NORMAL, bg=self.ACCENT)
         self._anim_state = "scanning"
@@ -942,23 +924,12 @@ class VirusScannerGUI:
             # ── Enregistrement des détails de menaces avec hash SHA-256 ───────
             threats = getattr(result, "threats", []) or []
             if threats:
-                import hashlib as _hl
                 ts = time.strftime("%Y-%m-%d %H:%M:%S")
                 for item in threats:
-                    # item peut être (filepath, threat_name) ou juste filepath
-                    if isinstance(item, (list, tuple)) and len(item) >= 2:
-                        fpath, tname = str(item[0]), str(item[1])
-                    else:
-                        fpath, tname = str(item), "inconnu"
-                    sha = "N/A"
-                    try:
-                        h = _hl.sha256()
-                        with open(fpath, "rb") as _f:
-                            for chunk in iter(lambda: _f.read(65536), b""):
-                                h.update(chunk)
-                        sha = h.hexdigest()
-                    except Exception:
-                        pass
+                    # item est un ThreatInfo avec path, threat, engine, hash
+                    fpath  = item.path
+                    tname  = item.threat
+                    sha    = item.hash if item.hash else "N/A"
                     self._threat_details.append({
                         "ts":     ts,
                         "file":   fpath,
@@ -966,6 +937,7 @@ class VirusScannerGUI:
                         "hash":   sha,
                         "dev":    dev,
                     })
+                    self._session_threats.append(item)
                     self._cumul_threats += 1
         else:
             self._log(f"❌ {dev} : erreur durant le scan.", "threat")
@@ -998,7 +970,9 @@ class VirusScannerGUI:
     def _all_scans_done(self) -> None:
         self.stop_btn.configure(state=tk.DISABLED, bg="#444")
 
-        if self._total_infected > 0:
+        all_threats = list(self._session_threats)
+
+        if all_threats:
             self._anim_state = "threat"
             self.status_var.set(
                 f"⚠  {self._total_infected} menace(s) détectée(s) !")
@@ -1009,6 +983,16 @@ class VirusScannerGUI:
                 "Consultez le journal pour les détails.",
                 parent=self.root
             )
+            # Gestion post-scan : suppression automatique ou proposition à l'utilisateur
+            if self.remove_var.get():
+                # L'admin a coché "Supprimer les virus détectés" → suppression immédiate
+                self._log(
+                    f"🗑 Suppression automatique de {len(all_threats)} fichier(s) "
+                    "infecté(s) (option admin activée)…", "warning")
+                self._delete_threat_files(all_threats)
+            else:
+                # Proposer la suppression à l'utilisateur
+                self._offer_delete_threats(all_threats)
         else:
             self._anim_state = "ok"
             self.status_var.set("✅  Aucune menace détectée")
@@ -1019,6 +1003,228 @@ class VirusScannerGUI:
             )
 
         self.root.after(5000, self._reset_anim_idle)
+
+    # ── Proposition de suppression ─────────────────────────────────────────────
+
+    def _offer_delete_threats(self, threats: list) -> None:
+        """Demande à l'utilisateur s'il souhaite supprimer les fichiers infectés."""
+        names = "\n".join(
+            f"  • {os.path.basename(t.path)}  [{t.threat}]"
+            for t in threats[:12]
+        )
+        if len(threats) > 12:
+            names += f"\n  … et {len(threats) - 12} autre(s)"
+
+        answer = messagebox.askyesno(
+            "⚠ Supprimer les fichiers infectés ?",
+            f"{len(threats)} fichier(s) infecté(s) ont été détectés :\n\n"
+            f"{names}\n\n"
+            "Voulez-vous supprimer DÉFINITIVEMENT ces fichiers ?",
+            icon="warning",
+            parent=self.root
+        )
+        if answer:
+            self._delete_threat_files(threats)
+        else:
+            self._show_risks_window(threats)
+
+    # ── Suppression des fichiers infectés ─────────────────────────────────────
+
+    def _delete_threat_files(self, threats: list) -> None:
+        """Supprime les fichiers infectés en remontant les supports en RW si nécessaire."""
+        import threading as _th
+
+        # Construire un index dev → [ThreatInfo] depuis _threat_details
+        file_to_dev = {d["file"]: d.get("dev", "") for d in self._threat_details}
+
+        def _worker():
+            deleted, failed = [], []
+
+            # Regrouper par périphérique
+            by_dev: dict = {}
+            for t in threats:
+                dev = file_to_dev.get(t.path, "")
+                by_dev.setdefault(dev, []).append(t)
+
+            for dev, dev_threats in by_dev.items():
+                mp       = self.usb.get_mountpoint(dev) if dev else None
+                action   = None
+                remounted = False
+
+                if dev:
+                    if not mp:
+                        # Non monté → monter en RW pour pouvoir supprimer
+                        ok_mnt, _, mp, action = self.usb.mount_rw(dev)
+                        remounted = ok_mnt
+                    elif self.usb._is_ro(dev, mp):
+                        # Monté RO → remonter en RW
+                        ok_mnt, _, mp, action = self.usb.mount_rw(dev)
+                        remounted = ok_mnt
+
+                for t in dev_threats:
+                    try:
+                        if os.path.exists(t.path):
+                            os.remove(t.path)
+                            deleted.append(t.path)
+                            self.root.after(0, self._log,
+                                            f"🗑 Supprimé : {os.path.basename(t.path)}",
+                                            "warning")
+                        else:
+                            self.root.after(0, self._log,
+                                            f"ℹ Déjà absent : {os.path.basename(t.path)}",
+                                            "info")
+                    except Exception as exc:
+                        failed.append(t.path)
+                        self.root.after(0, self._log,
+                                        f"❌ Impossible de supprimer "
+                                        f"{os.path.basename(t.path)} : {exc}",
+                                        "threat")
+
+                # Restaurer le montage RO après suppression
+                if dev and remounted:
+                    self.usb.restore_after_export(dev, action)
+
+            # Bilan
+            summary = f"✅ {len(deleted)} fichier(s) infecté(s) supprimé(s)."
+            if failed:
+                summary += (f"\n❌ {len(failed)} fichier(s) non supprimé(s) "
+                            "(voir journal — droits insuffisants ?).")
+            self.root.after(0, messagebox.showinfo,
+                            "Suppression terminée", summary)
+            self.root.after(0, self._refresh_usb)
+
+        _th.Thread(target=_worker, daemon=True).start()
+
+    # ── Page des risques ───────────────────────────────────────────────────────
+
+    def _show_risks_window(self, threats: list) -> None:
+        """Affiche une fenêtre d'avertissement sur les risques liés aux fichiers conservés."""
+        win = tk.Toplevel(self.root)
+        win.title("⚠ Risques — Fichiers infectés conservés")
+        win.configure(bg="#1a0808")
+        win.grab_set()
+        win.transient(self.root)
+        win.resizable(True, True)
+
+        w, h = 760, 640
+        px = self.root.winfo_rootx() + (self.root.winfo_width()  - w) // 2
+        py = self.root.winfo_rooty() + (self.root.winfo_height() - h) // 2
+        win.geometry(f"{w}x{h}+{px}+{py}")
+
+        # ── Bandeau rouge ────────────────────────────────────────────────────
+        banner = tk.Frame(win, bg="#8b0000", pady=14)
+        banner.pack(fill=tk.X)
+        tk.Label(
+            banner,
+            text="⚠  ATTENTION — FICHIERS MALVEILLANTS CONSERVÉS",
+            bg="#8b0000", fg="white",
+            font=("Arial", 14, "bold")
+        ).pack()
+        tk.Label(
+            banner,
+            text=f"{len(threats)} fichier(s) infecté(s) n'ont PAS été supprimés.",
+            bg="#8b0000", fg="#ffcccc",
+            font=("Arial", 10)
+        ).pack(pady=(2, 0))
+
+        # ── Contenu scrollable ────────────────────────────────────────────────
+        body_frame = tk.Frame(win, bg="#1a0808")
+        body_frame.pack(fill=tk.BOTH, expand=True, padx=16, pady=10)
+
+        # Liste des fichiers infectés
+        list_lbl = tk.Label(
+            body_frame,
+            text="Fichiers infectés présents sur vos supports :",
+            bg="#1a0808", fg="#ffaaaa",
+            font=("Arial", 10, "bold"), anchor=tk.W
+        )
+        list_lbl.pack(anchor=tk.W, pady=(0, 4))
+
+        list_wrap = tk.Frame(body_frame, bg="#300808")
+        list_wrap.pack(fill=tk.X, pady=(0, 10))
+
+        cols = ("fichier", "menace", "hash")
+        tree = ttk.Treeview(list_wrap, columns=cols, show="headings", height=6)
+        tree.heading("fichier", text="Fichier")
+        tree.heading("menace",  text="Menace détectée")
+        tree.heading("hash",    text="SHA-256")
+        tree.column("fichier", width=200, anchor=tk.W)
+        tree.column("menace",  width=160, anchor=tk.W)
+        tree.column("hash",    width=340, anchor=tk.W)
+        t_sb = ttk.Scrollbar(list_wrap, orient=tk.VERTICAL, command=tree.yview)
+        tree.configure(yscrollcommand=t_sb.set)
+        tree.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        t_sb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        for t in threats:
+            tree.insert("", tk.END, values=(
+                os.path.basename(t.path),
+                t.threat,
+                t.hash if t.hash else "N/A",
+            ))
+
+        # Texte des risques
+        risks_text = (
+            "RISQUES LIÉS À LA CONSERVATION DE FICHIERS INFECTÉS\n\n"
+            "1.  PROPAGATION  —  Les fichiers malveillants peuvent se copier\n"
+            "    automatiquement vers d'autres supports ou machines dès leur connexion.\n\n"
+            "2.  VOL DE DONNÉES  —  Certains malwares (chevaux de Troie, spywares)\n"
+            "    collectent silencieusement vos fichiers personnels, mots de passe\n"
+            "    et coordonnées bancaires.\n\n"
+            "3.  CHIFFREMENT RANSOMWARE  —  Si le fichier est un ransomware, il peut\n"
+            "    chiffrer l'intégralité de vos données et réclamer une rançon.\n\n"
+            "4.  PERSISTANCE  —  Certains rootkits s'installent dans le secteur de\n"
+            "    démarrage et survivent à un formatage simple du support.\n\n"
+            "5.  COMPROMISSION DU RÉSEAU  —  En insérant ce support sur un autre\n"
+            "    ordinateur connecté au réseau, vous exposez l'ensemble du réseau.\n\n"
+            "RECOMMANDATIONS\n\n"
+            "  ✦  Supprimez immédiatement les fichiers listés ci-dessus.\n"
+            "  ✦  Formatez le support USB si la suppression n'est pas possible.\n"
+            "  ✦  N'insérez pas ce support sur d'autres ordinateurs.\n"
+            "  ✦  Contactez votre responsable informatique si vous avez un doute."
+        )
+
+        txt_wrap = tk.Frame(body_frame, bg="#1a0808")
+        txt_wrap.pack(fill=tk.BOTH, expand=True)
+        risks_box = tk.Text(
+            txt_wrap,
+            bg="#200a0a", fg="#ffdddd",
+            font=("Courier", 9), wrap=tk.WORD,
+            state=tk.DISABLED, relief=tk.FLAT,
+            padx=10, pady=8
+        )
+        r_sb = ttk.Scrollbar(txt_wrap, orient=tk.VERTICAL, command=risks_box.yview)
+        risks_box.configure(yscrollcommand=r_sb.set)
+        risks_box.configure(state=tk.NORMAL)
+        risks_box.insert(tk.END, risks_text)
+        risks_box.configure(state=tk.DISABLED)
+        risks_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        r_sb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # ── Boutons ───────────────────────────────────────────────────────────
+        btn_bar = tk.Frame(win, bg="#1a0808", pady=10)
+        btn_bar.pack(fill=tk.X)
+
+        def _delete_now():
+            win.destroy()
+            self._delete_threat_files(threats)
+
+        tk.Button(
+            btn_bar,
+            text="🗑  Supprimer maintenant",
+            command=_delete_now,
+            bg="#8b0000", fg="white", relief=tk.FLAT,
+            font=("Arial", 11, "bold"), padx=18, pady=8,
+            cursor="hand2"
+        ).pack(side=tk.LEFT, padx=(16, 8))
+
+        tk.Button(
+            btn_bar,
+            text="✕  Fermer (conserver les fichiers)",
+            command=win.destroy,
+            bg="#444", fg="white", relief=tk.FLAT,
+            font=("Arial", 10), padx=14, pady=8
+        ).pack(side=tk.LEFT)
 
     def _reset_anim_idle(self) -> None:
         if self._active_scans == 0:
