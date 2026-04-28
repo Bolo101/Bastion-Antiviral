@@ -99,7 +99,8 @@ class VirusScannerGUI:
         self._total_keys_scanned: int       = 0   # nombre de clés USB analysées
         self._cumul_threats:      int       = 0   # menaces cumulées toutes sessions
         self._threat_details:     List[dict] = []  # [{file, hash, threat, ts}]
-        self._session_threats:    List       = []  # ThreatInfo de la session en cours
+        self._session_threats:    List       = []  # ThreatInfo de la session en cours (dédupliqués)
+        self._session_seen_hashes: set      = set()  # hashes déjà vus dans la session
 
         # ── Visionneuse PDF ───────────────────────────────────────────────────
         self._pdf_viewer:   Optional[PdfViewer] = None
@@ -820,6 +821,7 @@ class VirusScannerGUI:
             self._per_dev_scanned  = {}
             self._per_dev_infected = {}
             self._session_threats  = []   # réinitialiser pour cette session
+            self._session_seen_hashes = set()
 
         self.stop_btn.configure(state=tk.NORMAL, bg=self.ACCENT)
         self._anim_state = "scanning"
@@ -926,20 +928,31 @@ class VirusScannerGUI:
             if threats:
                 ts = time.strftime("%Y-%m-%d %H:%M:%S")
                 for item in threats:
-                    # item est un ThreatInfo avec path, threat, engine, hash
                     fpath  = item.path
                     tname  = item.threat
-                    sha    = item.hash if item.hash else "N/A"
+                    sha    = item.hash if item.hash else ""
+
+                    # ── Déduplication par hash (même fichier détecté par plusieurs
+                    #    moteurs, ou présent sur plusieurs clés avec contenu identique)
+                    dedup_key = sha if sha else fpath   # fallback sur le chemin si pas de hash
+                    if dedup_key in self._session_seen_hashes:
+                        continue
+                    self._session_seen_hashes.add(dedup_key)
+
                     self._threat_details.append({
                         "ts":     ts,
                         "file":   fpath,
                         "threat": tname,
-                        "hash":   sha,
+                        "hash":   sha if sha else "N/A",
                         "dev":    dev,
-                        "mp":     self._targets_map.get(dev, ""),  # mountpoint au moment du scan
+                        "mp":     self._targets_map.get(dev, ""),
                     })
                     self._session_threats.append(item)
                     self._cumul_threats += 1
+
+            # Recalculer _total_infected depuis la liste dédupliquée
+            # (écrase la somme brute des moteurs qui peut compter en double)
+            self._total_infected = len(self._session_threats)
         else:
             self._log(f"❌ {dev} : erreur durant le scan.", "threat")
 
