@@ -498,13 +498,37 @@ class DBManager:
             except Exception:
                 return True
 
-        def _fetch(url: str, suffix: str) -> Optional[str]:
+        def _fetch(url: str, suffix: str,
+                   connect_timeout: int = 15,
+                   read_timeout: int = 60) -> Optional[str]:
+            """
+            Télécharge url vers un fichier temporaire avec des timeouts explicites.
+            connect_timeout : délai de connexion TCP (secondes).
+            read_timeout    : délai max entre deux blocs lus (secondes).
+            Retourne le chemin du fichier ou None en cas d'erreur/timeout.
+            """
             tmp_path = None
             try:
                 with tempfile.NamedTemporaryFile(
                         delete=False, suffix=suffix, dir="/tmp") as tmp:
                     tmp_path = tmp.name
-                urllib.request.urlretrieve(url, tmp_path)
+                req = urllib.request.Request(
+                    url,
+                    headers={"User-Agent": "ClamAV-DB-Updater/1.0"}
+                )
+                with urllib.request.urlopen(req, timeout=connect_timeout) as resp:
+                    with open(tmp_path, "wb") as out:
+                        import socket as _sock
+                        # Timeout sur les lectures successives
+                        try:
+                            resp.fp.raw._sock.settimeout(read_timeout)
+                        except Exception:
+                            pass
+                        while True:
+                            chunk = resp.read(65536)
+                            if not chunk:
+                                break
+                            out.write(chunk)
                 return tmp_path
             except Exception:
                 if tmp_path and os.path.exists(tmp_path):
@@ -531,7 +555,7 @@ class DBManager:
                 tmp_path = _fetch(sig["url2"], suffix)
 
             if tmp_path is None:
-                msg = f"   ⚠ {name} : inaccessible (réseau ?)"
+                msg = f"   ⚠ {name} : inaccessible ou timeout — base ignorée, poursuite…"
                 log_warning(msg)
                 failed.append(name)
                 if progress_cb:
