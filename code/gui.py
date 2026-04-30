@@ -1166,11 +1166,7 @@ class VirusScannerGUI:
         win.grab_set()
         win.transient(self.root)
         win.resizable(True, True)
-
-        w, h = 760, 640
-        px = self.root.winfo_rootx() + (self.root.winfo_width()  - w) // 2
-        py = self.root.winfo_rooty() + (self.root.winfo_height() - h) // 2
-        win.geometry(f"{w}x{h}+{px}+{py}")
+        win.attributes("-fullscreen", True)
 
         # ── Bandeau rouge ────────────────────────────────────────────────────
         banner = tk.Frame(win, bg="#8b0000", pady=14)
