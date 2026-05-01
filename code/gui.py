@@ -150,10 +150,7 @@ class VirusScannerGUI:
                  font=("Arial", 9, "italic"),
                  bg=self.TOPBAR, fg=self.FG_DIM).pack(side=tk.LEFT, padx=4)
 
-        tk.Button(topbar, text="⛶ Plein écran",
-                  command=self._toggle_fullscreen,
-                  bg=self.CARD, fg=self.FG_DIM, relief=tk.FLAT,
-                  font=("Arial", 9), padx=8).pack(side=tk.RIGHT, padx=4)
+
         tk.Button(topbar, text="⚙  Administration",
                   command=self._request_admin,
                   bg=self.ACCENT, fg="white", relief=tk.FLAT,
