@@ -168,6 +168,12 @@ openbox
 lightdm
 xfwm4
 xfce4-session
+xfdesktop4
+xfce4-panel
+xfce4-terminal
+thunar
+xfce4-appfinder
+xfce4-power-manager
 # Réseau
 network-manager
 wget
@@ -892,6 +898,10 @@ else
         [[ $? -eq 0 ]] && break   # quitter volontaire → on sort
         sleep 1
     done
+
+    # Quitter volontaire → lancer un vrai bureau XFCE
+    kill "$OB_PID" 2>/dev/null || true
+    exec xfce4-session
 fi
 
 kill "$OB_PID" 2>/dev/null || true
@@ -928,7 +938,9 @@ while true; do
     sleep 1
 done
 
+# Quitter volontaire → lancer un vrai bureau XFCE
 kill "$WM_PID" 2>/dev/null || true
+exec xfce4-session
 SESSION
 chmod 755 /usr/local/bin/usb-antivirus-session-installed.sh
 
