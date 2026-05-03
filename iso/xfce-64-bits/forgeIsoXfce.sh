@@ -886,9 +886,10 @@ if grep -q "installer=1" /proc/cmdline 2>/dev/null; then
           -e "sudo /usr/local/bin/install-to-disk.sh"
 else
     # ── Mode live kiosque ────────────────────────────────────────────────────
-    # Boucle de relance : l'application redémarre si elle quitte
+    # Boucle de relance : redémarre uniquement en cas de crash (exit != 0)
     while true; do
-        /usr/local/bin/usb-antivirus || true
+        /usr/local/bin/usb-antivirus
+        [[ $? -eq 0 ]] && break   # quitter volontaire → on sort
         sleep 1
     done
 fi
@@ -920,9 +921,10 @@ xfwm4 --compositor=off &
 WM_PID=$!
 sleep 1
 
-# Boucle de relance
+# Boucle de relance : redémarre uniquement en cas de crash (exit != 0)
 while true; do
-    /usr/local/bin/usb-antivirus || true
+    /usr/local/bin/usb-antivirus
+    [[ $? -eq 0 ]] && break   # quitter volontaire → on sort
     sleep 1
 done
 
