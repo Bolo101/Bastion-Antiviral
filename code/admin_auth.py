@@ -829,60 +829,26 @@ class AdminPanel:
                    width=20).pack(anchor=tk.W, pady=(4, 0))
         self._refresh_avast_status_display()
 
-        # ── Installation ──────────────────────────────────────────────────────
-        install_frame = ttk.LabelFrame(tab, text="Installation (mode installé)",
-                                       padding=8)
-        install_frame.pack(fill=tk.X, pady=(0, 6))
-        ttk.Label(
-            install_frame,
-            text="Installe Avast Business for Linux depuis le dépôt officiel.\n"
-                 "Étapes : ajout clé GPG → dépôt APT → apt install avast → systemd.",
-            justify=tk.LEFT, foreground="#cccccc"
-        ).pack(anchor=tk.W, pady=(0, 6))
-        install_row = ttk.Frame(install_frame)
-        install_row.pack(anchor=tk.W)
-
         # ── Licence ───────────────────────────────────────────────────────────
         lic_frame = ttk.LabelFrame(tab, text="Licence Business", padding=8)
         lic_frame.pack(fill=tk.X, pady=(0, 6))
 
-        ttk.Label(lic_frame, text="A — Code d'activation (Internet requis) :",
+        ttk.Label(lic_frame, text="A — Fichier .avastlic depuis USB :",
                   foreground="#cccccc").grid(row=0, column=0, columnspan=3,
-                                           sticky=tk.W, pady=(0, 4))
-        code_var   = tk.StringVar()
-        code_entry = ttk.Entry(lic_frame, textvariable=code_var,
-                               width=30, font=("Courier", 10))
-        code_entry.grid(row=1, column=0, sticky=tk.W, padx=(0, 6))
-
-        def _activate():
-            code = code_var.get().strip()
-            if not code:
-                messagebox.showwarning("Code vide", "Entrez un code d'activation.",
-                                       parent=tab.winfo_toplevel())
-                return
-            self._cb["avast_activate"](code)
-
-        ttk.Button(lic_frame, text="🔑 Activer",
-                   command=_activate, width=13).grid(row=1, column=1, padx=4)
-        ttk.Separator(lic_frame, orient=tk.HORIZONTAL).grid(
-            row=2, column=0, columnspan=3, sticky=tk.EW, pady=6)
-
-        ttk.Label(lic_frame, text="B — Fichier .avastlic depuis USB :",
-                  foreground="#cccccc").grid(row=3, column=0, columnspan=3,
                                            sticky=tk.W, pady=(0, 4))
         ttk.Button(lic_frame, text="🔌  Import depuis USB",
                    command=self._cb["avast_license_usb"],
-                   width=22).grid(row=4, column=0, sticky=tk.W)
+                   width=22).grid(row=1, column=0, sticky=tk.W)
         ttk.Separator(lic_frame, orient=tk.HORIZONTAL).grid(
-            row=5, column=0, columnspan=3, sticky=tk.EW, pady=6)
+            row=2, column=0, columnspan=3, sticky=tk.EW, pady=6)
 
-        ttk.Label(lic_frame, text="C — Fichier .avastlic depuis le système :",
-                  foreground="#cccccc").grid(row=6, column=0, columnspan=3,
+        ttk.Label(lic_frame, text="B — Fichier .avastlic depuis le système :",
+                  foreground="#cccccc").grid(row=3, column=0, columnspan=3,
                                            sticky=tk.W, pady=(0, 4))
         self._avast_lic_path_var = tk.StringVar(value="Aucun fichier sélectionné")
         ttk.Label(lic_frame, textvariable=self._avast_lic_path_var,
                   foreground="#7ec8e3", font=("Courier", 8),
-                  wraplength=360).grid(row=7, column=0, columnspan=2,
+                  wraplength=360).grid(row=4, column=0, columnspan=2,
                                        sticky=tk.W, pady=2)
 
         def _browse():
@@ -911,7 +877,7 @@ class AdminPanel:
             self._cb["avast_license_file"](path)
 
         btn_row2 = ttk.Frame(lic_frame)
-        btn_row2.grid(row=8, column=0, columnspan=3, sticky=tk.W, pady=(2, 0))
+        btn_row2.grid(row=5, column=0, columnspan=3, sticky=tk.W, pady=(2, 0))
         ttk.Button(btn_row2, text="📂  Parcourir…",
                    command=_browse, width=16).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(btn_row2, text="⬇  Installer",
@@ -928,7 +894,7 @@ class AdminPanel:
         vps_row.pack(anchor=tk.W)
 
         # ── Terminal mini en bas à droite ─────────────────────────────────────
-        _, _, _append, _clear, term_status, _after = self._mini_terminal(tab)
+        _, _, _append, _clear, term_status, _after = self._mini_terminal(tab, height=50)
 
         # ── Wiring ────────────────────────────────────────────────────────────
         all_btns: list = []
@@ -939,42 +905,6 @@ class AdminPanel:
                     b.configure(state=state)
                 except Exception:
                     pass
-
-        # Install
-        def _do_install():
-            _clear()
-            cmds_install = [
-                (["bash", "-c",
-                  "curl -fsSL https://repo.avcdn.net/linux/avast.gpg "
-                  "| tee /etc/apt/trusted.gpg.d/avast.gpg"],
-                 "Ajout clé GPG Avast"),
-                (["bash", "-c",
-                  "echo 'deb https://repo.avcdn.net/linux stable avast' "
-                  "| tee /etc/apt/sources.list.d/avast.list"],
-                 "Ajout dépôt APT"),
-                (["apt-get", "update", "-q"], "apt update"),
-                (["apt-get", "install", "-y", "avast"], "Installation avast"),
-                (["bash", "-c",
-                  "systemctl enable avast && systemctl start avast"],
-                 "Activation service"),
-            ]
-
-            def _chain(idx: int, _rc=None):
-                if idx >= len(cmds_install):
-                    _append("━━━ Installation terminée ━━━", "ok")
-                    self._refresh_avast_status_display()
-                    return
-                c, lbl = cmds_install[idx]
-                self._stream_to_terminal(c, lbl, _append, term_status,
-                                          set_btns_fn=_set_btns,
-                                          on_done=lambda rc: _chain(idx + 1, rc),
-                                          after_fn=_after)
-            _chain(0)
-
-        b_install = ttk.Button(install_row, text="📦  Installer Avast Business",
-                               command=_do_install, width=28)
-        b_install.pack(side=tk.LEFT, padx=4)
-        all_btns.append(b_install)
 
         # VPS en ligne
         def _do_vps_online():
@@ -1033,9 +963,9 @@ class AdminPanel:
     # ══════════════════════════════════════════════════════════════════════════
 
     @staticmethod
-    def _mini_terminal(parent: tk.Widget):
+    def _mini_terminal(parent: tk.Widget, height: int = 6):
         """
-        Terminal miniature 3 lignes ancré en bas à droite du parent.
+        Terminal miniature ancré en bas à droite du parent.
         Retourne (frame, foot, append_fn, clear_fn, status_var, after_fn).
         """
         bottom_bar = ttk.Frame(parent)
@@ -1054,7 +984,7 @@ class AdminPanel:
             term_wrap, bg="#0b0d14", fg="#c8d0de",
             font=("Courier", 7), wrap=tk.WORD,
             state=tk.DISABLED, relief=tk.FLAT,
-            height=6, width=120,
+            height=height, width=120,
             padx=4, pady=2
         )
         sb = ttk.Scrollbar(term_wrap, orient=tk.VERTICAL, command=txt.yview)
