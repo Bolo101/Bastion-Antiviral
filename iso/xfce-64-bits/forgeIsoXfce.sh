@@ -1375,7 +1375,7 @@ ok "Fichiers Python copiés → $APP_CHROOT"
 PDF_CHROOT="config/includes.chroot/opt/pdf"
 mkdir -p "$PDF_CHROOT"
 # Copier les PDFs présents dans ../pdf/ sur la machine de build, si disponibles
-PDF_SRC="$(pwd)/../../pdf"
+PDF_SRC="$(dirname "$WORK_DIR")/../../pdf"
 if [[ -d "$PDF_SRC" ]]; then
     PDF_COUNT=$(find "$PDF_SRC" -maxdepth 1 -name "*.pdf" | wc -l)
     if [[ "$PDF_COUNT" -gt 0 ]]; then
@@ -1406,18 +1406,7 @@ step "Pré-téléchargement de la base ClamAV (machine de build)..."
 CLAMAV_CHROOT="config/includes.chroot/var/lib/clamav"
 mkdir -p "$CLAMAV_CHROOT"
 
-# 1. Copie depuis ../database/ si disponible
-DB_FOUND=0
-if [[ -d "$DATABASE_DIR" ]]; then
-    for f in main.cvd main.cld daily.cvd daily.cld bytecode.cvd bytecode.cld; do
-        if [[ -f "$DATABASE_DIR/$f" ]]; then
-            cp -v "$DATABASE_DIR/$f" "$CLAMAV_CHROOT/"
-            DB_FOUND=$((DB_FOUND + 1))
-        fi
-    done
-fi
-
-# 2. Téléchargement via freshclam sur la machine de build, puis copie dans le chroot
+# Téléchargement via freshclam sur la machine de build, puis copie dans le chroot
 #
 #    Stratégie : freshclam met à jour son répertoire natif (/var/lib/clamav),
 #    qui est toujours fonctionnel (permissions, verrou, config OK).
@@ -1513,23 +1502,22 @@ _dl_tp() {
         if [[ "$SZ" -ge "$MIN" ]]; then
             if ! _is_valid_clamav_file "$TMP"; then
                 warn "$FNAME : page HTML reçue à la place du fichier (200 OK trompeur) — ignoré"
-                rm -f "$TMP" "$WGETLOG"
-                return 1
+            else
+                mv "$TMP" "$DEST"; chmod 644 "$DEST"
+                ok "$FNAME inclus ($(du -h "$DEST" | cut -f1))"
+                TMP=""   # déjà déplacé, ne pas supprimer
             fi
-            mv "$TMP" "$DEST"; chmod 644 "$DEST"
-            ok "$FNAME inclus ($(du -h "$DEST" | cut -f1))"
         else
             warn "$FNAME trop petit (${SZ} o < ${MIN} o) — ignoré"
-            rm -f "$TMP"
         fi
     else
         local ERR; ERR="$(tail -3 "$WGETLOG" 2>/dev/null)"
-        warn "Échec téléchargement $FNAME"
+        warn "Échec téléchargement $FNAME — ignoré"
         echo "    URL    : $URL"
         echo "    Erreur : $ERR"
-        rm -f "$TMP"
     fi
-    rm -f "$WGETLOG"
+    rm -f "$TMP" "$WGETLOG"
+    return 0
 }
 
 # Liste complète établie depuis https://mirror.ihost.md/?dir=clamav/sanesecurity
@@ -1611,7 +1599,7 @@ if ! $_SANE_OK; then
             ok "Miroir HTTP Sanesecurity joignable : $SANE_HTTP"
             _SANE_OK=true
             for _fname in "${_SANE_FILES[@]}"; do
-                _dl_tp "$SANE_HTTP/$_fname" "$CLAMAV_CHROOT/$_fname" 64
+                _dl_tp "$SANE_HTTP/$_fname" "$CLAMAV_CHROOT/$_fname" 64 || true
             done
             break
         else
@@ -1661,14 +1649,7 @@ step "Pré-téléchargement des règles YARA signature-base (machine de build)..
 YARA_CHROOT="config/includes.chroot/var/lib/yara-rules"
 mkdir -p "$YARA_CHROOT/signature-base" "$YARA_CHROOT/custom"
 
-# 1. Copie depuis ../database/yara-rules/ si disponible
-if [[ -d "$DATABASE_DIR/yara-rules" ]]; then
-    while IFS= read -r -d '' f; do
-        cp "$f" "$YARA_CHROOT/custom/"
-    done < <(find "$DATABASE_DIR/yara-rules" -name "*.yar" -o -name "*.yara" -print0)
-fi
-
-# 2. Téléchargement si règles absentes
+# Téléchargement si règles absentes
 EXISTING_RULES=$(find "$YARA_CHROOT/signature-base" -name "*.yar" 2>/dev/null | wc -l)
 if [[ "$EXISTING_RULES" -lt 50 ]]; then
     echo "  Téléchargement de signature-base (Florian Roth) depuis GitHub..."
