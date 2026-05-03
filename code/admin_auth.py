@@ -2176,7 +2176,8 @@ class AdminPanel:
 
         def _do():
             dlg.destroy()
-            self._cb["quit"]()
+            self._cb["quit"]()   # doit faire sys.exit(0) pour éviter le relancement
+            import sys as _sys; _sys.exit(0)  # filet de sécurité si le callback ne quitte pas
 
         ttk.Button(tab, text="🚪  Quitter l'application",
                    command=_do).pack(pady=16)
