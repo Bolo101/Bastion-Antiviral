@@ -1,364 +1,329 @@
+#!/usr/bin/env python3
+"""log_handler.py – Journalisation avec rotation par volumétrie et export PDF/USB."""
+
 import logging
-import sys
 import os
+import shutil
+import sys
 from datetime import datetime
-from typing import List
+from logging.handlers import RotatingFileHandler
+from typing import List, Tuple
 
-# Define the log file path
-log_file = "/var/log/virusCleaner.log"
+from config import LOG_FILE
 
-# Configure logging with basic format
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# ── Paramètres de rotation ─────────────────────────────────────────────────────
+_LOG_MAX_BYTES  = 5 * 1024 * 1024   # 5 Mo par fichier
+_LOG_BACKUP_CNT = 5                  # 5 archives conservées
 
-logger = logging.getLogger()
+# ── Configuration du logger ────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger("virusscanner")
 logger.setLevel(logging.INFO)
 
 try:
-    log_handler = logging.FileHandler(log_file)
-    log_handler.setLevel(logging.INFO)
-    formatter = logging.Formatter('%(asctime)s - %(message)s')
-    log_handler.setFormatter(formatter)
-    logger.addHandler(log_handler)
+    _fh = RotatingFileHandler(
+        LOG_FILE,
+        maxBytes=_LOG_MAX_BYTES,
+        backupCount=_LOG_BACKUP_CNT,
+        encoding="utf-8",
+        delay=False,
+    )
+    _fh.setLevel(logging.INFO)
+    _fh.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+    logger.addHandler(_fh)
 except PermissionError:
-    print("Error: Permission denied. Please run the script with sudo.", file=sys.stderr)
-    sys.exit(1)  # Exit the script to enforce sudo usage
+    print("Erreur : permissions insuffisantes. Lancez avec sudo.", file=sys.stderr)
+    sys.exit(1)
 
 
-def log_info(message: str) -> None:
-    """Log general information to both the console and log file."""
-    logger.info(message)
+def log_info(msg: str)    -> None: logger.info(msg)
+def log_error(msg: str)   -> None: logger.error(msg)
+def log_warning(msg: str) -> None: logger.warning(msg)
 
-def log_error(message: str) -> None:
-    """Log error message to both the console and log file."""
-    logger.error(message)
 
-def log_warning(message: str) -> None:
-    """Log warning message to both the console and log file."""
-    logger.warning(message)
+# ── Gestion des fichiers de log ────────────────────────────────────────────────
+
+def get_log_files() -> List[str]:
+    """
+    Retourne la liste des fichiers de log existants :
+    le fichier actif + les archives de rotation (.1 … .N).
+    """
+    files: List[str] = []
+    if os.path.exists(LOG_FILE):
+        files.append(LOG_FILE)
+    for i in range(1, _LOG_BACKUP_CNT + 1):
+        rotated = f"{LOG_FILE}.{i}"
+        if os.path.exists(rotated):
+            files.append(rotated)
+    return files
+
+
+def get_log_size_info() -> str:
+    """
+    Retourne une chaîne lisible décrivant la volumétrie des logs,
+    ex. : "3 fichier(s)  –  4,2 Mo"
+    """
+    files = get_log_files()
+    total = sum(os.path.getsize(f) for f in files)
+    mb    = total / (1024 * 1024)
+    size_str = f"{mb:.1f} Mo" if mb >= 1.0 else f"{total // 1024} Ko"
+    return f"{len(files)} fichier(s)  –  {size_str}"
+
+
+def purge_logs() -> Tuple[bool, str]:
+    """
+    Supprime tous les fichiers de log (actif + archives de rotation).
+    Recrée ensuite le fichier actif vide pour que le handler RotatingFileHandler
+    puisse continuer d'écrire sans erreur.
+    Retourne (ok, message).
+    """
+    deleted: List[str] = []
+    errors:  List[str] = []
+
+    for path in get_log_files():
+        try:
+            os.remove(path)
+            deleted.append(path)
+        except OSError as e:
+            errors.append(f"{os.path.basename(path)}: {e}")
+
+    # Recréer le fichier principal vide
+    try:
+        with open(LOG_FILE, "w", encoding="utf-8") as _f:
+            pass
+    except OSError:
+        pass
+
+    if errors:
+        return False, "Erreurs lors de la purge : " + " ; ".join(errors)
+
+    n = len(deleted)
+    # On relogue APRÈS la purge pour avoir une trace
+    log_info(f"Purge des logs effectuée : {n} fichier(s) supprimé(s).")
+    return True, f"{n} fichier(s) de log supprimé(s) avec succès."
+
+
+def export_logs_to_path(dest_dir: str) -> Tuple[bool, str]:
+    """
+    Copie tous les fichiers de log (actif + archives) dans dest_dir.
+    Chaque fichier est préfixé d'un horodatage pour éviter les collisions.
+    Retourne (ok, message).
+    """
+    if not os.path.isdir(dest_dir):
+        return False, f"Répertoire de destination introuvable : {dest_dir}"
+
+    files = get_log_files()
+    if not files:
+        return False, "Aucun fichier de log à exporter."
+
+    ts     = datetime.now().strftime("%Y%m%d_%H%M%S")
+    copied: List[str] = []
+    errors: List[str] = []
+
+    for src in files:
+        basename = os.path.basename(src)
+        dst      = os.path.join(dest_dir, f"{ts}_{basename}")
+        try:
+            shutil.copy2(src, dst)
+            copied.append(dst)
+        except OSError as e:
+            errors.append(f"{basename}: {e}")
+
+    if errors:
+        return False, "Erreurs lors de la copie : " + " ; ".join(errors)
+
+    log_info(f"Export des logs vers {dest_dir} : {len(copied)} fichier(s) copié(s).")
+    return True, f"{len(copied)} fichier(s) exporté(s) dans :\n{dest_dir}"
+
+
+# ── Export PDF (bibliothèques standard uniquement) ────────────────────────────
 
 def generate_session_pdf(session_logs: List[str]) -> str:
-    """
-    Generate a PDF from session logs using built-in libraries only.
-    
-    Args:
-        session_logs: List of log messages from the current session
-    
-    Returns:
-        str: Path to the generated PDF file
-    
-    Raises:
-        Exception: If PDF generation fails
-    """
-    try:
-        # Create output directory if it doesn't exist
-        output_dir = "/tmp/disk_cloner_logs"
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # Generate filename with timestamp
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        pdf_filename = f"disk_cloner_session_{timestamp}.pdf"
-        pdf_path = os.path.join(output_dir, pdf_filename)
-        
-        # Create PDF using basic PDF structure
-        _create_simple_pdf(
-            pdf_path,
-            "Disk Cloner - Session Log Report",
-            session_logs,
-            f"Report Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            f"Total Log Entries: {len(session_logs)}"
+    out_dir = "/tmp/virusscanner_reports"
+    os.makedirs(out_dir, exist_ok=True)
+    ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(out_dir, f"scan_report_{ts}.pdf")
+    _write_pdf(path, "Rapport de session – USB Antivirus Scanner", session_logs,
+               f"Généré le : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+               f"Entrées de journal : {len(session_logs)}")
+    log_info(f"PDF exporté : {path}")
+    return path
+
+
+def _write_pdf(path: str, title: str, lines: List[str], *info: str) -> None:
+    content  = _build_stream(title, lines, *info)
+    cb       = content.encode("latin-1", errors="replace")
+    with open(path, "wb") as f:
+        f.write(b"%PDF-1.4\n")
+        pos: dict = {}
+
+        def obj(n: int, raw: bytes) -> None:
+            pos[n] = f.tell()
+            f.write(raw)
+
+        obj(1, b"1 0 obj\n<</Type /Catalog /Pages 2 0 R>>\nendobj\n")
+        obj(2, b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n")
+        obj(3, (
+            b"3 0 obj\n<</Type /Page /Parent 2 0 R "
+            b"/MediaBox [0 0 612 792] /Contents 4 0 R "
+            b"/Resources <</Font <</F1 5 0 R>>>>>>\nendobj\n"
+        ))
+        obj(4, (
+            f"4 0 obj\n<</Length {len(cb)}>>\nstream\n".encode()
+            + cb + b"\nendstream\nendobj\n"
+        ))
+        obj(5, b"5 0 obj\n<</Type /Font /Subtype /Type1 /BaseFont /Courier>>\nendobj\n")
+
+        xref = f.tell()
+        f.write(b"xref\n0 6\n0000000000 65535 f \n")
+        for i in range(1, 6):
+            f.write(f"{pos[i]:010d} 00000 n \n".encode())
+        f.write(
+            f"trailer\n<</Size 6 /Root 1 0 R>>\nstartxref\n{xref}\n%%EOF\n".encode()
         )
-        
-        log_info(f"Session log PDF generated successfully: {pdf_path}")
-        return pdf_path
-        
-    except PermissionError as e:
-        error_msg = f"Permission denied writing PDF to {output_dir}: {str(e)}"
-        log_error(error_msg)
-        raise Exception(error_msg)
-    except OSError as e:
-        error_msg = f"OS error during PDF generation: {str(e)}"
-        log_error(error_msg)
-        raise Exception(error_msg)
-    except Exception as e:
-        error_msg = f"Unexpected error during session PDF generation: {str(e)}"
-        log_error(error_msg)
-        raise Exception(error_msg)
 
-def generate_log_file_pdf() -> str:
-    """
-    Generate a PDF from the complete log file using built-in libraries only.
-    
-    Returns:
-        str: Path to the generated PDF file
-    
-    Raises:
-        Exception: If PDF generation fails
-    """
-    try:
-        # Create output directory if it doesn't exist
-        output_dir = "/tmp/disk_cloner_logs"
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # Generate filename with timestamp
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        pdf_filename = f"disk_cloner_complete_log_{timestamp}.pdf"
-        pdf_path = os.path.join(output_dir, pdf_filename)
-        
-        # Read log file
-        if not os.path.exists(log_file):
-            raise FileNotFoundError(f"Log file not found: {log_file}")
-        
-        try:
-            with open(log_file, 'r', encoding='utf-8') as f:
-                log_lines = [line.strip() for line in f.readlines() if line.strip()]
-        except UnicodeDecodeError:
-            # Try with different encoding if UTF-8 fails
-            with open(log_file, 'r', encoding='latin-1') as f:
-                log_lines = [line.strip() for line in f.readlines() if line.strip()]
-        
-        # Create PDF using basic PDF structure
-        _create_simple_pdf(
-            pdf_path,
-            "Disk Cloner - Complete Log File Report",
-            log_lines,
-            f"Report Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            f"Log File: {log_file}",
-            f"Total Log Lines: {len(log_lines)}"
-        )
-        
-        log_info(f"Complete log file PDF generated successfully: {pdf_path}")
-        return pdf_path
-        
-    except FileNotFoundError as e:
-        error_msg = f"Log file not found: {str(e)}"
-        log_error(error_msg)
-        raise Exception(error_msg)
-    except PermissionError as e:
-        error_msg = f"Permission denied: {str(e)}"
-        log_error(error_msg)
-        raise Exception(error_msg)
-    except OSError as e:
-        error_msg = f"OS error during PDF generation: {str(e)}"
-        log_error(error_msg)
-        raise Exception(error_msg)
-    except UnicodeDecodeError as e:
-        error_msg = f"Error reading log file - encoding issue: {str(e)}"
-        log_error(error_msg)
-        raise Exception(error_msg)
-    except Exception as e:
-        error_msg = f"Unexpected error during complete log PDF generation: {str(e)}"
-        log_error(error_msg)
-        raise Exception(error_msg)
 
-def _create_simple_pdf(file_path: str, title: str, content_lines: List[str], *info_lines: str) -> None:
-    """
-    Create a simple PDF file using basic PDF structure without external libraries.
-    
-    Args:
-        file_path: Path where to save the PDF
-        title: Title of the document
-        content_lines: List of content lines to include
-        *info_lines: Additional info lines to include in header
-    """
-    try:
-        with open(file_path, 'wb') as f:
-            # PDF Header
-            f.write(b'%PDF-1.4\n')
-            
-            # Prepare content first to get accurate length
-            content = _prepare_pdf_content(title, content_lines, *info_lines)
-            content_bytes = content.encode('utf-8')
-            content_length = len(content_bytes)
-            
-            # Track object positions for xref table
-            object_positions = {}
-            
-            # Object 1: Catalog
-            object_positions[1] = f.tell()
-            catalog_obj = b'''1 0 obj
-<<
-/Type /Catalog
-/Pages 2 0 R
->>
-endobj
-'''
-            f.write(catalog_obj)
-            
-            # Object 2: Pages
-            object_positions[2] = f.tell()
-            pages_obj = b'''2 0 obj
-<<
-/Type /Pages
-/Kids [3 0 R]
-/Count 1
->>
-endobj
-'''
-            f.write(pages_obj)
-            
-            # Object 3: Page
-            object_positions[3] = f.tell()
-            page_obj = b'''3 0 obj
-<<
-/Type /Page
-/Parent 2 0 R
-/MediaBox [0 0 612 792]
-/Contents 4 0 R
-/Resources <<
-/Font <<
-/F1 5 0 R
->>
->>
->>
-endobj
-'''
-            f.write(page_obj)
-            
-            # Object 4: Content Stream
-            object_positions[4] = f.tell()
-            content_obj = f'''4 0 obj
-<<
-/Length {content_length}
->>
-stream
-{content}
-endstream
-endobj
-'''.encode('utf-8')
-            f.write(content_obj)
-            
-            # Object 5: Font
-            object_positions[5] = f.tell()
-            font_obj = b'''5 0 obj
-<<
-/Type /Font
-/Subtype /Type1
-/BaseFont /Courier
->>
-endobj
-'''
-            f.write(font_obj)
-            
-            # Cross-reference table
-            xref_start = f.tell()
-            f.write(b'xref\n')
-            f.write(b'0 6\n')
-            f.write(b'0000000000 65535 f \n')
-            for i in range(1, 6):
-                f.write(f'{object_positions[i]:010d} 00000 n \n'.encode())
-            
-            # Trailer
-            trailer = f'''trailer
-<<
-/Size 6
-/Root 1 0 R
->>
-startxref
-{xref_start}
-%%EOF
-'''.encode('utf-8')
-            f.write(trailer)
-            
-    except Exception as e:
-        raise Exception(f"Error creating PDF structure: {str(e)}")
+def _build_stream(title: str, lines: List[str], *info: str) -> str:
+    out = ["BT", "/F1 14 Tf", "50 750 Td", f"({_esc(title)}) Tj",
+           "/F1 9 Tf"]
+    y = 720
+    for il in info:
+        out += ["0 -15 Td", f"({_esc(il)}) Tj"]
+        y -= 15
+    out += ["/F1 8 Tf", "0 -20 Td"]
+    y -= 20
+    for ln in (lines or ["(vide)"]):
+        if y < 50:
+            out += ["ET", "BT", "/F1 8 Tf", "50 750 Td"]
+            y = 750
+        ln = ln[:90] + "…" if len(ln) > 90 else ln
+        out += ["0 -12 Td", f"({_esc(ln)}) Tj"]
+        y -= 12
+    out.append("ET")
+    return "\n".join(out)
 
-def _prepare_pdf_content(title: str, content_lines: List[str], *info_lines: str) -> str:
+
+def _esc(t: str) -> str:
+    t = str(t).replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+    return "".join(c if 32 <= ord(c) <= 126 else " " for c in t)
+
+
+# ── Rapport de scan par support (export automatique) ──────────────────────────
+
+def write_device_scan_report_pdf(
+        mountpoint: str, device: str, label: str, uuid: str,
+        result,
+        clamav_info: dict,
+        yara_info:   dict,
+        avast_info:  dict,
+        engines_used: dict,
+) -> str:
     """
-    Prepare PDF content stream with proper formatting.
-    
-    Args:
-        title: Document title
-        content_lines: List of content lines
-        *info_lines: Additional info lines
-    
-    Returns:
-        str: Formatted PDF content stream
+    Génère un PDF de rapport de scan et l'écrit à la racine du support.
+
+    Nommage  : scan_AV_YYYYMMDD_HHMMSS_<label>.pdf
+    Contenu  : en-tête support, bases utilisées, résumé, détail des menaces.
+    Retourne : chemin complet du fichier créé.
     """
-    try:
-        lines = []
-        
-        # Start content stream
-        lines.append("BT")  # Begin text
-        
-        y_position = 750  # Start near top of page
-        
-        # Add title
-        lines.append(f"50 {y_position} Td")  # Move to position
-        lines.append("/F1 16 Tf")  # Larger font for title
-        lines.append(f"({_escape_pdf_string(title)}) Tj")
-        y_position -= 30
-        
-        # Add info lines
-        lines.append("/F1 10 Tf")  # Smaller font for info
-        for info_line in info_lines:
-            lines.append(f"0 -{15} Td")  # Move down 15 points
-            lines.append(f"({_escape_pdf_string(info_line)}) Tj")
-            y_position -= 15
-        
-        y_position -= 20  # Extra space before content
-        
-        # Add content lines
-        lines.append("/F1 8 Tf")  # Small font for content
-        lines.append(f"0 -{20} Td")  # Move down 20 points
-        
-        if not content_lines:
-            lines.append("(No content available.) Tj")
+    ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_lbl = (label or device.replace("/dev/", "")).replace(" ", "_")
+    for ch in r'\/:*?"<>|':
+        safe_lbl = safe_lbl.replace(ch, "_")
+    fname = f"scan_AV_{ts}_{safe_lbl}.pdf"
+    dest  = os.path.join(mountpoint, fname)
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # ── Construction des lignes du rapport ────────────────────────────────────
+    lines: List[str] = []
+
+    # En-tête support
+    lines.append(f"Support   : {device}")
+    if label:
+        lines.append(f"Etiquette : {label}")
+    if uuid:
+        lines.append(f"UUID      : {uuid}")
+    lines.append(f"Date      : {now}")
+    lines.append("")
+
+    # Moteurs utilisés
+    engines_list = []
+    if engines_used.get("clamav"):
+        engines_list.append("ClamAV")
+    if engines_used.get("avast"):
+        engines_list.append("Avast")
+    if engines_used.get("yara"):
+        engines_list.append("YARA")
+    lines.append(f"Moteurs   : {' + '.join(engines_list) or 'aucun'}")
+    lines.append("")
+
+    # Bases ClamAV
+    lines.append("--- BASE CLAMAV ---")
+    clamav_status = clamav_info.get("status", "MISSING")
+    clamav_lu     = clamav_info.get("last_update", "inconnue")
+    lines.append(f"Statut    : {clamav_status}  (MAJ : {clamav_lu})")
+    official = {k: v for k, v in clamav_info.get("files", {}).items()
+                if k in ("main.cvd","main.cld","daily.cvd","daily.cld",
+                         "bytecode.cvd","bytecode.cld")}
+    tp_count = len(clamav_info.get("files", {})) - len(official)
+    for fname_db, info_db in official.items():
+        lines.append(f"  {fname_db:<18} {info_db}")
+    if tp_count > 0:
+        lines.append(f"  Signatures tierces : {tp_count} fichier(s)")
+    lines.append("")
+
+    # Base YARA
+    if engines_used.get("yara"):
+        lines.append("--- BASE YARA ---")
+        yara_count = yara_info.get("count", 0)
+        yara_lu    = yara_info.get("last_update", "inconnue")
+        lines.append(f"Regles    : {yara_count}  (MAJ : {yara_lu})")
+        lines.append("")
+
+    # Avast
+    if engines_used.get("avast"):
+        lines.append("--- AVAST BUSINESS ---")
+        if avast_info.get("licensed"):
+            lines.append("Statut    : installe et licence active")
+        elif avast_info.get("installed"):
+            lines.append("Statut    : installe - LICENCE REQUISE")
         else:
-            line_number = 1
-            for content_line in content_lines:
-                if y_position < 50:  # Start new page if needed (simplified)
-                    lines.append("ET")  # End text block
-                    lines.append("BT")  # Begin new text block
-                    lines.append("/F1 8 Tf")
-                    lines.append("50 750 Td")
-                    y_position = 750
-                
-                # Truncate very long lines to fit on page
-                if len(content_line) > 85:
-                    content_line = content_line[:82] + "..."
-                
-                numbered_line = f"{line_number:4d}: {content_line}"
-                lines.append(f"0 -{12} Td")  # Move down 12 points
-                lines.append(f"({_escape_pdf_string(numbered_line)}) Tj")
-                y_position -= 12
-                line_number += 1
-        
-        lines.append("ET")  # End text
-        
-        return "\n".join(lines)
-        
-    except Exception as e:
-        raise Exception(f"Error preparing PDF content: {str(e)}")
+            lines.append("Statut    : non installe")
+        lines.append("")
 
-def _escape_pdf_string(text: str) -> str:
-    """
-    Escape special characters in PDF strings.
-    
-    Args:
-        text: Text to escape
-    
-    Returns:
-        str: Escaped text safe for PDF
-    """
-    try:
-        # Replace special PDF string characters
-        text = str(text)
-        text = text.replace('\\', '\\\\')  # Backslash must be first
-        text = text.replace('(', '\\(')
-        text = text.replace(')', '\\)')
-        text = text.replace('\r', ' ')
-        text = text.replace('\n', ' ')
-        text = text.replace('\t', ' ')
-        
-        # Remove or replace non-printable characters
-        cleaned_text = ""
-        for char in text:
-            if ord(char) >= 32 and ord(char) <= 126:
-                cleaned_text += char
-            else:
-                cleaned_text += " "  # Replace with space
-        
-        return cleaned_text
-        
-    except Exception as e:
-        return f"Error processing text: {str(e)}"
+    # Résultats
+    lines.append("--- RESULTATS DU SCAN ---")
+    lines.append(f"Fichiers analyses  : {result.scanned}")
+    lines.append(f"Menaces detectees  : {result.infected}")
+    lines.append(f"Duree              : {result.duration:.1f}s")
+    if result.scanned_clamav:
+        lines.append(f"  ClamAV : {result.scanned_clamav} fichier(s)")
+    if result.scanned_avast:
+        lines.append(f"  Avast  : {result.scanned_avast} fichier(s)")
+    if result.scanned_yara:
+        lines.append(f"  YARA   : {result.scanned_yara} fichier(s)")
+    if result.stopped:
+        lines.append("  (scan interrompu par l'utilisateur)")
+    lines.append("")
+
+    if result.threats:
+        lines.append("--- FICHIERS INFECTES ---")
+        for t in result.threats:
+            lines.append(f"[{t.engine}] {t.threat}")
+            lines.append(f"  -> {t.path}")
+    else:
+        lines.append("Aucune menace detectee sur ce support.")
+
+    lines += ["", "Rapport genere par USB Antivirus Scanner - EDF"]
+
+    _write_pdf(dest, "Rapport de scan - USB Antivirus Scanner",
+               lines,
+               f"Support : {label or device}",
+               f"Date    : {now}",
+               f"Resultat: {'MENACES DETECTEES' if result.infected else 'SAIN'}")
+
+    log_info(f"Rapport PDF ecrit : {dest}")
+    return dest
