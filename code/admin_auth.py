@@ -1668,8 +1668,36 @@ class AdminPanel:
     # ── Onglet Journaux ────────────────────────────────────────────────────────
 
     def _tab_logs(self, nb: ttk.Notebook) -> None:
-        tab = ttk.Frame(nb, padding=10)
-        nb.add(tab, text="📋 Journaux")
+        outer = ttk.Frame(nb)
+        nb.add(outer, text="📋 Journaux")
+
+        # ── Conteneur scrollable ───────────────────────────────────────────────
+        canvas  = tk.Canvas(outer, highlightthickness=0)
+        vscroll = ttk.Scrollbar(outer, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=vscroll.set)
+        vscroll.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        tab = ttk.Frame(canvas, padding=10)
+        win_id = canvas.create_window((0, 0), window=tab, anchor="nw")
+
+        def _on_configure(event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _on_canvas_resize(event):
+            canvas.itemconfig(win_id, width=event.width)
+
+        tab.bind("<Configure>", _on_configure)
+        canvas.bind("<Configure>", _on_canvas_resize)
+
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        canvas.bind_all("<MouseWheel>",    _on_mousewheel)
+        canvas.bind_all("<Button-4>",
+                        lambda e: canvas.yview_scroll(-1, "units"))
+        canvas.bind_all("<Button-5>",
+                        lambda e: canvas.yview_scroll( 1, "units"))
 
         ttk.Label(tab, text="Journaux d'activité et statistiques",
                   font=("Arial", 11, "bold")).pack(anchor=tk.W, pady=(0, 6))
