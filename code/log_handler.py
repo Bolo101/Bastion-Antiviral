@@ -313,7 +313,9 @@ def write_device_scan_report_pdf(
         lines.append("--- FICHIERS INFECTES ---")
         for t in result.threats:
             lines.append(f"[{t.engine}] {t.threat}")
-            lines.append(f"  -> {t.path}")
+            lines.append(f"  Chemin : {t.path}")
+            sha = getattr(t, "hash", None) or "N/A"
+            lines.append(f"  SHA256 : {sha}")
     else:
         lines.append("Aucune menace detectee sur ce support.")
 
