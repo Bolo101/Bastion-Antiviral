@@ -20,6 +20,7 @@ Dépendances optionnelles pour la visionneuse PDF :
   pip install pymupdf pillow
 """
 
+import json
 import os
 import subprocess
 import sys
@@ -32,7 +33,7 @@ from typing import Dict, List, Optional
 from pdf_viewer import PdfViewer, RenderedPage
 
 from admin_auth import AdminAuthManager, AdminPanel
-from config import YARA_RULES_DIR
+from config import YARA_RULES_DIR, ADMIN_CFG_DIR
 from db_manager import DBManager
 from log_handler import (export_logs_to_path, generate_session_pdf,
                           log_error, log_info, log_warning, purge_logs)
@@ -96,11 +97,15 @@ class VirusScannerGUI:
         self._auto_refresh_id: Optional[str] = None
 
         # ── Statistiques cumulées (toutes sessions) ───────────────────────────
+        self._stats_file = os.path.join(ADMIN_CFG_DIR, "scan_stats.json")
         self._total_keys_scanned: int       = 0   # nombre de clés USB analysées
         self._cumul_threats:      int       = 0   # menaces cumulées toutes sessions
         self._threat_details:     List[dict] = []  # [{file, hash, threat, ts}]
         self._session_threats:    List       = []  # ThreatInfo de la session en cours (dédupliqués)
         self._session_seen_hashes: set      = set()  # hashes déjà vus dans la session
+
+        # Chargement des stats persistantes depuis le fichier JSON
+        self._load_persistent_stats()
 
         # ── Visionneuse PDF ───────────────────────────────────────────────────
         self._pdf_viewer:   Optional[PdfViewer] = None
@@ -123,6 +128,58 @@ class VirusScannerGUI:
         self._start_auto_refresh()
         self._init_pdf_viewer()
         self.root.protocol("WM_DELETE_WINDOW", self._request_admin)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Persistance des statistiques
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _load_persistent_stats(self) -> None:
+        """Charge les compteurs et le tableau des menaces depuis le fichier JSON."""
+        try:
+            if os.path.isfile(self._stats_file):
+                with open(self._stats_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                self._total_keys_scanned = int(data.get("keys_scanned", 0))
+                self._cumul_threats      = int(data.get("cumul_threats", 0))
+                self._threat_details     = data.get("threat_details", [])
+                # Reconstruire le set des hashes déjà vus (déduplication inter-sessions)
+                self._session_seen_hashes = {
+                    d.get("hash", d.get("file", ""))
+                    for d in self._threat_details
+                    if d.get("hash", "N/A") not in ("", "N/A")
+                }
+        except Exception as e:
+            log_error(f"Impossible de charger les stats persistantes : {e}")
+
+    def _save_persistent_stats(self) -> None:
+        """Sauvegarde les compteurs et le tableau des menaces dans le fichier JSON."""
+        try:
+            os.makedirs(os.path.dirname(self._stats_file), exist_ok=True)
+            data = {
+                "keys_scanned":   self._total_keys_scanned,
+                "cumul_threats":  self._cumul_threats,
+                "threat_details": self._threat_details,
+            }
+            with open(self._stats_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            log_error(f"Impossible de sauvegarder les stats : {e}")
+
+    def _purge_threats(self) -> None:
+        """Vide le tableau des menaces et remet à zéro le compteur de menaces."""
+        self._threat_details     = []
+        self._cumul_threats      = 0
+        self._session_threats    = []
+        self._session_seen_hashes = set()
+        self._save_persistent_stats()
+        self._log("🗑 Tableau des menaces purgé.", "warning")
+
+    def _purge_counters(self) -> None:
+        """Remet à zéro uniquement les compteurs (clés scannées + menaces)."""
+        self._total_keys_scanned = 0
+        self._cumul_threats      = 0
+        self._save_persistent_stats()
+        self._log("🗑 Compteurs de session remis à zéro.", "warning")
 
     # ══════════════════════════════════════════════════════════════════════════
     # Construction de l'interface
@@ -947,6 +1004,18 @@ class VirusScannerGUI:
                     self._session_threats.append(item)
                     self._cumul_threats += 1
 
+                    # ── Log détaillé dans la session (chemin + hash) ──────────
+                    log_info(
+                        f"MENACE DÉTECTÉE | chemin={fpath}"
+                        f" | hash={sha if sha else 'N/A'}"
+                        f" | type={tname}"
+                    )
+                    self._log(
+                        f"🦠 {tname}  ↳ {fpath}"
+                        f"  [hash: {(sha[:16] + '…') if sha and sha != 'N/A' else 'N/A'}]",
+                        "threat"
+                    )
+
             # Recalculer _total_infected depuis la liste dédupliquée
             # (écrase la somme brute des moteurs qui peut compter en double)
             self._total_infected = len(self._session_threats)
@@ -970,6 +1039,9 @@ class VirusScannerGUI:
         self.scanned_var.set(f"Analysés : {self._total_scanned}")
         if self._total_infected > 0:
             self.infected_var.set(f"Menaces : {self._total_infected}")
+
+        # Sauvegarde persistante des compteurs et du tableau des menaces
+        self._save_persistent_stats()
 
         # Export PDF automatique sur le support analysé
         self._auto_export_to_device(dev, result)
@@ -1369,8 +1441,10 @@ class VirusScannerGUI:
                     engines_used = engines_used,
                 )
                 self.root.after(0, self._log,
-                                f"📄 Rapport PDF écrit : {os.path.basename(report_path)}",
+                                f"📄 Rapport PDF écrit : {report_path}",
                                 "ok")
+                # Inscrire dans les logs de session le chemin complet du PDF
+                log_info(f"PDF DE RAPPORT EXPORTÉ SUR CLÉ | chemin={report_path} | device={dev}")
             except Exception as exc:
                 self.root.after(0, self._log,
                                 f"⚠ Erreur PDF sur {dev} : {exc}",
@@ -1415,6 +1489,8 @@ class VirusScannerGUI:
             # Journaux
             on_export_logs_usb        = self._admin_export_logs_usb,
             on_purge_logs             = self._admin_purge_logs,
+            on_purge_threats          = self._purge_threats,
+            on_purge_counters         = self._purge_counters,
             # Système
             on_poweroff               = self._admin_poweroff,
             on_quit                   = self._quit,
