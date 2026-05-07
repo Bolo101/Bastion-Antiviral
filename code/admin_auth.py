@@ -236,6 +236,8 @@ class AdminPanel:
         # Journaux
         on_export_logs_usb: Callable,
         on_purge_logs:      Callable,
+        on_purge_threats:   Callable,
+        on_purge_counters:  Callable,
         # Système
         on_poweroff: Callable,
         on_quit:     Callable,
@@ -273,6 +275,8 @@ class AdminPanel:
             "yara_usb":           on_import_yara_usb,
             "export_logs_usb":    on_export_logs_usb,
             "purge_logs":         on_purge_logs,
+            "purge_threats":      on_purge_threats,
+            "purge_counters":     on_purge_counters,
             "poweroff":           on_poweroff,
             "quit":               on_quit,
         }
@@ -1671,7 +1675,7 @@ class AdminPanel:
                   font=("Arial", 11, "bold")).pack(anchor=tk.W, pady=(0, 6))
 
         # ── Statistiques de scan ───────────────────────────────────────────────
-        stats_frame = ttk.LabelFrame(tab, text="Statistiques de la session", padding=8)
+        stats_frame = ttk.LabelFrame(tab, text="Statistiques cumulées (persistantes)", padding=8)
         stats_frame.pack(fill=tk.X, pady=(0, 8))
 
         stats_var = tk.StringVar(value="Chargement…")
@@ -1690,13 +1694,45 @@ class AdminPanel:
                 stats_var.set(f"Erreur stats : {e}")
 
         _refresh_stats()
-        ttk.Button(stats_frame, text="↺  Actualiser",
-                   command=_refresh_stats, width=14).pack(anchor=tk.W,
-                                                           pady=(6, 0))
+        stats_btn_row = ttk.Frame(stats_frame)
+        stats_btn_row.pack(anchor=tk.W, pady=(6, 0))
+        ttk.Button(stats_btn_row, text="↺  Actualiser",
+                   command=_refresh_stats, width=14).pack(side=tk.LEFT, padx=(0, 6))
+
+        def _do_purge_counters():
+            if not messagebox.askyesno(
+                "Purge compteurs",
+                "Remettre à zéro le nombre de clés scannées\n"
+                "et le compteur de menaces ?\n\n"
+                "(Le tableau des menaces est conservé.)",
+                icon="warning", parent=tab.winfo_toplevel()
+            ):
+                return
+            self._cb["purge_counters"]()
+            _refresh_stats()
+
+        def _do_purge_threats():
+            if not messagebox.askyesno(
+                "Purge menaces",
+                "Vider DÉFINITIVEMENT le tableau des menaces\n"
+                "et remettre le compteur de menaces à zéro ?",
+                icon="warning", parent=tab.winfo_toplevel()
+            ):
+                return
+            self._cb["purge_threats"]()
+            _refresh_stats()
+            _refresh_threats()
+
+        ttk.Button(stats_btn_row, text="🗑  Purge compteurs",
+                   command=_do_purge_counters,
+                   width=18).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(stats_btn_row, text="🗑  Purge menaces",
+                   command=_do_purge_threats,
+                   width=18).pack(side=tk.LEFT)
 
         # ── Tableau fichiers malveillants ──────────────────────────────────────
         threat_frame = ttk.LabelFrame(
-            tab, text="Fichiers malveillants détectés (session courante)",
+            tab, text="Fichiers malveillants détectés (cumulés, toutes sessions)",
             padding=8)
         threat_frame.pack(fill=tk.X, pady=(0, 8))
 
@@ -1761,7 +1797,8 @@ class AdminPanel:
                 import csv
                 with open(path, "w", newline="", encoding="utf-8") as f:
                     w = csv.DictWriter(
-                        f, fieldnames=["ts","file","threat","hash","dev"])
+                        f, fieldnames=["ts","file","threat","hash","dev","mp"],
+                        extrasaction="ignore")
                     w.writeheader()
                     w.writerows(s["details"])
                 messagebox.showinfo("Export terminé",
