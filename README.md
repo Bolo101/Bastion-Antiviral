@@ -25,6 +25,10 @@ Station de décontamination antivirale pour supports USB, conçue pour fonctionn
 
 USB Antivirus Scanner est une application Python/Tkinter qui tourne en plein écran sur une station dédiée (ou en mode live depuis un ISO). Elle détecte automatiquement les clés USB branchées, les analyse en parallèle avec plusieurs moteurs antivirus (ClamAV, Avast, YARA), et affiche le résultat dans un journal horodaté. L'accès aux réglages est protégé par un code administrateur.
 
+<div style="display: flex; align-items: center;">
+  <img src="./img/gui.png" alt="GUI" width="600" style="margin-right: 20px;">
+</div>
+
 ---
 
 ## Arborescence du projet
