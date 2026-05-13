@@ -203,9 +203,17 @@ class VirusScannerGUI:
                  font=("Arial", 16, "bold"),
                  bg=self.TOPBAR, fg=self.FG).pack(side=tk.LEFT, padx=16)
 
-        tk.Label(topbar, text="Protection de vos données amovibles",
+        self._subtitle_lbl = tk.Label(topbar, text="Protection de vos données amovibles",
                  font=("Arial", 9, "italic"),
-                 bg=self.TOPBAR, fg=self.FG_DIM).pack(side=tk.LEFT, padx=4)
+                 bg=self.TOPBAR, fg=self.FG_DIM)
+        self._subtitle_lbl.pack(side=tk.LEFT, padx=4)
+        # Masquer le sous-titre si la fenetre est trop etroite
+        def _toggle_subtitle(event=None):
+            if self.root.winfo_width() < 620:
+                self._subtitle_lbl.pack_forget()
+            else:
+                self._subtitle_lbl.pack(side=tk.LEFT, padx=4)
+        self.root.bind("<Configure>", _toggle_subtitle)
 
 
         tk.Button(topbar, text="⚙  Administration",
@@ -213,18 +221,15 @@ class VirusScannerGUI:
                   bg=self.ACCENT, fg="white", relief=tk.FLAT,
                   font=("Arial", 9, "bold"), padx=12).pack(side=tk.RIGHT, padx=8)
 
-        # ── Bandeau statut des moteurs ─────────────────────────────────────────
-        sbar = tk.Frame(self.root, bg="#0a2240", pady=3)
+        # ── Bandeau statut des moteurs (ClamAV + Avast uniquement) ────────────
+        sbar = tk.Frame(self.root, bg="#0a2240", pady=2)
         sbar.pack(fill=tk.X)
-        self.clamav_status_var = tk.StringVar(value="ClamAV : vérification…")
-        self.avast_status_var  = tk.StringVar(value="Avast : vérification…")
-        self.yara_status_var   = tk.StringVar(value="YARA : vérification…")
-        self.tp_status_var     = tk.StringVar(value="Sigs tierces : vérification…")
-        for var in (self.clamav_status_var, self.avast_status_var,
-                    self.yara_status_var, self.tp_status_var):
+        self.clamav_status_var = tk.StringVar(value="ClamAV…")
+        self.avast_status_var  = tk.StringVar(value="Avast…")
+        for var in (self.clamav_status_var, self.avast_status_var):
             tk.Label(sbar, textvariable=var,
                      bg="#0a2240", fg=self.GREEN,
-                     font=("Courier", 8), padx=14).pack(side=tk.LEFT)
+                     font=("Courier", 8), padx=8).pack(side=tk.LEFT)
 
         # ── Corps principal ────────────────────────────────────────────────────
         body = tk.Frame(self.root, bg=self.BG)
@@ -550,70 +555,57 @@ class VirusScannerGUI:
     def _refresh_status_worker(self) -> None:
         # ClamAV
         if not self.engine.is_clamav_installed():
-            clamav_text = "❌  ClamAV : non installé"
+            clamav_text = "❌ ClamAV"
         else:
-            info    = self.db.get_clamav_status()
-            st      = info["status"]
-            lu      = info.get("last_update", "?")
-            count   = self.db.get_known_virus_count()
-            count_s = (f"  {count:,} sig.".replace(",", "\u202f")
-                       if count else "")
+            info = self.db.get_clamav_status()
+            st   = info["status"]
+            lu   = info.get("last_update", "?")
+            # Raccourcir la date : garder seulement jj/mm si format ISO
+            try:
+                from datetime import datetime as _dt
+                lu_short = _dt.fromisoformat(lu).strftime("%d/%m/%y")
+            except Exception:
+                lu_short = lu[:8] if lu and lu != "?" else "?"
             if st == "OK":
-                clamav_text = f"✅  ClamAV  (màj : {lu}){count_s}"
+                clamav_text = f"✅ ClamAV · {lu_short}"
             elif st == "OUTDATED":
-                clamav_text = f"⚠   ClamAV : base obsolète  ({lu})"
+                clamav_text = f"⚠ ClamAV · {lu_short}"
             else:
-                missing = info.get("missing", [])
-                clamav_text = (f"❌  ClamAV : bases manquantes"
-                               + (f" – {', '.join(missing)}" if missing else ""))
+                clamav_text = "❌ ClamAV"
 
-        # Avast
+        # Avast – date de MAJ lue depuis le filesystem VPS
         avast_installed = self.engine.is_avast_installed()
         avast_licensed  = self.engine.is_avast_licensed()
         if not avast_installed:
-            avast_text = "⭕  Avast : non installé"
+            avast_text = "⭕ Avast"
         elif not avast_licensed:
-            avast_text = "⚠   Avast : installé, sans licence"
+            avast_text = "⚠ Avast"
         else:
-            avast_text = "✅  Avast : actif"
-
-        # YARA
-        yara_ok, method = self.engine.detect_yara()
-        if not yara_ok:
-            yara_text = "⭕  YARA : non disponible"
-        else:
-            yi = self.db.get_yara_status()
-            n  = yi["count"]
-            lu2 = yi.get("last_update", "?")
-            yara_text = (f"✅  YARA ({method}) : {n} règle(s)  (màj : {lu2})"
-                         if n > 0 else f"⚠   YARA ({method}) : aucune règle")
-
-        # Signatures tierces ClamAV
-        import glob as _glob
-        _TP_PATTERNS = [
-            "*.ndb", "*.hdb", "*.hsb", "*.db",
-            "*.ftm", "*.ldb", "*.cdb", "*.fp", "*.ign2"
-        ]
-        tp_count = sum(
-            len(_glob.glob(f"/var/lib/clamav/{p}")) for p in _TP_PATTERNS
-        )
-        if tp_count > 0:
-            tp_text = f"Sigs tierces : {tp_count} fichier(s)"
-        else:
-            tp_text = "⚠  Sigs tierces : aucune"
+            avast_date = "?"
+            try:
+                import os as _os, datetime as _datetime
+                _vps_paths = [
+                    "/var/lib/avast/Setup/avast.vpsupdate",
+                    "/var/lib/avast/Setup/vps.ver",
+                ]
+                for _p in _vps_paths:
+                    if _os.path.exists(_p):
+                        _mtime = _os.path.getmtime(_p)
+                        avast_date = _datetime.datetime.fromtimestamp(
+                            _mtime).strftime("%d/%m/%y")
+                        break
+            except Exception:
+                pass
+            avast_text = f"✅ Avast · {avast_date}"
 
         def _apply():
             self.clamav_status_var.set(clamav_text)
             self.avast_status_var.set(avast_text)
-            self.yara_status_var.set(yara_text)
-            self.tp_status_var.set(tp_text)
             # Synchronise les vars d'options avec la réalité du système
             if avast_installed and avast_licensed:
                 self.use_avast_var.set(True)
             elif not avast_installed:
                 self.use_avast_var.set(False)
-            if not yara_ok:
-                self.use_yara_var.set(False)
         self.root.after(0, _apply)
 
     # ══════════════════════════════════════════════════════════════════════════
