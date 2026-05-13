@@ -236,9 +236,12 @@ class VirusScannerGUI:
         left.pack_propagate(False)
         right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(4, 0))
 
+        # Journal + boutons ancrés en bas ; USB remplit l'espace restant
+        btm = tk.Frame(left, bg=self.BG)
+        btm.pack(side=tk.BOTTOM, fill=tk.X)
+        self._build_log_panel(btm)
+        self._build_scan_controls(btm)
         self._build_usb_panel(left)
-        self._build_log_panel(left)
-        self._build_scan_controls(left)
         self._build_pdf_viewer_panel(right)
 
     # ── Panneau USB (simplifié utilisateur) ───────────────────────────────────
@@ -308,7 +311,7 @@ class VirusScannerGUI:
 
     def _build_scan_controls(self, parent: tk.Frame) -> None:
         outer = tk.Frame(parent, bg=self.CARD, bd=1, relief=tk.SOLID)
-        outer.pack(fill=tk.X, pady=4)
+        outer.pack(fill=tk.X, pady=(0, 4))
         frm = tk.Frame(outer, bg=self.CARD, padx=10, pady=10)
         frm.pack(fill=tk.X)
 
@@ -401,10 +404,11 @@ class VirusScannerGUI:
 
         # Cadre englobant pour que le Text+Scrollbar s'étendent ensemble
         log_wrap = tk.Frame(parent, bg="#0b0d14", bd=1, relief=tk.FLAT)
-        log_wrap.pack(fill=tk.BOTH, expand=True, pady=(0, 4))
+        log_wrap.pack(fill=tk.X, expand=False, pady=(0, 0))
         self.log_text = tk.Text(
             log_wrap, bg="#0b0d14", fg="#c8d0de",
             font=("Courier", 9), wrap=tk.WORD,
+            height=10,
             state=tk.NORMAL, insertbackground="white",
             relief=tk.FLAT, padx=10, pady=8
         )
