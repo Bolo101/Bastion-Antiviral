@@ -1,4 +1,4 @@
-# 🛡 USB Antivirus Scanner
+# 🛡 Bastion Antiviral
 
 Station de décontamination antivirale pour supports USB, conçue pour fonctionner en mode kiosque (plein écran, sans interaction clavier nécessaire). L'interface affiche en permanence des documents PDF de sensibilisation ou de communication pendant que l'analyse se déroule en arrière-plan.
 
@@ -23,7 +23,7 @@ Station de décontamination antivirale pour supports USB, conçue pour fonctionn
 
 ## Aperçu
 
-USB Antivirus Scanner est une application Python/Tkinter qui tourne en plein écran sur une station dédiée (ou en mode live depuis un ISO). Elle détecte automatiquement les clés USB branchées, les analyse en parallèle avec plusieurs moteurs antivirus (ClamAV, Avast, YARA), et affiche le résultat dans un journal horodaté. L'accès aux réglages est protégé par un code administrateur.
+Bastion Antiviral est une application Python/Tkinter qui tourne en plein écran sur une station dédiée (ou en mode live depuis un ISO). Elle détecte automatiquement les clés USB branchées, les analyse en parallèle avec plusieurs moteurs antivirus (ClamAV, Avast, YARA), et affiche le résultat dans un journal horodaté. L'accès aux réglages est protégé par un code administrateur.
 
 <div style="display: flex; align-items: center;">
   <img src="./img/gui.png" alt="GUI" width="600" style="margin-right: 20px;">
@@ -49,8 +49,8 @@ USB Antivirus Scanner est une application Python/Tkinter qui tourne en plein éc
 │   └── utils.py            # Fonctions utilitaires partagées
 ├── iso/
 │   ├── makefile            # Génération de l'ISO ou démarrage en mode live
-│   └── xfce-64-bits/
-│       └── forgeIsoXfce.sh # Script de construction de l'image XFCE 64 bits
+│   └── iso-64-bits/
+│       └── forgeIso64.sh # Script de construction de l'image 64 bits
 ├── pdf/
 │   └── *.pdf               # Documents affichés en boucle (sensibilisation, communication…)
 └── README.md
