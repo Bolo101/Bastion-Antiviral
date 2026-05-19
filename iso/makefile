@@ -1,17 +1,17 @@
 # Define variables
 
-SCRIPT_XFCE     := forgeIsoXfce.sh
+SCRIPT_ISO    := forgeIso64.sh
 
-DIR_XFCE_64     := xfce-64-bits
+DIR_ISO_64     := iso-64-bits
 
-BUILD_DIR_XFCE_64    := ./xfce-64-bits/debian-live-build
+BUILD_DIR_ISO_64    := ./iso-64-bits/debian-live-build
 
 .PHONY: all kde all-iso clean help
 
 # Default target: run the script
 
 all:
-	cd $(DIR_XFCE_64) && chmod +x $(SCRIPT_XFCE) && bash $(SCRIPT_XFCE)
+	cd $(DIR_ISO_64) && chmod +x $(SCRIPT_ISO) && bash $(SCRIPT_ISO)
 
 # Build all ISOs
 
@@ -23,13 +23,13 @@ all-iso:
 # Clean target: remove the debian-live-build directory in all folders
 
 clean:
-	rm -rf $(BUILD_DIR_XFCE_64)
+	rm -rf $(BUILD_DIR_ISO_64)
 
 # Help target
 
 help:
 	@echo "Available commands:"
-	@echo "  make all     - Build XFCE ISO (64-bit)"
+	@echo "  make all     - Build ISO (64-bit)"
 	@echo "  make clean   - Remove the build directories in all folders"
 
 # Catch-all for invalid commands
