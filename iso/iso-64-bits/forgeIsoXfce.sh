@@ -21,7 +21,7 @@
 set -euo pipefail
 
 # ── Variables ─────────────────────────────────────────────────────────────────
-ISO_NAME="$(pwd)/usb-antivirus-scanner-v1.0.iso"
+ISO_NAME="$(pwd)/bastion-antiviral-v1.0.iso"
 WORK_DIR="$(pwd)/debian-live-build"
 CODE_DIR="$(pwd)/../../code"
 SIGBASE_URL="https://github.com/Neo23x0/signature-base/archive/refs/heads/master.zip"
