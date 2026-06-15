@@ -1,6 +1,6 @@
 #!/bin/bash
 # ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║  forgeIsoXfce.sh  –  ISO live Debian Bookworm  /  OpenBox + LightDM         ║
+# ║  forgeIsoXfce.sh  –  ISO live Debian Trixie  /  OpenBox + LightDM         ║
 # ║                       Scanner antiviral USB  (ClamAV + YARA + Avast)        ║
 # ║                                                                              ║
 # ║  Entrée 1 : Live       → OpenBox kiosque  (usb-antivirus)                   ║
@@ -62,9 +62,9 @@ cd "$WORK_DIR"
 lb clean 2>/dev/null || true
 
 # ── Configuration live-build ──────────────────────────────────────────────────
-step "Configuration de live-build (Debian Bookworm / OpenBox / AZERTY)..."
+step "Configuration de live-build (Debian Trixie / OpenBox / AZERTY)..."
 lb config \
-    --distribution bookworm \
+    --distribution trixie \
     --architectures amd64 \
     --linux-packages linux-image \
     --debian-installer none \
@@ -77,8 +77,8 @@ ok "live-build configuré"
 # ── Dépôts Debian ─────────────────────────────────────────────────────────────
 mkdir -p config/archives
 cat > config/archives/debian.list.chroot << 'EOF'
-deb http://deb.debian.org/debian bookworm main contrib non-free non-free-firmware
-deb-src http://deb.debian.org/debian bookworm main contrib non-free non-free-firmware
+deb http://deb.debian.org/debian trixie main contrib non-free non-free-firmware
+deb-src http://deb.debian.org/debian trixie main contrib non-free non-free-firmware
 EOF
 
 # ── Dépôt Avast (sources persistantes dans l'image finale) ───────────────────
@@ -625,7 +625,7 @@ cat > config/hooks/normal/0250-avast-install.hook.chroot << 'HOOK'
 #     | tee /etc/apt/trusted.gpg.d/avast.asc
 #   apt update && apt install avast avast-fss avast-rest avast-license
 #
-# Distributions supportées : debian-buster/bullseye/bookworm,
+# Distributions supportées : debian-buster/bullseye/bookworm/trixie,
 #   ubuntu-bionic/focal/jammy/noble
 #
 # Une licence Business est requise. L'administrateur l'active via le
