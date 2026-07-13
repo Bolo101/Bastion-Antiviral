@@ -221,6 +221,11 @@ class VirusScannerGUI:
                   bg=self.ACCENT, fg="white", relief=tk.FLAT,
                   font=("Arial", 9, "bold"), padx=12).pack(side=tk.RIGHT, padx=8)
 
+        tk.Button(topbar, text="⟲  Redémarrer",
+                  command=self._on_reboot_clicked,
+                  bg="#3d4f66", fg="white", relief=tk.FLAT,
+                  font=("Arial", 9, "bold"), padx=12).pack(side=tk.RIGHT, padx=(0, 0))
+
         # ── Bandeau statut des moteurs (ClamAV + Avast uniquement) ────────────
         sbar = tk.Frame(self.root, bg="#0a2240", pady=2)
         sbar.pack(fill=tk.X)
@@ -1456,6 +1461,19 @@ class VirusScannerGUI:
     # ══════════════════════════════════════════════════════════════════════════
     # Administration
     # ══════════════════════════════════════════════════════════════════════════
+
+    def _on_reboot_clicked(self) -> None:
+        if self._scan_engines:
+            messagebox.showwarning(
+                "Analyse en cours",
+                "Impossible de redémarrer pendant une analyse antivirus. "
+                "Attendez la fin de l'analyse, puis réessayez.",
+                parent=self.root,
+            )
+            return
+        if not messagebox.askyesno("Redémarrer", "Redémarrer la machine maintenant ?", parent=self.root):
+            return
+        subprocess.run(["systemctl", "reboot"], check=False)
 
     def _request_admin(self) -> None:
         panel = AdminPanel(
