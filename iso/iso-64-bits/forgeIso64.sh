@@ -44,7 +44,7 @@ for cmd in lb wget curl python3 unzip rsync xorriso; do
 done
 [[ -d "$CODE_DIR" ]] || err "Répertoire code introuvable : $CODE_DIR"
 for f in config.py log_handler.py admin_auth.py usb_manager.py \
-          db_manager.py scanner.py gui.py main.py pdf_viewer.py; do
+          db_manager.py scanner.py gui.py main.py pdf_viewer.py utils.py; do
     [[ -f "$CODE_DIR/$f" ]] || err "Fichier manquant dans $CODE_DIR : $f"
 done
 ok "Pré-requis OK"
@@ -59,7 +59,7 @@ ok "Outils de build installés"
 step "Préparation du répertoire de travail..."
 mkdir -p "$WORK_DIR"
 cd "$WORK_DIR"
-lb clean 2>/dev/null || true
+lb clean --purge 2>/dev/null || true
 
 # ── Configuration live-build ──────────────────────────────────────────────────
 step "Configuration de live-build (Debian Trixie / OpenBox / AZERTY)..."
@@ -71,7 +71,13 @@ lb config \
     --bootappend-live "${BOOT_PARAMS}" \
     --bootloaders "syslinux,grub-efi" \
     --binary-images iso-hybrid \
-    --apt-options "--yes --no-install-recommends"
+    --apt-options "--yes"
+# NOTE : --no-install-recommends a été retiré. Il coupait des paquets
+# "recommends" de xorg/openbox/lightdm qui sont en pratique nécessaires
+# à une session graphique fonctionnelle (x11-xserver-utils, dbus-x11,
+# policykit-1, polices, pilotes Mesa/GL...). C'est la cause probable de
+# l'écran noir : X démarrait mais la session ne s'établissait jamais.
+# Le script VirtuPack (qui fonctionne) n'utilise pas cette option.
 ok "live-build configuré"
 
 # ── Dépôts Debian ─────────────────────────────────────────────────────────────
@@ -164,6 +170,11 @@ xserver-xorg-video-nouveau
 xserver-xorg-video-vesa
 xserver-xorg-video-fbdev
 xserver-xorg-input-all
+x11-xserver-utils
+dbus
+dbus-x11
+polkitd
+pkexec
 openbox
 lightdm
 xfwm4
@@ -778,12 +789,27 @@ locale-gen fr_FR.UTF-8
 update-locale LANG=fr_FR.UTF-8 LC_ALL=fr_FR.UTF-8
 
 # Utilisateur scanner (autologin, sudo sans mot de passe)
+# Idempotent : gère séparément le groupe et l'utilisateur, car un chroot
+# réutilisé entre deux builds (lb clean sans --purge) peut déjà contenir
+# le groupe "scanner" sans l'utilisateur, ce qui fait échouer useradd
+# (qui tente de créer un groupe du même nom par défaut).
+groupadd -f scanner
 if ! id scanner &>/dev/null; then
-    useradd -m -s /bin/bash -G sudo,plugdev,cdrom,dialout scanner
+    useradd -m -s /bin/bash -g scanner -G sudo,plugdev,cdrom,dialout scanner
     echo "scanner:scanner" | chpasswd
+else
+    usermod --shell /bin/bash --gid scanner scanner
+    usermod --append --groups sudo,plugdev,cdrom,dialout scanner 2>/dev/null || true
 fi
 echo "scanner ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/scanner
 chmod 0440 /etc/sudoers.d/scanner
+
+# Dossier de logs de session : créé ici (en root, au build) car à
+# l'exécution la session graphique tourne en tant qu'utilisateur "scanner"
+# (non-root), qui ne peut pas créer de dossier sous /var/log lui-même.
+mkdir -p /var/log/usb-antivirus
+chown scanner:scanner /var/log/usb-antivirus
+chmod 0775 /var/log/usb-antivirus
 
 # Répertoires de l'application
 mkdir -p /opt/usb-antivirus
@@ -798,8 +824,15 @@ mkdir -p /opt/img && chmod 755 /opt/img
 
 # Wrapper de lancement
 cat > /usr/local/bin/usb-antivirus << 'WRAPPER'
-#!/bin/bash
-exec sudo -E python3 /opt/usb-antivirus/main.py "$@"
+#!/usr/bin/env bash
+set -u
+export DISPLAY="${DISPLAY:-:0}"
+export XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}"
+if [[ $(id -u) -eq 0 ]]; then
+    exec python3 /opt/usb-antivirus/main.py "$@"
+fi
+exec sudo --preserve-env=DISPLAY,XAUTHORITY,XDG_RUNTIME_DIR,DBUS_SESSION_BUS_ADDRESS \
+    python3 /opt/usb-antivirus/main.py "$@"
 WRAPPER
 chmod 755 /usr/local/bin/usb-antivirus
 
@@ -845,7 +878,10 @@ mkdir -p /etc/X11/xorg.conf.d
 cat > /etc/X11/xorg.conf.d/99-kiosk-lock.conf << 'XORGCONF'
 Section "ServerFlags"
     Option "DontZap"       "true"
-    Option "DontVTSwitch"  "true"
+    # DontVTSwitch désactivé volontairement : bloquer le changement de
+    # console (Ctrl+Alt+F2) empêche tout diagnostic en cas de plantage
+    # de l'application (écran noir sans possibilité de debug).
+    Option "DontVTSwitch"  "false"
     Option "BlankTime"     "0"
     Option "StandbyTime"   "0"
     Option "SuspendTime"   "0"
@@ -870,41 +906,76 @@ cat > /usr/local/bin/usb-antivirus-session.sh << 'SESSION'
 # automatiquement vers le mode installateur (xterm + install-to-disk.sh).
 # =============================================================================
 export DISPLAY=:0
+USER_NAME="$(id -un)"
 export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+export XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}"
+install -d -m 0700 "$XDG_RUNTIME_DIR" 2>/dev/null || true
+chown "$USER_NAME:$USER_NAME" "$XDG_RUNTIME_DIR" 2>/dev/null || true
 
 # Anti-veille
 xset s off -dpms 2>/dev/null || true
 xset s noblank   2>/dev/null || true
-
-# Démarrage d'OpenBox en arrière-plan
-openbox &
-OB_PID=$!
-sleep 1
-
-# Fond noir
 xsetroot -solid black 2>/dev/null || true
 
 if grep -q "installer=1" /proc/cmdline 2>/dev/null; then
     # ── Mode installateur ────────────────────────────────────────────────────
-    xterm -title "USB Antivirus Scanner - Installation" \
+    exec xterm -title "USB Antivirus Scanner - Installation" \
           -fa "Monospace" -fs 12 \
           -bg "#0d0d1a" -fg "#e0e0e0" \
           -e "sudo /usr/local/bin/install-to-disk.sh"
-else
-    # ── Mode live kiosque ────────────────────────────────────────────────────
+fi
+
+# ── Mode live kiosque ────────────────────────────────────────────────────────
+LOG_DIR="/var/log/usb-antivirus"
+if ! mkdir -p "$LOG_DIR" 2>/dev/null || [[ ! -w "$LOG_DIR" ]]; then
+    LOG_DIR="/tmp/usb-antivirus"
+    mkdir -p "$LOG_DIR" 2>/dev/null || true
+fi
+LOG_FILE="$LOG_DIR/session.log"
+
+# Toute la session (WM + appli) tourne sous un vrai bus D-Bus de session :
+# son absence fait échouer en silence tout ce qui touche udisks2 (détection
+# USB), notifications ou PolicyKit — c'était la cause probable des crashs
+# immédiats et répétés de l'application.
+exec dbus-run-session -- bash -c '
+    openbox --replace >/tmp/openbox-antivirus.log 2>&1 &
+    OB_PID=$!
+    sleep 1
+    xsetroot -solid black 2>/dev/null || true
+
     # Boucle de relance : redémarre uniquement en cas de crash (exit != 0)
+    # Si l'\''appli plante immédiatement (< 5s) plusieurs fois de suite, on
+    # arrête de boucler en silence et on affiche l'\''erreur à l'\''écran.
+    CRASH_COUNT=0
     while true; do
-        /usr/local/bin/usb-antivirus
-        [[ $? -eq 0 ]] && break   # quitter volontaire → on sort
+        START_TS=$(date +%s)
+        /usr/local/bin/usb-antivirus >>"'"$LOG_FILE"'" 2>&1
+        RC=$?
+        END_TS=$(date +%s)
+        [[ $RC -eq 0 ]] && break
+
+        if (( END_TS - START_TS < 5 )); then
+            CRASH_COUNT=$((CRASH_COUNT + 1))
+        else
+            CRASH_COUNT=0
+        fi
+
+        if (( CRASH_COUNT >= 3 )); then
+            xterm -title "USB Antivirus Scanner - ERREUR AU DEMARRAGE" \
+                  -fa "Monospace" -fs 12 \
+                  -bg "#3a0d0d" -fg "#f0f0f0" \
+                  -e "echo Application arrêtée avec le code $RC (x$CRASH_COUNT); \
+                      echo; echo Dernières lignes du log :; echo; \
+                      tail -n 60 '"$LOG_FILE"'; echo; \
+                      read -r -p \"Entrée pour réessayer...\"" || true
+            CRASH_COUNT=0
+        fi
         sleep 1
     done
 
-    # Quitter volontaire → lancer un vrai bureau XFCE
     kill "$OB_PID" 2>/dev/null || true
     exec xfce4-session
-fi
-
-kill "$OB_PID" 2>/dev/null || true
+'
 SESSION
 chmod 755 /usr/local/bin/usb-antivirus-session.sh
 
@@ -918,7 +989,11 @@ cat > /usr/local/bin/usb-antivirus-session-installed.sh << 'SESSION'
 # installé pérenne). L'application redémarre automatiquement.
 # =============================================================================
 export DISPLAY=:0
+USER_NAME="$(id -un)"
 export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+export XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}"
+install -d -m 0700 "$XDG_RUNTIME_DIR" 2>/dev/null || true
+chown "$USER_NAME:$USER_NAME" "$XDG_RUNTIME_DIR" 2>/dev/null || true
 
 xset s off -dpms 2>/dev/null || true
 xset s noblank   2>/dev/null || true
@@ -926,21 +1001,50 @@ xset s noblank   2>/dev/null || true
 # Fond noir
 xsetroot -solid black 2>/dev/null || true
 
-# Démarrage de xfwm4 (léger, stable, sans décoration)
-xfwm4 --compositor=off &
-WM_PID=$!
-sleep 1
+LOG_DIR="/var/log/usb-antivirus"
+if ! mkdir -p "$LOG_DIR" 2>/dev/null || [[ ! -w "$LOG_DIR" ]]; then
+    LOG_DIR="/tmp/usb-antivirus"
+    mkdir -p "$LOG_DIR" 2>/dev/null || true
+fi
+LOG_FILE="$LOG_DIR/session.log"
 
-# Boucle de relance : redémarre uniquement en cas de crash (exit != 0)
-while true; do
-    /usr/local/bin/usb-antivirus
-    [[ $? -eq 0 ]] && break   # quitter volontaire → on sort
+# Session complète (WM + appli) sous un vrai bus D-Bus de session.
+exec dbus-run-session -- bash -c '
+    xfwm4 --compositor=off >/tmp/xfwm4-antivirus.log 2>&1 &
+    WM_PID=$!
     sleep 1
-done
+    xsetroot -solid black 2>/dev/null || true
 
-# Quitter volontaire → lancer un vrai bureau XFCE
-kill "$WM_PID" 2>/dev/null || true
-exec xfce4-session
+    CRASH_COUNT=0
+    while true; do
+        START_TS=$(date +%s)
+        /usr/local/bin/usb-antivirus >>"'"$LOG_FILE"'" 2>&1
+        RC=$?
+        END_TS=$(date +%s)
+        [[ $RC -eq 0 ]] && break
+
+        if (( END_TS - START_TS < 5 )); then
+            CRASH_COUNT=$((CRASH_COUNT + 1))
+        else
+            CRASH_COUNT=0
+        fi
+
+        if (( CRASH_COUNT >= 3 )); then
+            xterm -title "USB Antivirus Scanner - ERREUR AU DEMARRAGE" \
+                  -fa "Monospace" -fs 12 \
+                  -bg "#3a0d0d" -fg "#f0f0f0" \
+                  -e "echo Application arrêtée avec le code $RC (x$CRASH_COUNT); \
+                      echo; echo Dernières lignes du log :; echo; \
+                      tail -n 60 '"$LOG_FILE"'; echo; \
+                      read -r -p \"Entrée pour réessayer...\"" || true
+            CRASH_COUNT=0
+        fi
+        sleep 1
+    done
+
+    kill "$WM_PID" 2>/dev/null || true
+    exec xfce4-session
+'
 SESSION
 chmod 755 /usr/local/bin/usb-antivirus-session-installed.sh
 
@@ -1381,9 +1485,19 @@ step "Copie des fichiers dans le chroot..."
 # ── Application Python ────────────────────────────────────────────────────────
 APP_CHROOT="config/includes.chroot/opt/usb-antivirus"
 mkdir -p "$APP_CHROOT"
-cp -v "$CODE_DIR"/{config.py,log_handler.py,admin_auth.py,\
-usb_manager.py,db_manager.py,scanner.py,gui.py,main.py,pdf_viewer.py} "$APP_CHROOT/"
-ok "Fichiers Python copiés → $APP_CHROOT"
+cp -a "$CODE_DIR"/*.py "$APP_CHROOT/"
+ok "$(find "$APP_CHROOT" -name '*.py' | wc -l) fichier(s) Python copié(s) → $APP_CHROOT"
+
+# Vérification de syntaxe au moment du build : un fichier avec une erreur
+# de syntaxe planterait silencieusement au démarrage du kiosque (voir le
+# problème utils.py manquant précédent) — on préfère faire échouer le
+# build immédiatement avec un message clair.
+if python3 -m py_compile "$APP_CHROOT"/*.py 2>/tmp/pycompile.log; then
+    ok "Syntaxe Python vérifiée (py_compile)"
+else
+    cat /tmp/pycompile.log
+    err "Erreur de syntaxe détectée dans le code Python — voir ci-dessus"
+fi
 
 # ── Répertoire PDFs (../pdf/ relatif au code = /opt/pdf/) ─────────────────────
 PDF_CHROOT="config/includes.chroot/opt/pdf"
@@ -1904,6 +2018,21 @@ polkit.addRule(function(action, subject) {
 EOF
 
 ok "Tous les fichiers de configuration générés"
+
+# ── Hook final : permissions et compilation Python dans le chroot ────────────
+cat > config/hooks/normal/0400-permissions.hook.chroot << 'HOOK'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+chmod 0644 /opt/usb-antivirus/*.py
+chmod 0755 /opt/usb-antivirus /usr/local/bin/usb-antivirus \
+    /usr/local/bin/usb-antivirus-session.sh \
+    /usr/local/bin/usb-antivirus-session-installed.sh 2>/dev/null || true
+chown -R scanner:scanner /home/scanner /opt/pdf /opt/img 2>/dev/null || true
+install -d -o scanner -g scanner -m 0755 /var/log/usb-antivirus
+python3 -m compileall -q /opt/usb-antivirus
+HOOK
+chmod 0755 config/hooks/normal/0400-permissions.hook.chroot
+ok "Hook de permissions finales créé"
 
 
 # =============================================================================
