@@ -44,7 +44,11 @@ Bastion Antiviral est une application Python/Tkinter qui tourne en plein écran 
 │   ├── log_handler.py      # Journalisation et export PDF des sessions
 │   ├── main.py             # Point d'entrée
 │   ├── pdf_viewer.py       # Visionneuse PDF cyclique (PyMuPDF)
+│   ├── sandbox.py          # Isolation de chaque analyse (bubblewrap + seccomp)
+│   ├── sandbox_selftest.py # Vérification du sandbox avec EICAR (sudo)
+│   ├── userns_exec.py      # Helper : user namespace « identité »
 │   ├── scanner.py          # Moteur de scan et résultats
+│   ├── yara_worker.py      # Worker YARA exécuté dans le sandbox
 │   ├── usb_manager.py      # Détection et montage des partitions USB
 │   └── utils.py            # Fonctions utilitaires partagées
 ├── iso/
@@ -100,6 +104,7 @@ Bastion Antiviral est une application Python/Tkinter qui tourne en plein écran 
 | PyMuPDF | `pip install pymupdf` |
 | Pillow | `pip install pillow` |
 | Avast (optionnel) | paquet `.deb` officiel + licence |
+| bubblewrap + python3-seccomp | `apt install bubblewrap python3-seccomp` (isolation des analyses) |
 
 > L'application **doit être lancée avec les droits root** (`sudo`) pour accéder aux périphériques USB et exécuter les commandes système.
 
@@ -218,7 +223,50 @@ Moteur de détection par règles personnalisées. Les règles (`.yar` / `.yara`)
 
 - L'application requiert les droits `root` pour monter les partitions USB et exécuter les commandes système.
 - Le code administrateur est stocké sous forme de condensat SHA-256 dans `/etc/virusscanner/admin.json` (permissions `600`).
+- **Isolation des analyses** : voir ci-dessous.
 - La fermeture de la fenêtre principale est elle-même protégée par le code administrateur, rendant l'interface résistante aux manipulations non autorisées en contexte kiosque.
+
+### Isolation des analyses (sandbox)
+
+Les moteurs analysent des fichiers hostiles (parseurs d'archives, PE, PDF…) alors que l'application tourne en `root`. Pour qu'une faille d'un moteur ne compromette pas la station, **chaque moteur est lancé dans un conteneur éphémère** ([bubblewrap](https://github.com/containers/bubblewrap), mêmes primitives noyau que Docker/Podman, sans démon) créé pour l'analyse puis détruit.
+
+| Mesure | Effet |
+|---|---|
+| namespaces mount / pid / ipc / uts / cgroup / **net** | aucun accès réseau, aucun processus de l'hôte visible |
+| racine `tmpfs` vide, puis **lecture seule** ; `/usr`, bases et règles en lecture seule | pas d'accès à `/etc`, `/home`, logs, identifiants admin |
+| support analysé monté en **lecture seule**, une seule clé par sandbox | rien n'est modifiable sur la clé, aucune autre clé n'est visible |
+| capabilities : **uniquement `CAP_DAC_READ_SEARCH`** | lecture de tous les fichiers de la clé quel que soit leur propriétaire (clé ext4, droits 600) ; aucune écriture possible |
+| **seccomp** généré (`python3-seccomp`) | interdit `open_by_handle_at`/`name_to_handle_at` (évasion classique liée à `CAP_DAC_READ_SEARCH`), `ptrace`, `mount`, `bpf`, `io_uring`, `keyctl`, `kexec`, `unshare`/`setns`, userns imbriqués… |
+| `no_new_privs`, `--new-session`, env vidé, pas de core dump | pas d'élévation, pas d'injection TIOCSTI |
+| `/tmp` éphémère borné (`SANDBOX_TMPFS_SIZE_MB`) | pas de persistance, pas de saturation du disque hôte |
+| YARA exécuté par `yara_worker.py` | plus aucun parsing de fichier dans le processus du GUI |
+| chemins remontés par les moteurs validés (`_accept_path`) | un moteur compromis ne peut pas faire supprimer un fichier hors de la clé |
+
+**Deux modes** (`SANDBOX_MODE = "auto"` choisit le premier qui passe l'auto-test, réalisé au démarrage) :
+- `idmap` : user namespace « identité » créé par `userns_exec.py` ; les capabilities n'existent que *dans* ce namespace (confinement maximal) ;
+- `root` : sans user namespace, pour les noyaux qui les interdisent ; root réel réduit à `CAP_DAC_READ_SEARCH` + seccomp.
+
+**Échec fermé, et jamais de faux « sain »** : si `bwrap` est absent ou si l'auto-test échoue, l'analyse est refusée (`SANDBOX_REQUIRED = True`). Toute analyse refusée, incomplète (fichier illisible, moteur absent ou en erreur) est affichée « ANALYSE INCOMPLÈTE — support NON validé » ; le message « aucune menace » n'apparaît que si tout s'est déroulé sans erreur. Le bandeau en haut de l'interface affiche l'état du sandbox.
+
+**Avast** (`AVAST_SANDBOX_MODE`) : `strict` (défaut) exécute `scan` entièrement dans le sandbox ; s'il tente de joindre son démon, l'erreur est affichée avec la marche à suivre. `daemon` autorise l'accès au socket du démon : l'analyse est alors faite **par le démon, hors sandbox** (signalé dans le journal).
+
+**Vérifier une installation** : `sudo python3 sandbox_selftest.py` analyse un fichier EICAR (lisible et illisible-par-autres) avec chaque moteur installé, *dans* le sandbox, et échoue si une détection manque.
+
+### Durcissement du montage des supports
+
+Le noyau hôte analyse lui-même la structure du système de fichiers au montage, avant tout sandbox. Pour réduire cette surface (`usb_manager.py`, `config.py`) :
+- **liste blanche** `USB_ALLOWED_FSTYPES` (vfat, exfat, ntfs, ext2/3/4, iso9660, udf) ; tout autre type est refusé, et le type est passé explicitement à `mount -t` (le noyau n'essaie pas d'autres pilotes) ;
+- **`nosuid,nodev,noexec`** sur chaque montage *et remontage* (`USB_MOUNT_HARDEN_OPTS`), y compris pour un montage créé par le système, qui est durci ou démonté ;
+- **`noload`** sur ext3/ext4 en lecture seule : pas de rejeu du journal (aucune écriture sur un support piégé) ;
+- sur l'ISO : pilotes de systèmes de fichiers inutiles **interdits au chargement** (`/etc/modprobe.d/bastion-fs-hardening.conf`) et montage automatique udisks2 par défaut en `ro,nosuid,nodev,noexec`.
+
+### Limites connues
+
+- Les pilotes noyau des systèmes de fichiers autorisés (vfat, exfat, ntfs, ext4, iso9660, udf) restent exposés à un support piégé : la surface est réduite, pas supprimée. Garder le noyau à jour.
+- Une faille du noyau lui-même (appels système autorisés, namespaces) reste hors périmètre.
+- Sans `python3-seccomp`, le sandbox reste actif mais **dégradé** (signalé « limité » dans le bandeau) : les fichiers d'un autre propriétaire en droits 600 ne sont plus lisibles et sont signalés comme *non analysés*.
+- Le filtre seccomp est généré et testé sur x86-64 uniquement.
+- Le comportement d'Avast dans le sandbox dépend du produit installé : utiliser `sandbox_selftest.py`.
 
 ---
 
