@@ -44,7 +44,8 @@ for cmd in lb wget curl python3 unzip rsync xorriso; do
 done
 [[ -d "$CODE_DIR" ]] || err "Répertoire code introuvable : $CODE_DIR"
 for f in config.py log_handler.py admin_auth.py usb_manager.py \
-          db_manager.py scanner.py gui.py main.py pdf_viewer.py utils.py; do
+          db_manager.py scanner.py sandbox.py userns_exec.py yara_worker.py \
+          sandbox_selftest.py gui.py main.py pdf_viewer.py utils.py; do
     [[ -f "$CODE_DIR/$f" ]] || err "Fichier manquant dans $CODE_DIR : $f"
 done
 ok "Pré-requis OK"
@@ -200,6 +201,9 @@ python3-fitz
 # YARA
 yara
 python3-yara
+# Sandbox d'analyse (isolation de chaque moteur – voir code/sandbox.py)
+bubblewrap
+python3-seccomp
 # ClamAV
 clamav
 clamav-daemon
@@ -1481,6 +1485,32 @@ ok "Script post-installation créé"
 # includes.chroot – Fichiers intégrés dans l'image
 # =============================================================================
 step "Copie des fichiers dans le chroot..."
+
+# ── Durcissement noyau/montage pour supports non fiables ─────────────────────
+# Le noyau analyse lui-même la structure d'un système de fichiers au montage :
+# on empêche le chargement des pilotes inutiles (le code applicatif n'autorise
+# de toute façon que vfat/exfat/ntfs/ext2-4/iso9660/udf — voir config.py).
+mkdir -p config/includes.chroot/etc/modprobe.d
+{
+    echo "# Bastion Antiviral – réduction de la surface d'attaque (FS inutiles)"
+    for fs in adfs affs befs bfs btrfs cramfs efs f2fs freevxfs gfs2 hfs hfsplus \
+              hpfs jffs2 jfs minix nilfs2 ocfs2 omfs qnx4 qnx6 reiserfs sysv \
+              ufs vxfs xfs; do
+        echo "install $fs /bin/false"
+        echo "blacklist $fs"
+    done
+} > config/includes.chroot/etc/modprobe.d/bastion-fs-hardening.conf
+
+# Montage automatique éventuel (udisks2/Thunar) : toujours en lecture seule et
+# sans exécution/setuid/périphériques, y compris pendant l'instant précédant la
+# prise en charge par l'application.
+mkdir -p config/includes.chroot/etc/udisks2
+cat > config/includes.chroot/etc/udisks2/mount_options.conf << 'UDISKS'
+[defaults]
+defaults=ro,nosuid,nodev,noexec
+allow=ro,nosuid,nodev,noexec,sync,flush,utf8,shortname,umask,dmask,fmask,uid,gid,showexec,iocharset,codepage
+UDISKS
+ok "Durcissement FS (modprobe + udisks2) → includes.chroot"
 
 # ── Application Python ────────────────────────────────────────────────────────
 APP_CHROOT="config/includes.chroot/opt/usb-antivirus"
