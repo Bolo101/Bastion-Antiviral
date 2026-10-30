@@ -40,6 +40,30 @@ def main() -> None:
         print("Erreur : ClamAV introuvable.", file=sys.stderr)
         sys.exit(1)
 
+    # ── Sandbox d'analyse ────────────────────────────────────────────────────
+    from config import SANDBOX_ENABLED, SANDBOX_REQUIRED
+    from sandbox import Sandbox
+    sandbox_ok = (not SANDBOX_ENABLED) or Sandbox.self_test()
+    log_info(Sandbox.status_summary())
+    if not sandbox_ok and SANDBOX_REQUIRED:
+        reason = Sandbox.unavailable_reason()
+        print(f"Sandbox indisponible : {reason}", file=sys.stderr)
+        try:
+            _root = tk.Tk()
+            _root.withdraw()
+            messagebox.showwarning(
+                "Sandbox indisponible",
+                "L'isolation des analyses ne peut pas démarrer :\n"
+                f"  {reason}\n\n"
+                "Par sécurité, AUCUNE analyse ne sera lancée tant que le "
+                "sandbox n'est pas opérationnel.\n\n"
+                "  sudo apt install bubblewrap python3-seccomp\n"
+                "  sudo python3 sandbox_selftest.py"
+            )
+            _root.destroy()
+        except Exception:
+            pass
+
     # ── Informations YARA ────────────────────────────────────────────────────
     yara_ok, yara_method = eng.detect_yara()
     log_info("Démarrage du scanner antiviral USB")

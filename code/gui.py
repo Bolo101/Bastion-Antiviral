@@ -80,6 +80,8 @@ class VirusScannerGUI:
 
         # ── Suivi des scans parallèles ─────────────────────────────────────────
         self._scan_engines:  Dict[str, ScanEngine] = {}   # dev → engine
+        # Analyses refusées / incomplètes du lot en cours (ne jamais afficher « sain »)
+        self._scan_issues:   List[str] = []
         self._targets_map:   Dict[str, str]         = {}   # dev → mountpoint
         self._scan_lock      = threading.Lock()
         self._active_scans   = 0
@@ -231,7 +233,9 @@ class VirusScannerGUI:
         sbar.pack(fill=tk.X)
         self.clamav_status_var = tk.StringVar(value="ClamAV…")
         self.avast_status_var  = tk.StringVar(value="Avast…")
-        for var in (self.clamav_status_var, self.avast_status_var):
+        self.sandbox_status_var = tk.StringVar(value="Sandbox…")
+        for var in (self.clamav_status_var, self.avast_status_var,
+                    self.sandbox_status_var):
             tk.Label(sbar, textvariable=var,
                      bg="#0a2240", fg=self.GREEN,
                      font=("Courier", 8), padx=8).pack(side=tk.LEFT)
@@ -603,9 +607,16 @@ class VirusScannerGUI:
                 pass
             avast_text = f"✅ Avast · {avast_date}"
 
+        try:
+            from sandbox import Sandbox
+            sandbox_text = Sandbox.short_status()
+        except Exception:
+            sandbox_text = "❌ Sandbox"
+
         def _apply():
             self.clamav_status_var.set(clamav_text)
             self.avast_status_var.set(avast_text)
+            self.sandbox_status_var.set(sandbox_text)
             # Synchronise les vars d'options avec la réalité du système
             if avast_installed and avast_licensed:
                 self.use_avast_var.set(True)
@@ -879,6 +890,7 @@ class VirusScannerGUI:
             self._session_seen_hashes = set()
 
         self.stop_btn.configure(state=tk.NORMAL, bg=self.ACCENT)
+        self._scan_issues = []
         self._anim_state = "scanning"
         self.status_var.set("Analyse en cours…")
         self.scanned_var.set("Analysés : 0")
@@ -971,11 +983,17 @@ class VirusScannerGUI:
         self._total_keys_scanned += 1
 
         if result:
-            tag  = "threat" if result.infected > 0 else "ok"
-            icon = "⚠" if result.infected > 0 else "✅"
+            incomplete = bool(result.errors) and not result.stopped
+            if incomplete:
+                for err in result.errors:
+                    self._scan_issues.append(f"{dev} : {err.splitlines()[0][:160]}")
+            tag  = ("threat" if result.infected > 0
+                    else "warning" if incomplete else "ok")
+            icon = ("⚠" if (result.infected > 0 or incomplete) else "✅")
             self._log(
                 f"{icon} {dev} : {result.scanned} fichier(s), "
-                f"{result.infected} menace(s)  ({result.duration:.1f}s)",
+                f"{result.infected} menace(s)  ({result.duration:.1f}s)"
+                + ("  — ANALYSE INCOMPLÈTE" if incomplete else ""),
                 tag
             )
             # ── Enregistrement des détails de menaces avec hash SHA-256 ───────
@@ -1021,6 +1039,7 @@ class VirusScannerGUI:
             # (écrase la somme brute des moteurs qui peut compter en double)
             self._total_infected = len(self._session_threats)
         else:
+            self._scan_issues.append(f"{dev} : erreur durant le scan")
             self._log(f"❌ {dev} : erreur durant le scan.", "threat")
 
         # Restaurer le tag visuel de la ligne USB
@@ -1077,6 +1096,20 @@ class VirusScannerGUI:
             else:
                 # Proposer la suppression à l'utilisateur
                 self._offer_delete_threats(all_threats)
+        elif self._scan_issues:
+            # Jamais de « support sain » quand l'analyse a été refusée ou est incomplète
+            self._anim_state = "idle"
+            self.status_var.set("⚠  Analyse incomplète — support NON validé")
+            shown = "\n".join(f"  • {i}" for i in self._scan_issues[:6])
+            more  = (f"\n  … et {len(self._scan_issues) - 6} autre(s)"
+                     if len(self._scan_issues) > 6 else "")
+            messagebox.showwarning(
+                "Analyse incomplète",
+                "Aucune menace n'a été trouvée, MAIS l'analyse n'a pas pu être "
+                "menée à bien :\n\n" + shown + more +
+                "\n\nNe considérez pas ce support comme sain.",
+                parent=self.root
+            )
         else:
             self._anim_state = "ok"
             self.status_var.set("✅  Aucune menace détectée")
