@@ -3,13 +3,66 @@
 
 import json
 import os
+import tempfile
 import subprocess
 from typing import Callable, Dict, List, Optional, Tuple
 
-from config import USB_MOUNT_BASE
+from config import USB_ALLOWED_FSTYPES, USB_MOUNT_BASE, USB_MOUNT_HARDEN_OPTS
 from log_handler import log_error, log_info, log_warning
 
 ProgressCB = Optional[Callable[[str], None]]
+
+# Options appliquées à CHAQUE montage et remontage d'un support non fiable :
+# aucun exécutable setuid, aucun fichier périphérique, aucune exécution depuis
+# la clé. Elles se cumulent avec ro/rw.
+_HARDEN_LIST = [o for o in USB_MOUNT_HARDEN_OPTS.split(",") if o]
+
+
+_NOSYMFOLLOW: Optional[bool] = None
+
+
+def _nosymfollow_supported() -> bool:
+    """
+    `nosymfollow` (noyau ≥ 5.10) : le noyau refuse de suivre tout lien symbolique
+    du support. Sans lui, un lien absolu posé sur la clé (`lien -> /etc/shadow`)
+    est suivi par tout code qui tourne en root HORS sandbox. Détecté une fois.
+    """
+    global _NOSYMFOLLOW
+    if _NOSYMFOLLOW is None:
+        d = tempfile.mkdtemp(prefix="bastion_probe_mnt_")
+        try:
+            rc, _, _ = _run(["mount", "-t", "tmpfs", "-o", "nosymfollow", "tmpfs", d],
+                            timeout=10)
+            _NOSYMFOLLOW = (rc == 0)
+            if rc == 0:
+                _run(["umount", d], timeout=10)
+        finally:
+            try:
+                os.rmdir(d)
+            except OSError:
+                pass
+        if not _NOSYMFOLLOW:
+            log_warning("Option de montage nosymfollow non prise en charge : "
+                        "les liens symboliques de la clé restent suivis hors sandbox.")
+    return _NOSYMFOLLOW
+
+
+def _harden_list() -> List[str]:
+    return _HARDEN_LIST + (["nosymfollow"] if _nosymfollow_supported() else [])
+
+
+def _mount_opts(mode: str, fstype: str = "") -> str:
+    """Options de montage durcies. 'noload' : pas de rejeu du journal ext3/4 en RO
+    (le rejeu écrirait sur un support potentiellement piégé et dont on veut
+    préserver l'état pour l'analyse)."""
+    opts = [mode] + _harden_list()
+    if mode == "ro" and fstype in ("ext3", "ext4"):
+        opts.append("noload")
+    return ",".join(opts)
+
+
+def _remount_opts(mode: str) -> str:
+    return ",".join(["remount", mode] + _harden_list())
 
 
 def _run(cmd: List[str], timeout: int = 30) -> Tuple[int, str, str]:
@@ -31,7 +84,8 @@ class UsbPartition:
 
     def __init__(self, device: str, parent: str, label: str,
                  size: str, fstype: str, mountpoint: Optional[str],
-                 managed: bool, uuid: str = "") -> None:
+                 managed: bool, uuid: str = "", serial: str = "",
+                 vendor: str = "", model: str = "", size_bytes: int = 0) -> None:
         self.device     = device
         self.parent     = parent
         self.label      = label
@@ -40,6 +94,11 @@ class UsbPartition:
         self.mountpoint = mountpoint
         self.managed    = managed
         self.uuid       = uuid          # UUID blkid (ex. "1A2B-3C4D" ou UUID ext4)
+        # Identité matérielle (voir validated_supports.py)
+        self.serial     = serial
+        self.vendor     = vendor
+        self.model      = model
+        self.size_bytes = size_bytes
 
     @property
     def display_name(self) -> str:
@@ -56,12 +115,15 @@ class UsbPartition:
 
 # ══════════════════════════════════════════════════════════════════════════════
 class UsbManager:
-    """Détecte, monte (RO/RW) et démonte les périphériques USB."""
+    """Détecte, monte (TOUJOURS en lecture seule) et démonte les périphériques USB.
+
+    Seule exception : mount_validated_rw(), pour l'export depuis l'administration
+    vers un support déjà validé."""
 
     def __init__(self) -> None:
         # {device: mount_point} – montages RO gérés par nous
         self._managed: Dict[str, str] = {}
-        # {device: mount_point} – montages RW temporaires (export)
+        # {device: mount_point} – montages RW d'export (supports validés)
         self._managed_rw: Dict[str, str] = {}
 
     # ── Énumération ───────────────────────────────────────────────────────────
@@ -71,7 +133,7 @@ class UsbManager:
         try:
             rc, out, err = _run(
                 ["lsblk", "-J", "-o",
-                 "NAME,SIZE,TRAN,FSTYPE,MOUNTPOINT,LABEL,TYPE,HOTPLUG"],
+                 "NAME,SIZE,TRAN,FSTYPE,MOUNTPOINT,LABEL,TYPE,HOTPLUG,SERIAL,VENDOR,MODEL"],
                 timeout=10
             )
             if rc != 0:
@@ -88,10 +150,10 @@ class UsbManager:
                 if children:
                     for child in children:
                         if child.get("type") in ("part", "lvm"):
-                            parts.append(self._build(child, parent))
+                            parts.append(self._build(child, parent, disk))
                 else:
                     if disk.get("fstype"):
-                        parts.append(self._build(disk, parent))
+                        parts.append(self._build(disk, parent, disk))
 
         except json.JSONDecodeError as e:
             log_error(f"Parsing lsblk : {e}")
@@ -99,7 +161,16 @@ class UsbManager:
             log_error(f"list_partitions : {e}")
         return parts
 
-    def _build(self, node: Dict, parent: str) -> UsbPartition:
+    @staticmethod
+    def _size_bytes(name: str) -> int:
+        try:
+            with open(f"/sys/class/block/{name}/size") as f:
+                return int(f.read().strip()) * 512
+        except Exception:
+            return 0
+
+    def _build(self, node: Dict, parent: str, disk: Optional[Dict] = None) -> UsbPartition:
+        disk = disk or node
         dev = f"/dev/{node['name']}"
         mp  = node.get("mountpoint") or self._managed.get(dev)
         return UsbPartition(
@@ -110,6 +181,10 @@ class UsbManager:
             mountpoint=mp,
             managed=dev in self._managed,
             uuid=self.get_uuid(dev),
+            serial=(disk.get("serial") or "").strip(),
+            vendor=(disk.get("vendor") or "").strip(),
+            model=(disk.get("model") or "").strip(),
+            size_bytes=self._size_bytes(node["name"]),
         )
 
     # ── UUID ──────────────────────────────────────────────────────────────────
@@ -136,8 +211,21 @@ class UsbManager:
         """
         current_mp = self._current_mountpoint(device)
 
+        allowed, fstype, why = self._fs_policy(device)
+        if not allowed:
+            log_error(why)
+            if current_mp:                     # déjà monté par le système : retirer
+                _run(["umount", current_mp], timeout=20)
+            return False, why
+
         if current_mp:
             if self._is_ro(device, current_mp):
+                if not self._is_hardened(device, current_mp):
+                    rc, _, err = _run(["mount", "-o", _remount_opts("ro"), current_mp],
+                                      timeout=20)
+                    if rc != 0:
+                        log_error(f"Durcissement impossible {device} : {err.strip()}")
+                        return False, f"Impossible de durcir le montage : {err.strip()}"
                 self._managed[device] = current_mp
                 uuid = self.get_uuid(device)
                 log_info(f"USB déjà monté RO : {device}  UUID={uuid or '?'}  → {current_mp}")
@@ -145,7 +233,8 @@ class UsbManager:
             # Remontage en lecture seule
             if progress_cb:
                 progress_cb(f"Remontage de {device} en lecture seule…")
-            rc, _, err = _run(["mount", "-o", "remount,ro", current_mp], timeout=20)
+            rc, _, err = _run(["mount", "-o", _remount_opts("ro"), current_mp],
+                              timeout=20)
             if rc == 0:
                 self._managed[device] = current_mp
                 uuid = self.get_uuid(device)
@@ -165,10 +254,10 @@ class UsbManager:
         if progress_cb:
             progress_cb(f"Montage de {device} → {mp} (lecture seule)…")
 
-        fstype = self._detect_fstype(device)
-        extra  = ["-t", fstype] if fstype in ("vfat", "exfat", "ntfs", "ntfs3") else []
+        extra = self._type_args(fstype)
 
-        rc, out, err = _run(["mount", "-o", "ro"] + extra + [device, mp], timeout=30)
+        rc, out, err = _run(["mount", "-o", _mount_opts("ro", fstype)] + extra
+                            + [device, mp], timeout=30)
         if rc == 0:
             self._managed[device] = mp
             uuid = self.get_uuid(device)
@@ -183,119 +272,89 @@ class UsbManager:
         log_error(f"Montage échoué {device} : {err_clean}")
         return False, f"Échec du montage : {err_clean}"
 
-    # ── Montage RW temporaire (export de logs) ────────────────────────────────
+    # ── Montage en écriture : UNIQUEMENT un support validé (export admin) ─────
+    #
+    # Aucun support analysé n'est jamais monté en écriture. La seule exception
+    # est l'export de rapports/journaux depuis le panneau d'administration, vers
+    # un support dont une analyse antérieure a conclu qu'il était sain
+    # (validated_supports.py). L'identité est relue ICI, sur le périphérique
+    # réel, et non reprise d'un objet fourni par l'appelant.
 
-    def mount_for_export(self, device: str,
-                         progress_cb: ProgressCB = None) -> Tuple[bool, str, Optional[str], str]:
+    def partition_for(self, device: str) -> Optional[UsbPartition]:
+        return next((p for p in self.list_partitions() if p.device == device), None)
+
+    def mount_validated_rw(self, device: str) -> Tuple[bool, str, Optional[str]]:
+        return self.mount_validated(device, rw=True)
+
+    def mount_validated(self, device: str, rw: bool = True
+                        ) -> Tuple[bool, str, Optional[str]]:
         """
-        Monte le périphérique en lecture/écriture pour permettre l'export de logs.
-
-        Cas possibles :
-          • Non monté            → nouveau montage RW à /mnt/avscan_export_<dev>
-          • Déjà monté RW        → utilise le point de montage existant (pas de démontage)
-          • Déjà monté RO par nous → remonte en RW temporairement
-
-        Retourne (ok, message, mountpoint, action)
-        où action ∈ {"mounted_rw", "remounted_rw", "existing_rw", "error"}
+        Monte `device` s'il est VALIDÉ : en lecture seule (vérification du secret
+        d'appairage) ou en lecture/écriture (+ sync) pour l'export. Toujours avec
+        nosuid,nodev,noexec,nosymfollow. Retourne (ok, message, point_de_montage).
         """
-        current_mp = self._current_mountpoint(device)
+        from validated_supports import identity_of, lookup
 
-        # ── Cas 1 : déjà monté RW ─────────────────────────────────────────────
-        if current_mp and not self._is_ro(device, current_mp):
-            uuid = self.get_uuid(device)
-            log_info(f"USB utilisé pour export (déjà RW) : {device}  UUID={uuid or '?'}  → {current_mp}")
-            return True, f"Utilisation du montage existant : {current_mp}", current_mp, "existing_rw"
+        part = self.partition_for(device)
+        if part is None:
+            return False, f"{device} : support introuvable (retiré ?).", None
+        record, why = lookup(identity_of(part))
+        if record is None:
+            log_warning(f"Montage RW refusé pour {device} : {why}")
+            return False, f"Montage en écriture refusé : {why}.", None
 
-        # ── Cas 2 : déjà monté RO → remontage RW ─────────────────────────────
-        if current_mp and self._is_ro(device, current_mp):
-            if progress_cb:
-                progress_cb(f"Remontage RW temporaire de {device}…")
-            rc, _, err = _run(["mount", "-o", "remount,rw", current_mp], timeout=20)
-            if rc == 0:
-                uuid = self.get_uuid(device)
-                log_info(f"USB remonté RW (export) : {device}  UUID={uuid or '?'}  → {current_mp}")
-                return True, f"{device} remonté RW pour export.", current_mp, "remounted_rw"
+        allowed, fstype, why = self._fs_policy(device)
+        if not allowed:
+            log_error(why)
+            return False, why, None
 
-            # Fallback : certains FS (FAT32, exFAT) refusent remount,rw.
-            # On démonte proprement puis on remonte en RW sur le même point.
-            log_warning(f"remount,rw échoué pour {device} ({err.strip()}) — tentative umount+mount RW")
-            if progress_cb:
-                progress_cb(f"Fallback : démontage puis remontage RW de {device}…")
-            _run(["umount", current_mp], timeout=20)
+        # Repartir d'un état propre : un montage existant (RO par nous, ou
+        # automatique) est retiré avant de remonter avec NOS options.
+        cur = self._current_mountpoint(device)
+        if cur:
+            rc, _, err = _run(["umount", cur], timeout=20)
+            if rc != 0:
+                return False, f"Impossible de démonter {cur} : {err.strip()}", None
             self._managed.pop(device, None)
 
-            fstype = self._detect_fstype(device)
-            extra  = ["-t", fstype] if fstype in ("vfat", "exfat", "ntfs", "ntfs3") else []
-            rc2, _, err2 = _run(["mount", "-o", "rw"] + extra + [device, current_mp], timeout=30)
-            if rc2 == 0:
-                uuid = self.get_uuid(device)
-                log_info(f"USB remonté RW (fallback export) : {device}  UUID={uuid or '?'}  → {current_mp}")
-                return True, f"{device} remonté RW (fallback) pour export.", current_mp, "remounted_rw"
-
-            log_error(f"Remontage RW fallback échoué pour {device} : {err2.strip()}")
-            return False, f"Impossible de remonter en RW : {err2.strip()}", None, "error"
-
-        # ── Cas 3 : non monté → montage RW ───────────────────────────────────
         dev_name = device.replace("/dev/", "").replace("/", "_")
         mp = os.path.join(USB_MOUNT_BASE, f"export_{dev_name}")
-        try:
-            os.makedirs(mp, exist_ok=True)
-        except OSError as e:
-            return False, f"Impossible de créer le point de montage : {e}", None, "error"
+        os.makedirs(mp, exist_ok=True)
 
-        if progress_cb:
-            progress_cb(f"Montage RW de {device} → {mp}…")
-
-        fstype = self._detect_fstype(device)
-        extra  = ["-t", fstype] if fstype in ("vfat", "exfat", "ntfs", "ntfs3") else []
-
-        rc, out, err = _run(["mount", "-o", "rw"] + extra + [device, mp], timeout=30)
+        opts = (_mount_opts("rw", fstype) + ",sync") if rw else _mount_opts("ro", fstype)
+        rc, out, err = _run(["mount", "-o", opts] + self._type_args(fstype)
+                            + [device, mp], timeout=30)
         if rc == 0:
             self._managed_rw[device] = mp
-            uuid = self.get_uuid(device)
-            log_info(f"USB monté RW (export) : {device}  UUID={uuid or '?'}  → {mp}")
-            return True, f"{device} monté RW pour export.", mp, "mounted_rw"
-
+            log_info(f"Support validé monté {'RW' if rw else 'RO'} : {device} → {mp} "
+                     f"(validé le {record.get('validated_at', '?')})")
+            return (True, f"{device} monté "
+                          f"{'en écriture' if rw else 'en lecture seule'} (support validé).",
+                    mp)
         try:
             os.rmdir(mp)
         except OSError:
             pass
         err_clean = err.strip() or out.strip()
         log_error(f"Montage RW échoué {device} : {err_clean}")
-        return False, f"Échec du montage RW : {err_clean}", None, "error"
+        return False, f"Échec du montage RW : {err_clean}", None
 
-    def mount_rw(self, device: str,
-                 progress_cb: ProgressCB = None) -> Tuple[bool, str, Optional[str], str]:
-        """
-        Monte le périphérique en lecture/écriture pour un scan avec suppression.
-
-        Identique à mount_for_export mais utilisé avant le scan (pas l'export).
-        Retourne (ok, message, mountpoint, action) — mêmes valeurs qu'mount_for_export.
-        """
-        return self.mount_for_export(device, progress_cb=progress_cb)
-
-    def restore_after_export(self, device: str, action: str) -> None:
-        """
-        Restaure l'état du montage après un export de logs.
-        - "mounted_rw"   → démonte le point de montage temporaire
-        - "remounted_rw" → remet en lecture seule
-        - "existing_rw"  → ne fait rien
-        """
-        if action == "mounted_rw":
-            mp = self._managed_rw.pop(device, None)
-            if mp:
-                _run(["umount", mp], timeout=20)
-                try:
-                    os.rmdir(mp)
-                except OSError:
-                    pass
-                log_info(f"Démontage export RW : {device}")
-        elif action == "remounted_rw":
-            mp = self._managed.get(device) or self._current_mountpoint(device)
-            if mp:
-                _run(["mount", "-o", "remount,ro", mp], timeout=20)
-                log_info(f"Remontage RO après export : {device} → {mp}")
-        # "existing_rw" ou "error" : rien à faire
+    def umount_validated(self, device: str) -> Tuple[bool, str]:
+        """Synchronise puis démonte un support monté par mount_validated_rw."""
+        mp = self._managed_rw.get(device)
+        if not mp:
+            return False, f"{device} n'est pas monté en écriture par l'application."
+        _run(["sync"], timeout=60)
+        rc, _, err = _run(["umount", mp], timeout=30)
+        if rc != 0:
+            return False, f"Impossible de démonter {device} : {err.strip()}"
+        self._managed_rw.pop(device, None)
+        try:
+            os.rmdir(mp)
+        except OSError:
+            pass
+        log_info(f"Support d'export démonté : {device}")
+        return True, f"{device} démonté : vous pouvez le retirer."
 
     # ── Démontage ─────────────────────────────────────────────────────────────
 
@@ -329,7 +388,7 @@ class UsbManager:
         for dev in list(self._managed):
             self.umount(dev)
         for dev in list(self._managed_rw):
-            self.restore_after_export(dev, "mounted_rw")
+            self.umount_validated(dev)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -363,6 +422,40 @@ class UsbManager:
                     parts = line.split()
                     if len(parts) >= 4 and parts[0] == device and parts[1] == mountpoint:
                         return "ro" in parts[3].split(",")
+        except Exception:
+            pass
+        return False
+
+    def _fs_policy(self, device: str) -> Tuple[bool, str, str]:
+        """
+        Liste blanche des systèmes de fichiers. Le noyau hôte analyse lui-même
+        la structure du support au montage ; chaque pilote supplémentaire est
+        une surface d'attaque, et le sandbox ne la couvre pas.
+        Retourne (autorisé, type, message).
+        """
+        fstype = self._detect_fstype(device)
+        if not fstype:
+            return False, "", (f"{device} : système de fichiers non reconnu — "
+                               "montage refusé.")
+        if fstype not in USB_ALLOWED_FSTYPES:
+            return False, fstype, (
+                f"{device} : système de fichiers « {fstype} » non pris en charge "
+                f"(autorisés : {', '.join(USB_ALLOWED_FSTYPES)}) — montage refusé.")
+        return True, fstype, ""
+
+    @staticmethod
+    def _type_args(fstype: str) -> List[str]:
+        """Type explicite : empêche le noyau d'essayer d'autres pilotes."""
+        return ["-t", fstype] if fstype in USB_ALLOWED_FSTYPES else []
+
+    def _is_hardened(self, device: str, mountpoint: str) -> bool:
+        try:
+            with open("/proc/mounts") as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) >= 4 and parts[0] == device and parts[1] == mountpoint:
+                        have = set(parts[3].split(","))
+                        return set(_harden_list()) <= have
         except Exception:
             pass
         return False

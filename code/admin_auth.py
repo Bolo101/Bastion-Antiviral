@@ -2,8 +2,9 @@
 """admin_auth.py – Authentification et panneau d'administration.
 
 Onglets du panneau :
-  🔧 Moteurs      – sélection ClamAV / Avast / YARA, mode scan, suppression
+  🔧 Moteurs      – sélection ClamAV / Avast / YARA, mode scan
   📡 Supports     – affichage exhaustif de tous les supports USB
+  📑 Rapports     – rapports des supports compromis (Evince), export vers un support validé
   🛡 ClamAV       – mise à jour base (en ligne / USB) + signatures tierces
   🔐 Avast        – installation, licence, base VPS
   🔍 YARA         – règles signature-base (GitHub / USB)
@@ -18,7 +19,7 @@ import os
 import subprocess
 import tkinter as tk
 from tkinter import ttk, messagebox
-from typing import Callable, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 
 from config import (
     ADMIN_CFG_DIR,
@@ -199,7 +200,6 @@ class AdminPanel:
         use_avast_var:  tk.BooleanVar,
         use_yara_var:   tk.BooleanVar,
         scan_mode_var:  tk.StringVar,
-        remove_var:     tk.BooleanVar,
         # ClamAV
         on_update_clamav_online:      Callable,
         on_import_clamav_usb:         Callable,
@@ -226,6 +226,7 @@ class AdminPanel:
         # Supports exhaustifs
         get_usb_partitions: Callable,
         refresh_usb:        Callable,
+        usb_manager:        Any,
         # PDFs
         pdf_dir:             str,
         on_pdf_reload_viewer: Callable,
@@ -240,7 +241,7 @@ class AdminPanel:
         self._use_avast  = use_avast_var
         self._use_yara   = use_yara_var
         self._scan_mode  = scan_mode_var
-        self._remove     = remove_var
+        self._usb        = usb_manager      # UsbManager (montages durcis, export validé)
 
         self._cb = {
             "clamav_online":      on_update_clamav_online,
@@ -323,6 +324,7 @@ class AdminPanel:
 
         self._tab_engines(nb)
         self._tab_usb_detail(nb, dlg)
+        self._tab_reports(nb, dlg)
         self._tab_clamav(nb)
         self._tab_avast(nb)
         self._tab_yara(nb)
@@ -376,21 +378,15 @@ class AdminPanel:
                         variable=self._scan_mode,
                         value="deep").pack(side=tk.LEFT, padx=8)
 
-        # ── Suppression automatique ────────────────────────────────────────────
-        del_frm = ttk.LabelFrame(tab, text="Gestion des fichiers infectés", padding=10)
+        # ── Fichiers infectés : jamais modifiés ────────────────────────────────
+        del_frm = ttk.LabelFrame(tab, text="Fichiers infectés", padding=10)
         del_frm.pack(fill=tk.X)
-
         ttk.Label(
-            del_frm,
-            text="⚠  DANGER — Activez uniquement si vous voulez que les fichiers\n"
-                 "    infectés soient supprimés DÉFINITIVEMENT et automatiquement.",
-            foreground="#ff6b6b"
-        ).pack(anchor=tk.W, pady=(0, 6))
-
-        ttk.Checkbutton(
-            del_frm,
-            text="Supprimer automatiquement les fichiers infectés",
-            variable=self._remove
+            del_frm, justify=tk.LEFT, wraplength=620,
+            text="Les supports sont analysés en LECTURE SEULE : les fichiers infectés ne "
+                 "sont jamais supprimés ni modifiés, et rien n'est écrit sur le support.\n"
+                 "Pour un support compromis, un rapport est conservé sur la borne "
+                 "(onglet « Rapports »)."
         ).pack(anchor=tk.W)
 
         # ── Statut courant ────────────────────────────────────────────────────
@@ -405,11 +401,10 @@ class AdminPanel:
                 "YARA"   if self._use_yara.get()   else None,
             ])) or "Aucun moteur sélectionné !"
             mode  = "Rapide" if self._scan_mode.get() == "quick" else "Complet"
-            suppr = "Oui ⚠" if self._remove.get() else "Non"
             summary_var.set(
                 f"Moteurs : {engines}\n"
                 f"Mode    : {mode}\n"
-                f"Suppression auto : {suppr}"
+                "Supports : lecture seule (jamais modifiés)"
             )
 
         summary_var = tk.StringVar()
@@ -421,7 +416,7 @@ class AdminPanel:
 
         # Met à jour le résumé si une case change
         for var in (self._use_clamav, self._use_avast, self._use_yara,
-                    self._scan_mode, self._remove):
+                    self._scan_mode):
             var.trace_add("write", lambda *_: _refresh_summary())
 
     # ── Onglet Supports (affichage exhaustif) ─────────────────────────────────
@@ -699,9 +694,7 @@ class AdminPanel:
         dev = tree.item(sel[0], "values")[0].strip()
         if dev in ("—", "") or not dev.startswith("/dev/"):
             return
-        from usb_manager import UsbManager
-        usb = UsbManager()
-        ok, msg = usb.mount(dev)
+        ok, msg = self._usb.mount(dev)
         if ok:
             messagebox.showinfo("Montage", msg)
         else:
@@ -714,14 +707,319 @@ class AdminPanel:
         dev = tree.item(sel[0], "values")[0].strip()
         if dev in ("—", "") or not dev.startswith("/dev/"):
             return
-        from usb_manager import UsbManager
-        usb = UsbManager()
-        ok, msg = usb.umount(dev)
+        ok, msg = self._usb.umount(dev)
         if ok:
             messagebox.showinfo("Démontage", msg)
         else:
             messagebox.showerror("Démontage", msg)
             
+    # ── Onglet Rapports (supports compromis) ──────────────────────────────────
+
+    def _tab_reports(self, nb: ttk.Notebook, dlg: tk.Toplevel) -> None:
+        """
+        Rapports des supports compromis (conservés sur la borne uniquement),
+        visualisation avec Evince, et export vers un support externe VALIDÉ.
+        """
+        import threading
+        from config import EXPORT_REPORTS_SUBDIR, REPORTS_DIR
+        from export_manager import export_to_validated_support
+        from reports import (close_viewers, delete_report, list_reports,
+                             mark_exported, open_in_viewer, purge_reports,
+                             storage_status)
+        from validated_supports import forget, identity_of, list_records, lookup
+
+        tab = ttk.Frame(nb, padding=10)
+        nb.add(tab, text="📑 Rapports")
+
+        ttk.Label(tab, text="Rapports des supports compromis",
+                  font=("Arial", 11, "bold")).pack(anchor=tk.W)
+        ttk.Label(
+            tab, foreground="#aaaaaa", justify=tk.LEFT, wraplength=700,
+            text="Un rapport n'est créé que lorsqu'une menace est détectée (jamais pour un "
+                 "support sain). Il est conservé dans un répertoire de la borne uniquement : "
+                 "vous pouvez l'exporter, le supprimer, ou purger tout le répertoire."
+        ).pack(anchor=tk.W, pady=(0, 2))
+        storage_var = tk.StringVar()
+        storage_lbl = ttk.Label(tab, textvariable=storage_var, wraplength=700,
+                                justify=tk.LEFT)
+        storage_lbl.pack(anchor=tk.W, pady=(0, 6))
+
+        def _refresh_storage() -> None:
+            persistent, detail = storage_status()
+            if persistent:
+                storage_var.set(f"💾 Stockage permanent ({detail}) : les rapports survivent "
+                                "au redémarrage.")
+                storage_lbl.configure(foreground="#7ed957")
+            else:
+                storage_var.set(f"⚠ Stockage NON permanent ({detail}) : mode live, les rapports "
+                                "seront perdus à l'extinction. Installez la borne sur disque "
+                                "pour une conservation permanente.")
+                storage_lbl.configure(foreground="#ffb347")
+
+        # ── Liste ────────────────────────────────────────────────────────────
+        lf = ttk.LabelFrame(tab, text="Rapports présents", padding=6)
+        lf.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
+        tree = ttk.Treeview(lf, columns=("when", "label", "threats", "size", "exp"),
+                            show="headings", height=6, selectmode="extended")
+        for col, txt, w in (("when", "Date", 150), ("label", "Support", 200),
+                            ("threats", "Menaces", 70), ("size", "Taille", 70),
+                            ("exp", "Exporté", 80)):
+            tree.heading(col, text=txt)
+            tree.column(col, width=w, anchor=tk.W if col in ("when", "label") else tk.CENTER)
+        vsb = ttk.Scrollbar(lf, orient=tk.VERTICAL, command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        status_var = tk.StringVar()
+        ttk.Label(tab, textvariable=status_var, foreground="#7ec8e3",
+                  wraplength=700, justify=tk.LEFT).pack(anchor=tk.W, pady=2)
+
+        def _refresh() -> None:
+            for row in tree.get_children():
+                tree.delete(row)
+            reps = list_reports()
+            for r in reps:
+                sz = f"{r.size // 1024} Ko" if r.size >= 1024 else f"{r.size} o"
+                tree.insert("", tk.END, iid=r.path, values=(
+                    r.when, r.label, r.threats, sz, "✅" if r.exported else "—"))
+            pending = sum(1 for r in reps if not r.exported)
+            status_var.set(f"{len(reps)} rapport(s) dans le répertoire"
+                           + (f" — {pending} pas encore exporté(s)." if pending else "."))
+            _refresh_storage()
+
+        def _selected_paths() -> List[str]:
+            return list(tree.selection())
+
+        # ── Ouverture avec Evince (sans droits root) ─────────────────────────
+        def _open_selected() -> None:
+            sel = _selected_paths()
+            if not sel:
+                messagebox.showwarning("Aucune sélection",
+                                       "Sélectionnez un rapport.", parent=dlg)
+                return
+            # Le panneau est plein écran : le laisser passer derrière la visionneuse
+            was_fs = bool(dlg.attributes("-fullscreen"))
+            if was_fs:
+                dlg.attributes("-fullscreen", False)
+            _ov: list = [None]
+
+            def _restore() -> None:
+                def _r() -> None:
+                    try:
+                        if _ov[0] is not None and _ov[0].winfo_exists():
+                            _ov[0].destroy()
+                        if dlg.winfo_exists() and was_fs:
+                            dlg.attributes("-fullscreen", True)
+                    except tk.TclError:
+                        pass
+                dlg.after(0, _r)
+
+            ok, msg = open_in_viewer(sel[0], on_exit=_restore)
+            status_var.set(("✅ " if ok else "❌ ") + msg)
+            if not ok:
+                _restore()
+                messagebox.showerror("Visionneuse", msg, parent=dlg)
+                return
+
+            # Evince s'affiche en plein écran SANS bouton de fermeture (config
+            # kiosque) et masquerait un bouton du panneau : bouton flottant,
+            # sans décoration, toujours au premier plan (utilisable à la souris).
+            ov = tk.Toplevel(dlg)
+            _ov[0] = ov
+            ov.overrideredirect(True)
+            ov.attributes("-topmost", True)
+            tk.Button(ov, text="✖  Fermer le rapport", command=close_viewers,
+                      bg="#8b0000", fg="white", activebackground="#b00000",
+                      activeforeground="white", relief=tk.FLAT,
+                      font=("Arial", 12, "bold"), padx=16, pady=10,
+                      cursor="hand2").pack()
+            ov.update_idletasks()
+            w, h = ov.winfo_reqwidth(), ov.winfo_reqheight()
+            ov.geometry(f"{w}x{h}+{ov.winfo_screenwidth() - w - 16}+{ov.winfo_screenheight() - h - 16}")
+
+            def _keep_top() -> None:
+                try:
+                    if ov.winfo_exists():
+                        ov.lift()
+                        ov.after(700, _keep_top)
+                except tk.TclError:
+                    pass
+            _keep_top()
+
+        def _delete_selected() -> None:
+            sel = _selected_paths()
+            if not sel:
+                messagebox.showwarning("Aucune sélection",
+                                       "Sélectionnez au moins un rapport.", parent=dlg)
+                return
+            if not messagebox.askyesno(
+                    "Confirmer", f"Supprimer définitivement {len(sel)} rapport(s) ?",
+                    icon="warning", parent=dlg):
+                return
+            errs = [m for ok, m in (delete_report(p) for p in sel) if not ok]
+            _refresh()
+            if errs:
+                messagebox.showerror("Erreurs", "\n".join(errs[:5]), parent=dlg)
+
+        dlg.bind("<Destroy>",
+                 lambda e: close_viewers() if e.widget is dlg else None, add="+")
+
+        def _purge() -> None:
+            reps = list_reports()
+            if not reps:
+                messagebox.showinfo("Purge", "Le répertoire des rapports est déjà vide.",
+                                    parent=dlg)
+                return
+            pending = sum(1 for r in reps if not r.exported)
+            msg = (f"Supprimer DÉFINITIVEMENT les {len(reps)} rapport(s) du répertoire ?")
+            if pending:
+                msg += (f"\n\n⚠ {pending} d'entre eux n'ont pas encore été exportés : "
+                        "ils seront perdus.")
+            if not messagebox.askyesno("Purger le répertoire", msg, icon="warning",
+                                       default="no", parent=dlg):
+                return
+            close_viewers()
+            n, errs = purge_reports()
+            _refresh()
+            if errs:
+                messagebox.showerror("Purge incomplète",
+                                     f"{n} supprimé(s). Erreurs :\n" + "\n".join(errs[:5]),
+                                     parent=dlg)
+            else:
+                status_var.set(f"🧹 Répertoire purgé : {n} rapport(s) supprimé(s).")
+
+        bf = ttk.Frame(tab)
+        bf.pack(fill=tk.X, pady=(0, 8))
+        ttk.Button(bf, text="👁  Ouvrir avec Evince", command=_open_selected,
+                   width=24).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(bf, text="🗑  Supprimer", command=_delete_selected,
+                   width=14).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(bf, text="🧹  Purger le répertoire", command=_purge,
+                   width=24).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(bf, text="↺  Actualiser", command=_refresh,
+                   width=12).pack(side=tk.LEFT)
+
+        # ── Export vers un support VALIDÉ ────────────────────────────────────
+        ef = ttk.LabelFrame(tab, text="Exporter vers un support externe validé", padding=8)
+        ef.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(
+            ef, foreground="#aaaaaa", justify=tk.LEFT, wraplength=680,
+            text="Seul un support déjà analysé et reconnu SAIN peut recevoir l'export. Il "
+                 "est monté en écriture le temps de la copie, sans nouvelle analyse, puis "
+                 f"démonté. Dossier créé : « {EXPORT_REPORTS_SUBDIR} »."
+        ).pack(anchor=tk.W, pady=(0, 4))
+
+        row = ttk.Frame(ef)
+        row.pack(fill=tk.X)
+        ttk.Label(row, text="Support :", width=10).pack(side=tk.LEFT)
+        dest_var = tk.StringVar()
+        combo = ttk.Combobox(row, textvariable=dest_var, state="readonly", width=64)
+        combo.pack(side=tk.LEFT, padx=4)
+        _parts: list = []
+
+        def _refresh_dest() -> None:
+            _parts.clear()
+            labels = []
+            for p in self._usb.list_partitions():
+                rec, _why = lookup(identity_of(p))
+                mark = (f"✅ validé le {rec['validated_at'][:10]}" if rec
+                        else "⛔ non validé — export impossible")
+                _parts.append(p)
+                labels.append(f"{p.device}  [{p.label or '—'}]  {p.size}  {mark}")
+            combo["values"] = labels
+            if labels:
+                combo.current(0)
+            else:
+                dest_var.set("— aucun support connecté —")
+
+        ttk.Button(row, text="↺", width=3, command=_refresh_dest).pack(side=tk.LEFT)
+
+        def _export() -> None:
+            idx = combo.current()
+            if idx < 0 or idx >= len(_parts):
+                messagebox.showwarning("Support", "Choisissez un support.", parent=dlg)
+                return
+            part = _parts[idx]
+            rec, why = lookup(identity_of(part))
+            if rec is None:
+                messagebox.showerror("Support non validé", why[0].upper() + why[1:] + ".",
+                                     parent=dlg)
+                return
+            sel = _selected_paths() or [r.path for r in list_reports()]
+            if not sel:
+                messagebox.showinfo("Export", "Aucun rapport à exporter.", parent=dlg)
+                return
+            if not messagebox.askyesno(
+                    "Export des rapports",
+                    f"Exporter {len(sel)} rapport(s) vers {part.device} "
+                    f"[{part.label or '—'}] ?\n\nLe support (validé le "
+                    f"{rec['validated_at'][:10]}) sera monté en écriture puis démonté.",
+                    parent=dlg):
+                return
+            files = [(p, os.path.basename(p)) for p in sel]
+            status_var.set(f"⏳ Export vers {part.device}…")
+
+            def _worker() -> None:
+                res = export_to_validated_support(
+                    self._usb, part.device, files, EXPORT_REPORTS_SUBDIR, [REPORTS_DIR])
+                if res.ok:
+                    mark_exported([p for p, _n in files])
+                def _done() -> None:
+                    _refresh()
+                    status_var.set(("✅ " if res.ok else "❌ ") + res.message)
+                    (messagebox.showinfo if res.ok else messagebox.showerror)(
+                        "Export des rapports", res.message, parent=dlg)
+                    _refresh_dest()
+                dlg.after(0, _done)
+
+            threading.Thread(target=_worker, daemon=True).start()
+
+        ttk.Button(ef, text="📤  Exporter la sélection (ou tous les rapports)",
+                   command=_export).pack(anchor=tk.W, pady=(6, 0))
+
+        # ── Supports validés connus ──────────────────────────────────────────
+        vf = ttk.LabelFrame(tab, text="Supports validés connus", padding=6)
+        vf.pack(fill=tk.X)
+        vtree = ttk.Treeview(vf, columns=("label", "uuid", "serial", "date"),
+                             show="headings", height=3, selectmode="browse")
+        for col, txt, w in (("label", "Étiquette", 150), ("uuid", "UUID", 160),
+                            ("serial", "N° de série", 160), ("date", "Validé le", 150)):
+            vtree.heading(col, text=txt)
+            vtree.column(col, width=w, anchor=tk.W)
+        vtree.pack(fill=tk.X)
+        _records: list = []
+
+        def _refresh_valid() -> None:
+            for row_ in vtree.get_children():
+                vtree.delete(row_)
+            _records[:] = list_records()
+            for i, r in enumerate(_records):
+                idn = r.get("identity", {})
+                vtree.insert("", tk.END, iid=str(i), values=(
+                    idn.get("label", ""), idn.get("uuid", ""),
+                    idn.get("serial", "") or "—", r.get("validated_at", "")))
+
+        def _forget() -> None:
+            sel = vtree.selection()
+            if not sel:
+                return
+            idn = _records[int(sel[0])].get("identity", {})
+            if messagebox.askyesno(
+                    "Oublier ce support",
+                    "Il ne pourra plus recevoir d'export tant qu'il n'aura pas été "
+                    "ré-analysé.\n\nContinuer ?", parent=dlg):
+                forget(idn)
+                _refresh_valid()
+                _refresh_dest()
+
+        ttk.Button(vf, text="✖  Oublier le support sélectionné",
+                   command=_forget).pack(anchor=tk.W, pady=(4, 0))
+
+        _refresh()
+        _refresh_dest()
+        _refresh_valid()
+
     # ── Onglet ClamAV ──────────────────────────────────────────────────────────
 
     def _tab_clamav(self, nb: ttk.Notebook) -> None:
@@ -1487,6 +1785,7 @@ class AdminPanel:
         usb_combo.pack(side=tk.LEFT, padx=4)
 
         _mp_holder: list = [None]   # point de montage actif
+        _dev_holder: list = [None]  # périphérique correspondant
         usb_status_var = tk.StringVar()
 
         def _refresh_usb_combo():
@@ -1510,49 +1809,28 @@ class AdminPanel:
                 usb_status_var.set("⚠ Sélectionnez une clé USB valide.")
                 return
             part = parts[idx]
-            # Déjà monté ?
-            existing_mp = None
-            try:
-                with open("/proc/mounts") as f:
-                    for line in f:
-                        tok = line.split()
-                        if len(tok) >= 2 and tok[0] == part.device:
-                            existing_mp = tok[1]
-                            break
-            except Exception:
-                pass
-            if existing_mp:
-                _mp_holder[0] = existing_mp
-                usb_status_var.set(f"✅ Déjà monté → {existing_mp}")
-                _populate_usb_tree()
+            ok, msg = self._usb.mount(part.device)     # RO durci : liste blanche FS
+            if not ok:
+                usb_status_var.set(f"❌ {msg[:100]}")
                 return
-            try:
-                mp = f"/mnt/pdf_import_{part.device.replace('/', '_')}"
-                os.makedirs(mp, exist_ok=True)
-                r = subprocess.run(["mount", "-o", "ro", part.device, mp],
-                                   capture_output=True, text=True)
-                if r.returncode != 0:
-                    usb_status_var.set(f"❌ mount : {r.stderr.strip()[:80]}")
-                    return
-                _mp_holder[0] = mp
-                usb_status_var.set(f"✅ Monté en lecture seule → {mp}")
-                _populate_usb_tree()
-            except Exception as e:
-                usb_status_var.set(f"❌ {e}")
+            mp = self._usb.get_mountpoint(part.device)
+            _mp_holder[0], _dev_holder[0] = mp, part.device
+            usb_status_var.set(f"✅ Monté en lecture seule → {mp}")
+            _populate_usb_tree()
 
         def _umount_usb_pdf():
-            mp = _mp_holder[0]
-            if not mp:
+            dev = _dev_holder[0]
+            if not dev:
                 usb_status_var.set("⚠ Aucun montage actif.")
                 return
-            r = subprocess.run(["umount", mp], capture_output=True, text=True)
-            if r.returncode == 0:
-                _mp_holder[0] = None
+            ok, msg = self._usb.umount(dev)
+            if ok:
+                _mp_holder[0] = _dev_holder[0] = None
                 for row in usb_tree.get_children():
                     usb_tree.delete(row)
                 usb_status_var.set("✅ Clé démontée.")
             else:
-                usb_status_var.set(f"❌ umount : {r.stderr.strip()[:80]}")
+                usb_status_var.set(f"❌ {msg[:100]}")
 
         mount_row = ttk.Frame(usb_frame); mount_row.pack(fill=tk.X, pady=(0, 4))
         ttk.Button(mount_row, text="▲  Monter la clé",
@@ -2079,6 +2357,20 @@ class AdminPanel:
 
     # ── Onglet Arrêt ──────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _lost_reports_text() -> str:
+        """Avertissement UNIQUEMENT si le stockage n'est pas permanent (mode live)."""
+        try:
+            from reports import storage_status, unexported_reports
+            if storage_status()[0]:
+                return ""
+            n = len(unexported_reports())
+        except Exception:                                 # noqa: BLE001
+            return ""
+        return (f"\n\n⚠ Stockage non permanent : {n} rapport(s) de support compromis "
+                "pas encore exporté(s) seront PERDUS "
+                "(Administration → Rapports → Exporter)." if n else "")
+
     def _tab_poweroff(self, nb: ttk.Notebook, dlg: tk.Toplevel) -> None:
         tab = ttk.Frame(nb, padding=16)
         nb.add(tab, text="⏻ Arrêt")
@@ -2102,7 +2394,7 @@ class AdminPanel:
         def _do_poweroff():
             if messagebox.askyesno(
                 "⏻ Confirmer l'arrêt",
-                "Voulez-vous vraiment éteindre la station ?",
+                "Voulez-vous vraiment éteindre la station ?" + self._lost_reports_text(),
                 icon="warning", parent=dlg
             ):
                 dlg.destroy()
@@ -2126,7 +2418,7 @@ class AdminPanel:
         def _do_reboot():
             if messagebox.askyesno(
                 "🔄 Confirmer le redémarrage",
-                "Voulez-vous vraiment redémarrer la station ?",
+                "Voulez-vous vraiment redémarrer la station ?" + self._lost_reports_text(),
                 icon="warning", parent=dlg
             ):
                 dlg.destroy()

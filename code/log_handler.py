@@ -7,7 +7,7 @@ import shutil
 import sys
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 from config import LOG_FILE
 
@@ -153,65 +153,120 @@ def generate_session_pdf(session_logs: List[str]) -> str:
     return path
 
 
-def _write_pdf(path: str, title: str, lines: List[str], *info: str) -> None:
-    content  = _build_stream(title, lines, *info)
-    cb       = content.encode("latin-1", errors="replace")
-    with open(path, "wb") as f:
-        f.write(b"%PDF-1.4\n")
-        pos: dict = {}
-
-        def obj(n: int, raw: bytes) -> None:
-            pos[n] = f.tell()
-            f.write(raw)
-
-        obj(1, b"1 0 obj\n<</Type /Catalog /Pages 2 0 R>>\nendobj\n")
-        obj(2, b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n")
-        obj(3, (
-            b"3 0 obj\n<</Type /Page /Parent 2 0 R "
-            b"/MediaBox [0 0 612 792] /Contents 4 0 R "
-            b"/Resources <</Font <</F1 5 0 R>>>>>>\nendobj\n"
-        ))
-        obj(4, (
-            f"4 0 obj\n<</Length {len(cb)}>>\nstream\n".encode()
-            + cb + b"\nendstream\nendobj\n"
-        ))
-        obj(5, b"5 0 obj\n<</Type /Font /Subtype /Type1 /BaseFont /Courier>>\nendobj\n")
-
-        xref = f.tell()
-        f.write(b"xref\n0 6\n0000000000 65535 f \n")
-        for i in range(1, 6):
-            f.write(f"{pos[i]:010d} 00000 n \n".encode())
-        f.write(
-            f"trailer\n<</Size 6 /Root 1 0 R>>\nstartxref\n{xref}\n%%EOF\n".encode()
-        )
+_PAGE_W, _PAGE_H = 612, 792
+_MARGIN          = 50
+_WRAP            = 100          # caractères par ligne (Courier 8 pt ≈ 106 max)
+_LEADING         = 11           # interligne (pt)
+_BODY_LINES_P1   = 52           # lignes de corps sur la 1re page (après l'en-tête)
+_BODY_LINES_PN   = 62           # lignes de corps sur les pages suivantes
 
 
-def _build_stream(title: str, lines: List[str], *info: str) -> str:
-    out = ["BT", "/F1 14 Tf", "50 750 Td", f"({_esc(title)}) Tj",
-           "/F1 9 Tf"]
-    y = 720
-    for il in info:
-        out += ["0 -15 Td", f"({_esc(il)}) Tj"]
-        y -= 15
-    out += ["/F1 8 Tf", "0 -20 Td"]
-    y -= 20
-    for ln in (lines or ["(vide)"]):
-        if y < 50:
-            out += ["ET", "BT", "/F1 8 Tf", "50 750 Td"]
-            y = 750
-        ln = ln[:90] + "…" if len(ln) > 90 else ln
-        out += ["0 -12 Td", f"({_esc(ln)}) Tj"]
-        y -= 12
-    out.append("ET")
-    return "\n".join(out)
+def _wrap_lines(lines: List[str]) -> List[str]:
+    """Retour à la ligne (jamais de troncature : la fin d'un chemin compte)."""
+    out: List[str] = []
+    for ln in lines or ["(vide)"]:
+        for part in (str(ln).replace("\t", "    ").splitlines() or [""]):
+            width, first = _WRAP, True
+            while True:
+                chunk, part = part[:width], part[width:]
+                out.append(chunk if first else "    " + chunk)
+                if not part:
+                    break
+                first, width = False, _WRAP - 4
+    return out
 
 
-def _esc(t: str) -> str:
-    t = str(t).replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
-    return "".join(c if 32 <= ord(c) <= 126 else " " for c in t)
+def _pdf_str(t: str) -> bytes:
+    """
+    Chaîne littérale PDF sûre. Les noms de fichiers viennent du support analysé
+    donc sont hostiles : ASCII imprimable échappé, Latin-1 conservé (accents,
+    police WinAnsi), tout le reste (contrôles, CJK…) remplacé par '?'. Aucun
+    caractère ne peut sortir de la chaîne ni injecter d'opérateur PDF.
+    """
+    out = bytearray()
+    for ch in str(t):
+        o = ord(ch)
+        if ch in "\\()":
+            out += b"\\" + ch.encode()
+        elif 32 <= o <= 126:
+            out.append(o)
+        elif 160 <= o <= 255:
+            out += b"\\%03o" % o
+        else:
+            out.append(63)
+    return bytes(out)
+
+
+def _write_pdf(path: str, title: str, lines: List[str], *info: str,
+               mode: int = 0o644) -> None:
+    """PDF multi-pages (bibliothèque standard uniquement)."""
+    body = _wrap_lines(lines)
+    pages: List[List[str]] = [body[:_BODY_LINES_P1]]
+    rest = body[_BODY_LINES_P1:]
+    while rest:
+        pages.append(rest[:_BODY_LINES_PN])
+        rest = rest[_BODY_LINES_PN:]
+    n = len(pages)
+
+    contents: List[bytes] = []
+    for idx, plines in enumerate(pages):
+        c = bytearray()
+        c += b"BT /F1 8 Tf %d TL " % _LEADING
+        if idx == 0:
+            c += b"/F1 14 Tf 50 750 Td (" + _pdf_str(title) + b") Tj /F1 9 Tf "
+            for il in info:
+                c += b"0 -15 Td (" + _pdf_str(il) + b") Tj "
+            c += b"/F1 8 Tf 0 -20 Td "
+        else:
+            c += b"50 750 Td "
+        for ln in plines:
+            c += b"0 -%d Td (" % _LEADING + _pdf_str(ln) + b") Tj "
+        c += b"ET\n"
+        c += (b"BT /F1 8 Tf 50 28 Td (" + _pdf_str(f"Page {idx + 1}/{n}")
+              + b") Tj ET")
+        contents.append(bytes(c))
+
+    objs: List[bytes] = []          # objets 1..N dans l'ordre
+    kids = " ".join(f"{4 + 2 * i} 0 R" for i in range(n))
+    objs.append(b"<</Type /Catalog /Pages 2 0 R>>")
+    objs.append(f"<</Type /Pages /Kids [{kids}] /Count {n}>>".encode())
+    objs.append(b"<</Type /Font /Subtype /Type1 /BaseFont /Courier "
+                b"/Encoding /WinAnsiEncoding>>")
+    for i, cb in enumerate(contents):
+        page_no, cont_no = 4 + 2 * i, 5 + 2 * i
+        objs.append(
+            f"<</Type /Page /Parent 2 0 R /MediaBox [0 0 {_PAGE_W} {_PAGE_H}] "
+            f"/Contents {cont_no} 0 R /Resources <</Font <</F1 3 0 R>>>>>>".encode())
+        objs.append(f"<</Length {len(cb)}>>\nstream\n".encode() + cb
+                    + b"\nendstream")
+
+    out = bytearray(b"%PDF-1.4\n")
+    offsets: List[int] = []
+    for i, raw in enumerate(objs, start=1):
+        offsets.append(len(out))
+        out += f"{i} 0 obj\n".encode() + raw + b"\nendobj\n"
+    xref = len(out)
+    out += f"xref\n0 {len(objs) + 1}\n0000000000 65535 f \n".encode()
+    for off in offsets:
+        out += f"{off:010d} 00000 n \n".encode()
+    out += (f"trailer\n<</Size {len(objs) + 1} /Root 1 0 R>>\n"
+            f"startxref\n{xref}\n%%EOF\n").encode()
+
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, "wb") as f:
+        f.write(out)
 
 
 # ── Rapport de scan par support (export automatique) ──────────────────────────
+
+def safe_name_part(text: str, maxlen: int = 32) -> str:
+    """Fragment de nom de fichier sûr (le libellé d'un support est contrôlé par
+    l'attaquant) : [A-Za-z0-9._-] uniquement, longueur bornée, jamais vide."""
+    out = "".join(c if (c.isascii() and (c.isalnum() or c in "._-")) else "_"
+                  for c in str(text or ""))
+    out = out.strip("._") or "support"
+    return out[:maxlen]
+
 
 def write_device_scan_report_pdf(
         mountpoint: str, device: str, label: str, uuid: str,
@@ -220,19 +275,24 @@ def write_device_scan_report_pdf(
         yara_info:   dict,
         avast_info:  dict,
         engines_used: dict,
+        *,
+        identity:     Optional[dict] = None,
+        sandbox_info: str = "",
+        filename:     Optional[str] = None,
+        max_threats:  int = 500,
 ) -> str:
     """
-    Génère un PDF de rapport de scan et l'écrit à la racine du support.
+    Génère un PDF de rapport de scan dans le répertoire `mountpoint` — ici un
+    répertoire LOCAL de la borne : jamais le support analysé, qui reste en
+    lecture seule.
 
-    Nommage  : scan_AV_YYYYMMDD_HHMMSS_<label>.pdf
-    Contenu  : en-tête support, bases utilisées, résumé, détail des menaces.
-    Retourne : chemin complet du fichier créé.
+    Nommage  : `filename` s'il est fourni, sinon scan_AV_<date>_<label>.pdf
+    Contenu  : support (identité), bases utilisées, résumé, détail des menaces.
+    Retourne : chemin complet du fichier créé (droits 600).
     """
-    ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_lbl = (label or device.replace("/dev/", "")).replace(" ", "_")
-    for ch in r'\/:*?"<>|':
-        safe_lbl = safe_lbl.replace(ch, "_")
-    fname = f"scan_AV_{ts}_{safe_lbl}.pdf"
+    ts    = datetime.now().strftime("%Y%m%d_%H%M%S")
+    fname = filename or f"scan_AV_{ts}_{safe_name_part(label or device.replace('/dev/', ''))}.pdf"
+    fname = os.path.basename(fname)
     dest  = os.path.join(mountpoint, fname)
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -246,7 +306,21 @@ def write_device_scan_report_pdf(
         lines.append(f"Etiquette : {label}")
     if uuid:
         lines.append(f"UUID      : {uuid}")
+    if identity:
+        ident = " ".join(x for x in (identity.get("vendor", ""),
+                                     identity.get("model", "")) if x)
+        if ident:
+            lines.append(f"Materiel  : {ident}")
+        if identity.get("serial"):
+            lines.append(f"Serie USB : {identity['serial']}")
+        if identity.get("size_bytes") not in (None, "", "0", 0):
+            lines.append(f"Taille    : {identity['size_bytes']} octets")
+        if identity.get("fstype"):
+            lines.append(f"Systeme   : {identity['fstype']}")
     lines.append(f"Date      : {now}")
+    lines.append("Montage   : lecture seule (aucune ecriture sur le support)")
+    if sandbox_info:
+        lines.append(f"Isolation : {sandbox_info}")
     lines.append("")
 
     # Moteurs utilisés
@@ -310,12 +384,15 @@ def write_device_scan_report_pdf(
     lines.append("")
 
     if result.threats:
-        lines.append("--- FICHIERS INFECTES ---")
-        for t in result.threats:
+        lines.append("--- FICHIERS INFECTES (conserves sur le support) ---")
+        for t in result.threats[:max_threats]:
             lines.append(f"[{t.engine}] {t.threat}")
             lines.append(f"  Chemin : {t.path}")
             sha = getattr(t, "hash", None) or "N/A"
             lines.append(f"  SHA256 : {sha}")
+        if len(result.threats) > max_threats:
+            lines.append(f"... et {len(result.threats) - max_threats} autre(s) "
+                         "menace(s) non detaillee(s) (rapport tronque).")
     else:
         lines.append("Aucune menace detectee sur ce support.")
 
@@ -325,7 +402,8 @@ def write_device_scan_report_pdf(
                lines,
                f"Support : {label or device}",
                f"Date    : {now}",
-               f"Resultat: {'MENACES DETECTEES' if result.infected else 'SAIN'}")
+               f"Resultat: {'MENACES DETECTEES' if result.infected else 'SAIN'}",
+               mode=0o600)
 
     log_info(f"Rapport PDF ecrit : {dest}")
     return dest
