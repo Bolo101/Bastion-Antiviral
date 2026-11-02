@@ -1537,7 +1537,7 @@ fi
 PDF_CHROOT="config/includes.chroot/opt/pdf"
 mkdir -p "$PDF_CHROOT"
 # Copier les PDFs présents dans ../pdf/ sur la machine de build, si disponibles
-PDF_SRC="$(dirname "$WORK_DIR")/../../pdf"
+PDF_SRC="$(dirname "$WORK_DIR")/../pdf"
 if [[ -d "$PDF_SRC" ]]; then
     PDF_COUNT=$(find "$PDF_SRC" -maxdepth 1 -name "*.pdf" | wc -l)
     if [[ "$PDF_COUNT" -gt 0 ]]; then
@@ -1554,7 +1554,7 @@ fi
 # ── Logo (../img/logo.png relatif au code = /opt/img/logo.png) ────────────────
 IMG_CHROOT="config/includes.chroot/opt/img"
 mkdir -p "$IMG_CHROOT"
-LOGO_SRC="$(pwd)/../../img/logo.png"
+LOGO_SRC="$(pwd)/../img/logo.png"
 if [[ -f "$LOGO_SRC" ]]; then
     cp -v "$LOGO_SRC" "$IMG_CHROOT/logo.png"
     ok "Logo copié → $IMG_CHROOT/logo.png"
