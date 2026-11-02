@@ -23,7 +23,7 @@ set -euo pipefail
 # ── Variables ─────────────────────────────────────────────────────────────────
 ISO_NAME="$(pwd)/bastion-antiviral-v1.0.iso"
 WORK_DIR="$(pwd)/debian-live-build"
-CODE_DIR="$(pwd)/../../code"
+CODE_DIR="$(pwd)/../code"
 SIGBASE_URL="https://github.com/Neo23x0/signature-base/archive/refs/heads/master.zip"
 
 # Paramètres de boot communs (réutilisés dans syslinux + GRUB)

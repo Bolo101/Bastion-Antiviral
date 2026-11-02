@@ -2,9 +2,9 @@
 
 SCRIPT_ISO    := forgeIso64.sh
 
-DIR_ISO_64     := iso-64-bits
+DIR_ISO_64     := iso
 
-BUILD_DIR_ISO_64    := ./iso-64-bits/debian-live-build
+BUILD_DIR_ISO_64    := ./iso/debian-live-build
 
 .PHONY: all kde all-iso clean help
 
