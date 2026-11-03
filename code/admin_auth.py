@@ -18,7 +18,7 @@ Onglets du panneau :
 import os
 import subprocess
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import font as tkfont, ttk, messagebox
 from typing import Any, Callable, List, Optional, Tuple
 
 from config import (
@@ -301,6 +301,13 @@ class AdminPanel:
         self._open()
 
     def _open(self) -> None:
+        # Polices nommées de Tk → famille explicite « Arial », comme les widgets
+        # de gui.py : la police par défaut n'a pas de repli d'emojis sur certains
+        # systèmes, d'où les carrés dans les onglets / boutons ttk.
+        for _name in ("TkDefaultFont", "TkTextFont", "TkMenuFont",
+                      "TkHeadingFont", "TkCaptionFont"):
+            tkfont.nametofont(_name).configure(family="Arial")
+
         dlg = tk.Toplevel(self._parent)
         dlg.title("⚙  Panneau d'administration")
         dlg.attributes("-fullscreen", True)
