@@ -5,9 +5,11 @@ Onglets du panneau :
   🔧 Moteurs      – sélection ClamAV / Avast / YARA, mode scan
   📡 Supports     – affichage exhaustif de tous les supports USB
   📑 Rapports     – rapports des supports compromis (Evince), export vers un support validé
-  🛡 ClamAV       – mise à jour base (en ligne / USB) + signatures tierces
-  🔐 Avast        – installation, licence, base VPS
-  🔍 YARA         – règles signature-base (GitHub / USB)
+  🛡 ClamAV       – mise à jour base en ligne (freshclam) + signatures tierces
+  🔐 Avast        – installation, licence, base VPS en ligne
+  🔍 YARA         – règles signature-base (GitHub)
+  📦 MAJ offline  – mise à jour hors-ligne de TOUTES les bases depuis le dossier
+                    « bastion » d'une clé USB (ClamAV, tierces, Avast VPS, YARA)
   ⏰ Planification – crontab freshclam
   📋 Journaux     – export vers USB, purge des logs
   🔑 Sécurité     – changement du code admin
@@ -335,6 +337,7 @@ class AdminPanel:
         self._tab_clamav(nb)
         self._tab_avast(nb)
         self._tab_yara(nb)
+        self._tab_offline(nb, dlg)
         self._tab_cron(nb)
         self._tab_pdf(nb, dlg)
         self._tab_logs(nb)
@@ -1041,7 +1044,7 @@ class AdminPanel:
         ttk.Label(
             upd_frame,
             text="En ligne : freshclam contacte les serveurs ClamAV (Internet requis).\n"
-                 "Hors-ligne : copiez main.cvd, daily.cvd, bytecode.cvd sur une clé USB.",
+                 "Hors-ligne : onglet « 📦 MAJ offline » (dossier bastion sur clé USB).",
             justify=tk.LEFT, foreground="#cccccc"
         ).pack(anchor=tk.W, pady=(0, 6))
         btn_row1 = ttk.Frame(upd_frame)
@@ -1052,7 +1055,8 @@ class AdminPanel:
         ttk.Label(
             tp_frame,
             text="URLhaus (abuse.ch), Sanesecurity, InterServer…\n"
-                 "Installées dans /var/lib/clamav/ — Internet requis.",
+                 "Installées dans /var/lib/clamav/ — Internet requis "
+                 "(hors-ligne : onglet « 📦 MAJ offline »).",
             justify=tk.LEFT, foreground="#cccccc"
         ).pack(anchor=tk.W, pady=(0, 6))
         btn_row2 = ttk.Frame(tp_frame)
@@ -1079,10 +1083,6 @@ class AdminPanel:
                 set_btns_fn=_set_btns, after_fn=_after
             )
 
-        def _do_usb():
-            _append("⚙ Lancement import USB ClamAV…", "info")
-            self._cb["clamav_usb"]()
-
         def _do_thirdparty():
             _clear()
             cmd = [
@@ -1100,14 +1100,11 @@ class AdminPanel:
         b1 = ttk.Button(btn_row1, text="🌐  Mise à jour en ligne (freshclam)",
                         command=_do_online, width=36)
         b1.pack(side=tk.LEFT, padx=(0, 6))
-        b2 = ttk.Button(btn_row1, text="🔌  Importer depuis clé USB",
-                        command=_do_usb, width=26)
-        b2.pack(side=tk.LEFT)
         b3 = ttk.Button(btn_row2,
                         text="🌐  Télécharger signatures tierces",
                         command=_do_thirdparty, width=36)
         b3.pack(side=tk.LEFT)
-        all_btns.extend([b1, b2, b3])
+        all_btns.extend([b1, b3])
 
     # ── Onglet Avast ───────────────────────────────────────────────────────────
 
@@ -1188,7 +1185,7 @@ class AdminPanel:
         vps_frame.pack(fill=tk.X, pady=(0, 6))
         ttk.Label(vps_frame,
                   text="En ligne : avast update (Internet requis).\n"
-                       "Hors-ligne : copiez un fichier .vps/.vpz sur une clé USB.",
+                       "Hors-ligne : onglet « 📦 MAJ offline » (dossier bastion sur clé USB).",
                   foreground="#cccccc").pack(anchor=tk.W, pady=(0, 6))
         vps_row = ttk.Frame(vps_frame)
         vps_row.pack(anchor=tk.W)
@@ -1215,17 +1212,10 @@ class AdminPanel:
                 set_btns_fn=_set_btns, after_fn=_after
             )
 
-        def _do_vps_usb():
-            _append("⚙ Lancement import VPS USB…", "info")
-            self._cb["avast_vps_usb"]()
-
         b_vps_online = ttk.Button(vps_row, text="🌐  Mise à jour VPS en ligne",
                                    command=_do_vps_online, width=28)
         b_vps_online.pack(side=tk.LEFT, padx=(0, 6))
-        b_vps_usb = ttk.Button(vps_row, text="🔌  Importer VPS depuis USB",
-                                command=_do_vps_usb, width=26)
-        b_vps_usb.pack(side=tk.LEFT)
-        all_btns.extend([b_vps_online, b_vps_usb])
+        all_btns.append(b_vps_online)
 
     def _refresh_avast_status_display(self) -> None:
         try:
@@ -1494,7 +1484,7 @@ class AdminPanel:
         ttk.Label(
             ctrl_frame,
             text="En ligne  : télécharge signature-base de Florian Roth (GitHub) — ~30 Mo.\n"
-                 "Hors-ligne : placez des fichiers .yar/.yara ou un .zip sur une clé USB.",
+                 "Hors-ligne : onglet « 📦 MAJ offline » (dossier bastion sur clé USB).",
             justify=tk.LEFT, foreground="#cccccc"
         ).pack(anchor=tk.W, pady=(0, 8))
         btn_row = ttk.Frame(ctrl_frame)
@@ -1525,17 +1515,284 @@ class AdminPanel:
             self._stream_to_terminal(cmd, "YARA — téléchargement signature-base",
                                       _append, status_var, set_btns_fn=_set_btns, after_fn=_after)
 
-        def _do_usb():
-            _append("⚙ Lancement import USB YARA…", "info")
-            self._cb["yara_usb"]()
-
         b_online = ttk.Button(btn_row, text="🌐  Télécharger signature-base",
                               command=_do_online, width=30)
         b_online.pack(side=tk.LEFT, padx=(0, 6))
-        b_usb = ttk.Button(btn_row, text="🔌  Importer depuis clé USB",
-                           command=_do_usb, width=28)
-        b_usb.pack(side=tk.LEFT)
-        all_btns.extend([b_online, b_usb])
+        all_btns.append(b_online)
+
+    # ── Onglet MAJ offline ─────────────────────────────────────────────────────
+
+    def _tab_offline(self, nb: ttk.Notebook, dlg: tk.Toplevel) -> None:
+        """Mise à jour hors-ligne de TOUTES les bases depuis <clé USB>/bastion.
+
+        Les deux boutons parcourent l'intégralité du dossier « bastion »
+        (ClamAV, signatures tierces, Avast VPS, YARA) via bastion_update.py :
+        seules les bases plus récentes que celles de la borne sont installées ;
+        une base en erreur (ex. Avast sans licence) est sautée et le
+        traitement continue avec les suivantes.
+        La clé est montée en lecture seule (montage durci de l'UsbManager).
+        """
+        import json as _json
+        import threading as _th
+
+        tab = ttk.Frame(nb, padding=10)
+        nb.add(tab, text="📦 MAJ offline")
+
+        ttk.Label(tab, text="Mise à jour hors-ligne — clé USB, dossier « bastion »",
+                  font=("Arial", 11, "bold")).pack(anchor=tk.W, pady=(0, 4))
+        ttk.Label(
+            tab,
+            text="Préparez la clé avec make_bastion.sh (poste connecté), puis branchez-la ici.\n"
+                 "Tout le dossier « bastion » est parcouru : ClamAV, signatures tierces, Avast VPS, "
+                 "YARA.\nSeules les bases plus récentes que celles de la borne sont installées ; "
+                 "une base en erreur est sautée.",
+            justify=tk.LEFT, foreground="#cccccc"
+        ).pack(anchor=tk.W, pady=(0, 6))
+
+        # ── Sélection / montage de la clé ─────────────────────────────────────
+        usb_frame = ttk.LabelFrame(tab, text="Clé USB", padding=8)
+        usb_frame.pack(fill=tk.X, pady=(0, 6))
+        r1 = ttk.Frame(usb_frame)
+        r1.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(r1, text="Clé :").pack(side=tk.LEFT)
+        usb_var = tk.StringVar()
+        usb_combo = ttk.Combobox(r1, textvariable=usb_var, state="readonly", width=34)
+        usb_combo.pack(side=tk.LEFT, padx=4)
+        usb_status = tk.StringVar(value="Sélectionnez la clé contenant le dossier « bastion ».")
+        ttk.Label(usb_frame, textvariable=usb_status, foreground="#7ec8e3",
+                  font=("Courier", 8)).pack(anchor=tk.W, pady=(4, 0))
+
+        def _fill_combo():
+            parts = self._get_usb_partitions()
+            names = [p.device + (f"  [{p.label}]" if p.label else "") for p in parts]
+            usb_combo["values"] = names
+            if names:
+                usb_combo.current(0)
+            else:
+                usb_var.set("— aucune clé détectée —")
+
+        def _rescan():
+            try:
+                self._refresh_usb()
+            except Exception:
+                pass
+            _fill_combo()
+
+        ttk.Button(r1, text="↺", width=3, command=_rescan).pack(side=tk.LEFT, padx=2)
+        _fill_combo()
+
+        # ── Terminal d'activité (avant le tableau : il se range en bas) ───────
+        _, _, _append, _clear, term_status, _after = self._mini_terminal(tab)
+
+        # ── Tableau comparatif ────────────────────────────────────────────────
+        style = ttk.Style()
+        style.configure("Offline.Treeview", background="#101533", foreground="#ffffff",
+                        fieldbackground="#101533", rowheight=24, borderwidth=1,
+                        relief="solid")
+        style.configure("Offline.Treeview.Heading", background="#1e2a4a",
+                        foreground="#e0e0e0", font=("Arial", 9, "bold"),
+                        relief="raised")
+        style.map("Offline.Treeview", background=[("selected", "#2e7d32")],
+                  foreground=[("selected", "#ffffff")])
+
+        tree_frame = ttk.Frame(tab)
+        tree_frame.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
+        cols = ("base", "borne", "cle", "statut", "detail")
+        tree = ttk.Treeview(tree_frame, columns=cols, show="headings", height=7,
+                            style="Offline.Treeview")
+        for col, title, width in (("base", "Base", 210), ("borne", "Sur la borne", 200),
+                                  ("cle", "Sur la clé", 210), ("statut", "Statut", 130),
+                                  ("detail", "Détail", 330)):
+            tree.heading(col, text=title)
+            tree.column(col, width=width, anchor=tk.W)
+        for tag, color in (("todo", "#ffd666"), ("ok", "#88e0a0"),
+                           ("uptodate", "#a0a0c0"), ("skip", "#9090d0"),
+                           ("failed", "#ff6b6b"), ("partial", "#ffaa00")):
+            tree.tag_configure(tag, foreground=color)
+        sb = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=tree.yview)
+        tree.configure(yscrollcommand=sb.set)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.pack(side=tk.LEFT, fill=tk.Y)
+
+        summary_var = tk.StringVar(value="")
+        ttk.Label(tab, textvariable=summary_var, foreground="#7ec8e3",
+                  font=("Arial", 9, "bold")).pack(anchor=tk.W, pady=(4, 0),
+                                                  before=tree_frame)
+
+        status_text = {
+            "TODO":     ("⬇ À installer", "todo"),
+            "OK":       ("✅ Installé", "ok"),
+            "UPTODATE": ("✓ À jour", "uptodate"),
+            "SKIP":     ("⏏ Ignoré", "skip"),
+            "FAILED":   ("❌ Échec", "failed"),
+            "PARTIAL":  ("⚠ Partiel", "partial"),
+        }
+
+        def _label(r: dict) -> str:
+            g, n = r.get("group", ""), r.get("name", "")
+            return {"thirdparty": "ClamAV · signatures tierces",
+                    "avast": "Avast · base VPS",
+                    "yara": "YARA · signature-base",
+                    "yara-custom": "YARA · règles personnalisées"
+                    }.get(g, f"ClamAV · {n}" if g == "clamav" else f"{g} · {n}")
+
+        def _fill(data: dict) -> None:
+            tree.delete(*tree.get_children())
+            for r in data.get("rows", []):
+                text, tag = status_text.get(r.get("status"), (r.get("status", "?"), "skip"))
+                tree.insert("", tk.END, tags=(tag,), values=(
+                    _label(r), r.get("borne", "—"), r.get("cle", "—"), text,
+                    r.get("detail", "")))
+            c = data.get("summary", {})
+            parts = []
+            if c.get("TODO"):
+                parts.append(f"{c['TODO']} à installer")
+            if c.get("OK"):
+                parts.append(f"{c['OK']} installée(s)")
+            parts.append(f"{c.get('UPTODATE', 0)} à jour")
+            if c.get("SKIP"):
+                parts.append(f"{c['SKIP']} ignorée(s)")
+            bad = c.get("FAILED", 0) + c.get("PARTIAL", 0)
+            if bad:
+                parts.append(f"{bad} en échec")
+            summary_var.set(" · ".join(parts))
+
+        # ── Montage + localisation du dossier bastion ─────────────────────────
+        st: dict = {"dev": None, "bastion": None}
+        script = os.path.join(self._app_dir, "bastion_update.py")
+
+        def _resolve_bastion() -> Optional[str]:
+            if not os.path.isfile(script):
+                usb_status.set("❌ bastion_update.py introuvable dans le dossier de l'application.")
+                return None
+            parts = self._get_usb_partitions()
+            idx = usb_combo.current()
+            if idx < 0 or idx >= len(parts):
+                usb_status.set("⚠ Sélectionnez une clé USB valide.")
+                return None
+            part = parts[idx]
+            ok, msg = self._usb.mount(part.device)      # RO durci : liste blanche FS
+            if not ok:
+                usb_status.set(f"❌ {msg[:100]}")
+                return None
+            mp = self._usb.get_mountpoint(part.device)
+            st["dev"], st["bastion"] = part.device, None
+            try:
+                found = next((os.path.join(mp, n) for n in sorted(os.listdir(mp))
+                              if n.lower() == "bastion"
+                              and os.path.isdir(os.path.join(mp, n))), None)
+            except (OSError, TypeError):
+                found = None
+            if not found:
+                usb_status.set("❌ Dossier « bastion » introuvable à la racine de la clé.")
+                _append(f"❌ Dossier « bastion » introuvable à la racine de {mp}. "
+                        "Préparez la clé avec make_bastion.sh.", "threat")
+                return None
+            st["bastion"] = found
+            usb_status.set(f"✅ Clé montée en lecture seule → {mp}")
+            return found
+
+        all_btns: list = []
+
+        def _set_btns(state):
+            for b in all_btns:
+                try:
+                    b.configure(state=state)
+                except Exception:
+                    pass
+
+        # ── Comparaison seule ─────────────────────────────────────────────────
+        def _do_check(bastion: Optional[str] = None, quiet: bool = False) -> None:
+            bastion = bastion or _resolve_bastion()
+            if not bastion:
+                return
+            if not quiet:
+                _set_btns(tk.DISABLED)
+                term_status.set("⏳ Analyse du dossier bastion…")
+
+            def _worker():
+                try:
+                    r = subprocess.run(
+                        ["python3", script, "--bastion", bastion, "--check", "--json"],
+                        capture_output=True, text=True, timeout=600)
+                    # le JSON est la dernière ligne (le reste = bruit éventuel d'import)
+                    line = next((l for l in reversed(r.stdout.splitlines())
+                                 if l.startswith("{")), "")
+                    data = _json.loads(line) if line else {
+                        "error": (r.stderr or r.stdout or "aucune sortie")[-300:]}
+                except Exception as exc:                          # noqa: BLE001
+                    data = {"error": str(exc)}
+                tree.after(0, lambda: _on_check(data, quiet))
+
+            _th.Thread(target=_worker, daemon=True).start()
+
+        def _on_check(data: dict, quiet: bool) -> None:
+            if "error" in data:
+                _append(f"❌ {data['error']}", "threat")
+                term_status.set("❌ Analyse impossible.")
+            else:
+                _fill(data)
+                todo = data.get("summary", {}).get("TODO", 0)
+                if not quiet:
+                    _append(f"✅ Analyse terminée : {todo} base(s) à installer.", "ok")
+                    term_status.set(f"✅ {todo} base(s) à installer.")
+            if not quiet:
+                _set_btns(tk.NORMAL)
+
+        # ── Installation de tout ce qui est plus récent ───────────────────────
+        def _do_install() -> None:
+            bastion = _resolve_bastion()
+            if not bastion:
+                return
+            if not messagebox.askyesno(
+                "Mise à jour offline",
+                "Parcourir tout le dossier « bastion » et installer les bases plus "
+                "récentes que celles de la borne ?\n\n"
+                "Une base en erreur (ex. Avast sans licence) sera sautée, les "
+                "suivantes seront quand même traitées.",
+                parent=dlg
+            ):
+                return
+            _clear()
+
+            def _after_install(rc: int) -> None:
+                _do_check(bastion, quiet=True)          # rafraîchit le tableau
+                try:
+                    self._cb["avast_refresh"]()         # barre d'état de la fenêtre principale
+                except Exception:
+                    pass
+
+            self._stream_to_terminal(
+                ["python3", script, "--bastion", bastion],
+                "Mise à jour offline (bastion)", _append, term_status,
+                set_btns_fn=_set_btns, on_done=_after_install, after_fn=_after)
+
+        def _do_umount() -> None:
+            dev = st["dev"]
+            if not dev:
+                usb_status.set("⚠ Aucun montage actif.")
+                return
+            ok, msg = self._usb.umount(dev)
+            if ok:
+                st["dev"] = st["bastion"] = None
+                tree.delete(*tree.get_children())
+                summary_var.set("")
+                usb_status.set("✅ Clé démontée : vous pouvez la retirer.")
+            else:
+                usb_status.set(f"❌ {msg[:100]}")
+
+        btn_row = ttk.Frame(usb_frame)
+        btn_row.pack(fill=tk.X, pady=(2, 0))
+        b_check = ttk.Button(btn_row, text="🔍  Rechercher les mises à jour",
+                             command=_do_check, width=32)
+        b_check.pack(side=tk.LEFT, padx=(0, 6))
+        b_inst = ttk.Button(btn_row, text="⬇  Installer les mises à jour",
+                            command=_do_install, width=30)
+        b_inst.pack(side=tk.LEFT, padx=(0, 6))
+        b_umount = ttk.Button(btn_row, text="▼  Démonter la clé",
+                              command=_do_umount, width=20)
+        b_umount.pack(side=tk.LEFT)
+        all_btns.extend([b_check, b_inst])
 
     # ── Onglet Planification ───────────────────────────────────────────────────
 
