@@ -764,8 +764,11 @@ class Updater:
     def install_yara_set(self, sig: str, files: List[str], dst_dir: str,
                          row: Row) -> None:
         assert self.stage
-        new_dir = dst_dir + ".bastion-new"
-        old_dir = dst_dir + ".bastion-old"
+        # dossiers temporaires CACHÉS : un scanner qui parcourt YARA_RULES_DIR
+        # récursivement ne doit jamais les charger (règles en double)
+        parent, base = os.path.split(dst_dir)
+        new_dir = os.path.join(parent, f".{base}.bastion-new")
+        old_dir = os.path.join(parent, f".{base}.bastion-old")
         try:
             for p in (new_dir, old_dir):
                 if os.path.isdir(p):
