@@ -15,6 +15,12 @@ import os
 import sys
 
 TIMEOUT = 15
+BATCH = 100          # taille des lots du repli (si la compilation groupée échoue)
+
+# Variables externes déclarées à la compilation ET fournies à chaque analyse.
+# « owner » est requis par certaines règles de signature-base (THOR).
+EXTERNALS = {"filename": "", "filepath": "", "extension": "",
+             "filetype": "", "owner": ""}
 
 
 def emit(**kw) -> None:
@@ -24,7 +30,9 @@ def emit(**kw) -> None:
 
 def collect_rules(rules_dir):
     out = []
-    for root, _, files in os.walk(rules_dir):
+    for root, dirs, files in os.walk(rules_dir):
+        # dossiers cachés ignorés (ex. reliquat d'une mise à jour interrompue)
+        dirs[:] = sorted(d for d in dirs if not d.startswith("."))
         for f in sorted(files):
             if f.endswith((".yar", ".yara")) and not f.startswith("."):
                 out.append(os.path.join(root, f))
@@ -43,22 +51,42 @@ def main() -> int:
         emit(type="error", msg="module yara absent dans le sandbox")
         return 3
 
-    compiled = []
-    for rf in collect_rules(rules_dir):
+    # 1) Validation fichier par fichier. L'objet compilé est libéré aussitôt :
+    #    chaque yara.compile() réserve ~9 Mo de tables internes ; en garder ~750
+    #    (signature-base complet) dépasse 6 Go et le noyau tue le worker (137).
+    valid = {}
+    for i, rf in enumerate(collect_rules(rules_dir)):
         try:
-            compiled.append(yara.compile(
-                filepath=rf,
-                externals={"filename": "", "filepath": "",
-                           "extension": "", "filetype": ""}))
+            yara.compile(filepath=rf, externals=EXTERNALS)
+            valid[f"r{i}"] = rf                 # un namespace par fichier
         except yara.SyntaxError as e:
             emit(type="warn", msg=f"Règle ignorée ({os.path.basename(rf)}) : {e}")
         except Exception as e:
             emit(type="warn", msg=f"Erreur compilation ({os.path.basename(rf)}) : {e}")
 
+    # 2) UN SEUL ensemble compilé (≈ 65 Mo pour signature-base complet) et une
+    #    seule passe par fichier analysé.
+    compiled = []
+    n_files = 0
+    if valid:
+        try:
+            compiled.append(yara.compile(filepaths=valid, externals=EXTERNALS))
+            n_files = len(valid)
+        except Exception as e:
+            emit(type="warn", msg=f"Compilation groupée impossible ({e}) : repli par lots")
+            items = list(valid.items())
+            for k in range(0, len(items), BATCH):
+                chunk = dict(items[k:k + BATCH])
+                try:
+                    compiled.append(yara.compile(filepaths=chunk, externals=EXTERNALS))
+                    n_files += len(chunk)
+                except Exception as e2:
+                    emit(type="warn", msg=f"Lot de règles ignoré : {e2}")
+
     if not compiled:
         emit(type="error", msg="aucune règle valide après compilation")
         return 4
-    emit(type="compiled", count=len(compiled))
+    emit(type="compiled", count=n_files)
 
     scanned = 0
     unreadable = 0
@@ -68,7 +96,7 @@ def main() -> int:
         try:
             ext = os.path.splitext(fp)[1].lstrip(".").lower()
             exts = {"filename": os.path.basename(fp), "filepath": fp,
-                    "extension": ext, "filetype": ext.upper()}
+                    "extension": ext, "filetype": ext.upper(), "owner": ""}
             for rules in compiled:
                 for m in rules.match(fp, externals=exts, timeout=TIMEOUT):
                     emit(type="hit", path=fp, rule=m.rule)
