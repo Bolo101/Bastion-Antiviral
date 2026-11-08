@@ -24,8 +24,18 @@ EXTERNALS = {"filename": "", "filepath": "", "extension": "",
 
 
 def emit(**kw) -> None:
-    sys.stdout.write(json.dumps(kw, ensure_ascii=False) + "\n")
+    # ensure_ascii=True (défaut) : indispensable. Un chemin dont le nom n'est pas
+    # de l'UTF-8 valide contient des « surrogates » ; avec ensure_ascii=False
+    # l'écriture lève UnicodeEncodeError et la détection serait perdue en silence.
+    # En ASCII ils sont échappés (\udcXX) et json.loads côté hôte les restitue.
+    sys.stdout.write(json.dumps(kw) + "\n")
     sys.stdout.flush()
+
+
+def safe_text(text: str) -> str:
+    """Texte transmissible à yara-python (UTF-8 valide) : les octets invalides
+    d'un nom de fichier deviennent U+FFFD."""
+    return os.fsencode(text).decode("utf-8", "replace")
 
 
 def collect_rules(rules_dir):
@@ -93,18 +103,33 @@ def main() -> int:
 
     def scan_file(fp: str) -> None:
         nonlocal scanned, unreadable
+        fd = None
         try:
             ext = os.path.splitext(fp)[1].lstrip(".").lower()
-            exts = {"filename": os.path.basename(fp), "filepath": fp,
-                    "extension": ext, "filetype": ext.upper(), "owner": ""}
+            exts = {"filename": safe_text(os.path.basename(fp)),
+                    "filepath": safe_text(fp),
+                    "extension": safe_text(ext),
+                    "filetype": safe_text(ext.upper()), "owner": ""}
+            match_path = fp
+            try:
+                fp.encode("utf-8")
+            except UnicodeEncodeError:
+                # Nom de fichier non UTF-8 (fréquent sur clés FAT, ou volontaire) :
+                # yara-python n'accepte pas ce chemin. On l'ouvre nous-mêmes et on
+                # analyse via /proc/self/fd/N. Sans cela, le fichier échapperait
+                # à YARA.
+                fd = os.open(os.fsencode(fp), os.O_RDONLY)
+                match_path = f"/proc/self/fd/{fd}"
             for rules in compiled:
-                for m in rules.match(fp, externals=exts, timeout=TIMEOUT):
+                for m in rules.match(match_path, externals=exts, timeout=TIMEOUT):
                     emit(type="hit", path=fp, rule=m.rule)
         except Exception:
-            # Fichier non analysé : le signaler (ne jamais le laisser passer pour sain)
-            if not os.access(fp, os.R_OK):
-                unreadable += 1
+            # Fichier non (entièrement) analysé — illisible, délai dépassé, erreur
+            # du moteur… : le signaler, ne JAMAIS le laisser passer pour sain.
+            unreadable += 1
         finally:
+            if fd is not None:
+                os.close(fd)
             scanned += 1
             if scanned % 20 == 0:
                 emit(type="progress", scanned=scanned, unreadable=unreadable)
