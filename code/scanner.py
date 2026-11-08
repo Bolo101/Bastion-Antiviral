@@ -447,6 +447,20 @@ class ScanEngine:
         if r.returncode in (0, 1):
             return True, ""
 
+        # Tué par le système (SIGKILL = 137) pendant le chargement : presque toujours
+        # le manque de mémoire. Inutile de réessayer dans le scan (même chargement,
+        # même mort, et ~1 à 2 min perdues) : on s'arrête avec la vraie cause.
+        if r.returncode in (137, -9):
+            msg = (f"❌ ClamAV : chargement de la base tué par le système "
+                   f"(code {r.returncode}) — mémoire insuffisante ?\n"
+                   "   clamscan charge toute la base en RAM : libérez de la mémoire, "
+                   "réduisez les signatures tierces ou ajoutez de la RAM.")
+            if cb:
+                cb(msg, "threat")
+            log_error(msg)
+            return False, (f"ClamAV : base trop lourde pour la mémoire disponible "
+                           f"(code {r.returncode}) — scan annulé.")
+
         combined = (r.stdout + r.stderr).strip()
         bad_lines = [l for l in combined.splitlines()
                      if any(k in l for k in
@@ -562,7 +576,8 @@ class ScanEngine:
                 cb(msg, "warning")
             log_error(msg)
         elif rc not in (0, 1, -99) and not result.stopped:
-            msg = f"⚠ ClamAV : arrêt anormal (code {rc}) — analyse incomplète."
+            hint = (" (mémoire insuffisante ?)" if rc in (137, -9) else "")
+            msg = f"⚠ ClamAV : arrêt anormal (code {rc}){hint} — analyse incomplète."
             result.errors.append(msg)
             if cb:
                 cb(msg, "warning")
