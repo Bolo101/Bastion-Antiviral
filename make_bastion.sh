@@ -22,9 +22,18 @@
 #   --only LISTE            clamav,thirdparty,avast,yara (défaut : tout)
 #   --avast-vps-url URL     télécharge le fichier VPS Avast à cette adresse
 #   --avast-vps-file FICHIER  copie un fichier VPS déjà téléchargé
+#   --abusech-key CLÉ       clé d'authentification abuse.ch (URLhaus, voir ci-dessous)
 #   -h, --help
 #
 # Variables : AVAST_VPS_URL (équivalent de --avast-vps-url)
+#             ABUSECH_AUTH_KEY (équivalent de --abusech-key)
+#
+# URLhaus — depuis le 21/10/2026 abuse.ch n'offre plus le téléchargement sans clé
+#   (erreur 410). L'export ClamAV exige une clé d'authentification (« Auth-Key »,
+#   inscription sur auth.abuse.ch). Sans clé, URLhaus est simplement ignoré. La clé
+#   ne passe jamais par la ligne de commande de curl ni par l'affichage. Vérifiez
+#   les conditions d'abuse.ch pour votre usage (la clé gratuite serait réservée
+#   à un usage non commercial).
 #
 # Avast — IMPORTANT : aucune adresse publique de téléchargement du VPS pour
 #   Avast Business for Linux n'est documentée ; ce script ne devine donc rien.
@@ -35,8 +44,12 @@
 #
 # ClamAV — les bases officielles sont récupérées avec freshclam (méthode
 #   officielle, mises à jour incrémentales : les fichiers déjà présents sur la
-#   clé servent de point de départ). Repli sur curl/wget si freshclam est
-#   absent : ClamAV limite fortement ce mode (erreur 429), à éviter.
+#   clé servent de point de départ). freshclam travaille dans /tmp, pas sur la
+#   clé : son profil AppArmor (livré avec le paquet) ne l'autorise à lire que
+#   /etc/clamav et à écrire que /var/lib/clamav, /var/log/clamav et /tmp ; une
+#   config ailleurs donne « Can't open/parse the config file ». Repli sur
+#   curl/wget si freshclam est absent ou échoue : ClamAV limite fortement ce mode
+#   (erreur 429), à éviter.
 #
 # Chaque famille est traitée indépendamment : un échec (réseau, source
 # indisponible…) n'efface JAMAIS la version précédente de cette famille.
@@ -63,12 +76,14 @@ RUN_EPOCH="$(date +%s)"
 ONLY=""
 AVAST_URL="${AVAST_VPS_URL:-}"
 AVAST_FILE=""
+ABUSECH_KEY="${ABUSECH_AUTH_KEY:-}"
+FC_ROOT=""          # dossier de travail de freshclam (sous /tmp), nettoyé en sortie
 
 # ── Signatures tierces ClamAV : fichier|url|url_secours|taille_min_octets ─────
 read -r -d '' THIRD_PARTY_LIST <<'LIST_EOF'
-urlhaus-filter.ndb|https://urlhaus.abuse.ch/downloads/urlhaus.ndb|https://curbengh.github.io/malware-filter/urlhaus-filter-clam.ndb|1000
+urlhaus-filter.ndb|@ABUSECH_KEY@||1000
 interserver256.hdb|http://sigs.interserver.net/interserver256.hdb||500
-topline.db|http://sigs.interserver.net/topline.db||500
+interservertopline.db|http://sigs.interserver.net/interservertopline.db||500
 sanesecurity.ftm|https://mirror.ihost.md/clamav/sanesecurity/sanesecurity.ftm||64
 sigwhitelist.ign2|https://mirror.ihost.md/clamav/sanesecurity/sigwhitelist.ign2||64
 phish.ndb|https://mirror.ihost.md/clamav/sanesecurity/phish.ndb||64
@@ -139,10 +154,16 @@ while (( $# )); do
         --only)            ONLY="${2:-}"; shift 2 ;;
         --avast-vps-url)   AVAST_URL="${2:-}"; shift 2 ;;
         --avast-vps-file)  AVAST_FILE="${2:-}"; shift 2 ;;
+        --abusech-key)     ABUSECH_KEY="${2:-}"; shift 2 ;;
         -h|--help)         usage; exit 0 ;;
         *) err "option inconnue : $1 (voir --help)"; exit 1 ;;
     esac
 done
+
+if [[ -n "$ABUSECH_KEY" && ! "$ABUSECH_KEY" =~ ^[A-Za-z0-9._~-]+$ ]]; then
+    err "clé abuse.ch invalide (caractères autorisés : lettres, chiffres, . _ ~ -)"
+    exit 1
+fi
 
 # fetch URL DEST [délai_max_s] [user-agent]
 fetch() {
@@ -154,6 +175,24 @@ fetch() {
     else
         return 127
     fi
+}
+
+# Comme fetch, mais l'URL contient un secret : avec curl elle passe par stdin
+# (-K -) et n'apparaît donc pas dans la liste des processus.
+fetch_secret() {
+    local url="$1" dest="$2" max="${3:-120}"
+    if have curl; then
+        printf 'url = "%s"\n' "$url" | \
+            curl -fsSL --connect-timeout 15 --max-time "$max" -A "$UA" -K - -o "$dest"
+    else
+        fetch "$url" "$dest" "$max"
+    fi
+}
+
+# Mégaoctets libres sur le système de fichiers d'un dossier (0 si inconnu)
+free_mb() {
+    local v; v="$(df --output=avail -B1 "$1" 2>/dev/null | tail -n1 | tr -dc '0-9')"
+    echo $(( ${v:-0} / 1048576 ))
 }
 
 sha_of() { sha256sum "$1" | cut -d' ' -f1; }
@@ -184,9 +223,9 @@ have curl || have wget || { err "curl ou wget requis"; exit 1; }
 
 mkdir -p "$BASTION" || { err "impossible de créer $BASTION (clé en lecture seule ?)"; exit 1; }
 WORK="$(mktemp -d "$BASTION/.work.XXXXXX")" || { err "zone de travail impossible sur la clé"; exit 1; }
-trap 'rm -rf "$WORK"' EXIT INT TERM
+trap 'rm -rf "$WORK"; [[ -n "${FC_ROOT:-}" ]] && rm -rf "$FC_ROOT"' EXIT INT TERM
 
-avail_mb=$(( $(df --output=avail -B1 "$BASTION" 2>/dev/null | tail -n1 | tr -dc '0-9') / 1048576 ))
+avail_mb="$(free_mb "$BASTION")"
 (( avail_mb > 0 && avail_mb < 1200 )) && \
     warn "seulement ${avail_mb} Mo libres sur la clé (≈ 1,2 Go conseillés pour ClamAV)"
 
@@ -211,30 +250,68 @@ valid_cvd() { # fichier
     return 0
 }
 
+# Crée FC_ROOT (dossier de travail de freshclam) dans /tmp ou /var/tmp s'il y a
+# assez de place ; sinon retourne 1.
+pick_fc_root() { # <Mo nécessaires>
+    local need="$1" base
+    for base in "${TMPDIR:-/tmp}" /var/tmp; do
+        [[ -d "$base" && -w "$base" ]] || continue
+        (( $(free_mb "$base") >= need )) || continue
+        FC_ROOT="$(mktemp -d "$base/make_bastion.XXXXXX")" && return 0
+    done
+    return 1
+}
+
+# freshclam, travaillant sous /tmp (profil AppArmor), puis copie du résultat
+# dans <stage>. Retourne 0 si OK.
+run_freshclam() { # <stage>
+    local stage="$1" seed_mb need rc
+    seed_mb="$(du -sm "$BASTION/clamav" 2>/dev/null | cut -f1)"
+    need=$(( ${seed_mb:-0} + 450 ))
+    if ! pick_fc_root "$need"; then
+        warn "moins de ${need} Mo libres dans /tmp et /var/tmp : freshclam travaille sur la clé (échec probable si AppArmor le confine)"
+        FC_ROOT="$WORK/fc"
+    fi
+    mkdir -p "$FC_ROOT/db"
+    find "$stage" -maxdepth 1 -type f \( -name '*.cvd' -o -name '*.cld' \) -exec cp -f {} "$FC_ROOT/db"/ \;
+    {
+        echo "DatabaseDirectory $FC_ROOT/db"
+        echo "DatabaseMirror database.clamav.net"
+        (( $(id -u) == 0 )) && echo "DatabaseOwner root"
+    } > "$FC_ROOT/freshclam.conf"
+
+    freshclam --stdout --config-file="$FC_ROOT/freshclam.conf" --datadir="$FC_ROOT/db"
+    rc=$?
+    if (( rc == 0 || rc == 1 )); then
+        find "$stage" -maxdepth 1 -type f \( -name '*.cvd' -o -name '*.cld' \) -delete
+        cp -f "$FC_ROOT"/db/*.cvd "$FC_ROOT"/db/*.cld "$stage"/ 2>/dev/null
+        rc=0
+    else
+        err "freshclam a échoué (code $rc ; version : $(freshclam --version 2>/dev/null | head -n1))"
+        if [[ "$(cat /sys/module/apparmor/parameters/enabled 2>/dev/null)" == "Y" ]]; then
+            warn "AppArmor est actif : si freshclam est bloqué, voir « journalctl -k | grep -i 'apparmor.*freshclam' »"
+        fi
+        rc=1
+    fi
+    rm -rf "$FC_ROOT"; FC_ROOT=""
+    return "$rc"
+}
+
 do_clamav() {
     info "── ClamAV (bases officielles) ──"
-    local stage="$WORK/clamav"
+    local stage="$WORK/clamav" got=0
     seed_stage "$BASTION/clamav" "$stage"
     find "$stage" -type f ! -name '*.cvd' ! -name '*.cld' -delete 2>/dev/null
 
     if have freshclam; then
         info "freshclam (mise à jour incrémentale depuis le contenu de la clé)…"
-        local conf="$WORK/freshclam.conf"
-        {
-            echo "DatabaseDirectory $stage"
-            echo "DatabaseMirror database.clamav.net"
-            echo "DatabaseOwner $(id -un)"
-            echo "ScriptedUpdates yes"
-            echo "Bytecode yes"
-        } > "$conf"
-        freshclam --stdout --config-file="$conf" --datadir="$stage"
-        local rc=$?
-        if (( rc != 0 && rc != 1 )); then
-            err "freshclam a échoué (code $rc)"
-            return 1
-        fi
+        run_freshclam "$stage" && got=1
+        (( got )) || warn "repli sur téléchargement direct (ClamAV peut répondre 429 : trop de requêtes)"
     else
         warn "freshclam absent : repli sur téléchargement direct (ClamAV peut répondre 429)"
+    fi
+
+    if (( ! got )); then
         local f
         for f in main daily bytecode; do
             info "téléchargement de $f.cvd…"
@@ -279,14 +356,21 @@ valid_text_sig() { # fichier taille_min
 
 do_thirdparty() {
     info "── Signatures tierces ClamAV ──"
-    local stage="$WORK/thirdparty" good=0 bad=0 badnames=()
+    local stage="$WORK/thirdparty" good=0 bad=0 badnames=() skipped_uh=0
     seed_stage "$BASTION/clamav-thirdparty" "$stage"
-    local file url url2 minb tmp
+    local file url url2 minb tmp fetched
     while IFS='|' read -r file url url2 minb; do
         [[ -z "$file" || "$file" == \#* ]] && continue
         tmp="$stage/.$file.part"
-        if fetch "$url" "$tmp" 90 \
-           || { [[ -n "$url2" ]] && fetch "$url2" "$tmp" 90; }; then
+        fetched=1
+        if [[ "$url" == "@ABUSECH_KEY@" ]]; then
+            # URLhaus : export ClamAV réservé aux porteurs d'une clé abuse.ch
+            if [[ -z "$ABUSECH_KEY" ]]; then skipped_uh=1; continue; fi
+            fetch_secret "https://urlhaus-api.abuse.ch/v2/files/exports/${ABUSECH_KEY}/urlhaus_clamav.ndb" "$tmp" 90 || fetched=0
+        else
+            fetch "$url" "$tmp" 90 || { [[ -n "$url2" ]] && fetch "$url2" "$tmp" 90; } || fetched=0
+        fi
+        if (( fetched )); then
             if valid_text_sig "$tmp" "${minb:-64}"; then
                 mv -f "$tmp" "$stage/$file"; good=$((good + 1)); continue
             fi
@@ -296,6 +380,9 @@ do_thirdparty() {
         fi
         rm -f "$tmp"; bad=$((bad + 1))
     done <<< "$THIRD_PARTY_LIST"
+    if (( skipped_uh )); then
+        info "URLhaus ignoré : abuse.ch exige une clé depuis le 21/10/2026 (option --abusech-key)"
+    fi
     if (( bad > 0 && bad <= 8 )); then
         local b; for b in "${badnames[@]}"; do warn "$b — version précédente conservée"; done
     elif (( bad > 8 )); then
