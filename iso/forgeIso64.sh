@@ -1308,94 +1308,12 @@ HOOK
 chmod +x config/hooks/normal/0300-system-config.hook.chroot
 ok "Hook système OpenBox kiosque créé"
 
-cat > config/hooks/normal/0400-permissions.hook.chroot << 'HOOK'
-#!/bin/bash
-set -euo pipefail
-echo ">>> [Hook Permissions] Finalisation..."
-
-# Application Python
-chmod 644 /opt/usb-antivirus/*.py
-chmod 755 /opt/usb-antivirus
-
-# ClamAV – bases officielles + signatures tierces
-mkdir -p /var/lib/clamav /var/log/clamav /var/run/clamav
-chown -R clamav:clamav /var/lib/clamav /var/log/clamav /var/run/clamav 2>/dev/null || true
-chmod 755 /var/lib/clamav /var/log/clamav /var/run/clamav
-# Bases officielles
-find /var/lib/clamav \( -name "*.cvd" -o -name "*.cld" \) 2>/dev/null \
-    | xargs chmod 644 2>/dev/null || true
-# Signatures tierces (toutes extensions ClamAV tierces)
-find /var/lib/clamav \( -name "*.ndb" -o -name "*.hdb" -o -name "*.hsb" \
-    -o -name "*.db" -o -name "*.ftm" -o -name "*.ldb" \
-    -o -name "*.cdb" -o -name "*.fp" \) 2>/dev/null \
-    | xargs chown clamav:clamav 2>/dev/null || true
-find /var/lib/clamav \( -name "*.ndb" -o -name "*.hdb" -o -name "*.hsb" \
-    -o -name "*.db" -o -name "*.ftm" -o -name "*.ldb" \
-    -o -name "*.cdb" -o -name "*.fp" \) 2>/dev/null \
-    | xargs chmod 644 2>/dev/null || true
-# Validation au moment du hook permissions — même algorithme que le hook 0150.
-# Boucle while : recommence depuis zéro après chaque suppression pour éviter
-# de faussement supprimer des fichiers innocents.
-# Important : on utilise un fichier temporaire vide, PAS /dev/null.
-# /dev/null est un fichier spécial rejeté par clamscan avec code 2 + "Not
-# supported file type", ce qui déclencherait un faux positif d'erreur de base.
-if command -v clamscan &>/dev/null; then
-    _CVAL_TMP="$(mktemp /tmp/clamval_XXXXXX)"
-    if ! clamscan --no-summary --database=/var/lib/clamav "$_CVAL_TMP" &>/dev/null; then
-        echo ">>> [Hook Perms] ⚠ Base invalide — isolation en cours…"
-        CULPRITS_P=0
-        while ! clamscan --no-summary --database=/var/lib/clamav "$_CVAL_TMP" &>/dev/null; do
-            QDIR="$(mktemp -d /tmp/clamav_perms_quar_XXXXXX)"
-            FOUND_P=false
-            for f in /var/lib/clamav/*.ndb /var/lib/clamav/*.hdb /var/lib/clamav/*.hsb \
-                     /var/lib/clamav/*.db  /var/lib/clamav/*.ftm /var/lib/clamav/*.ldb \
-                     /var/lib/clamav/*.cdb /var/lib/clamav/*.fp; do
-                [ -f "$f" ] || continue
-                BNAME=$(basename "$f")
-                mv "$f" "$QDIR/"
-                if clamscan --no-summary --database=/var/lib/clamav "$_CVAL_TMP" &>/dev/null; then
-                    echo "    Suppression : $BNAME (coupable)"
-                    rm -f "$QDIR/$BNAME"
-                    CULPRITS_P=$((CULPRITS_P + 1))
-                    FOUND_P=true
-                    break
-                else
-                    mv "$QDIR/$BNAME" /var/lib/clamav/
-                fi
-            done
-            rm -rf "$QDIR"
-            if ! $FOUND_P; then
-                echo ">>> [Hook Perms] ⚠ Conflit non isolable — purge des fichiers tiers."
-                find /var/lib/clamav \( -name "*.ndb" -o -name "*.hdb" -o -name "*.hsb" \
-                    -o -name "*.db" -o -name "*.ftm" -o -name "*.ldb" \
-                    -o -name "*.cdb" -o -name "*.fp" \) -delete 2>/dev/null || true
-                break
-            fi
-        done
-        [ "$CULPRITS_P" -gt 0 ] && echo ">>> [Hook Perms] ✅ Base assainie ($CULPRITS_P fichier(s) retiré(s))."
-    fi
-    rm -f "$_CVAL_TMP"
-fi
-
-# YARA
-chmod -R 755 /var/lib/yara-rules
-
-# Avast (si installé)
-if [ -d /etc/avast ]; then
-    chmod 755 /etc/avast
-    # Le fichier de licence sera déposé par l'administrateur
-    [ -f /etc/avast/license.avastlic ] && chmod 644 /etc/avast/license.avastlic || true
-fi
-if [ -d /var/lib/avast ]; then
-    chmod -R 755 /var/lib/avast 2>/dev/null || true
-fi
-
-chown -R scanner:scanner /home/scanner/ 2>/dev/null || true
-
-echo ">>> [Hook Permissions] OK ✅"
-HOOK
-chmod +x config/hooks/normal/0400-permissions.hook.chroot
-ok "Hook permissions créé"
+# (Hook 0400 : voir « Hook final » plus bas. Une première version, plus longue —
+#  validation ClamAV avec purge des signatures tierces, chmod -R sur /var/lib/avast —
+#  était définie ici puis écrasée par celle de « Hook final » (même nom de fichier) :
+#  elle n'a jamais été exécutée. Supprimée : permissions déjà posées à la copie des
+#  fichiers, validation déjà faite par le hook 0150, et sa purge se déclenchait au
+#  moindre code de retour non nul de clamscan, y compris un manque de mémoire.)
 
 # ── Hook 4.5 : script post-installation exécuté après Calamares ───────────────
 # Ce script est lancé par un service systemd oneshot sur le SYSTÈME INSTALLÉ
