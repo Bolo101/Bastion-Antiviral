@@ -11,11 +11,16 @@
 # ║    sudo apt install live-build xorriso syslinux wget curl python3 unzip     ║
 # ║                                                                              ║
 # ║  Structure du projet :                                                       ║
-# ║    ../code/      → les 8 fichiers Python du scanner                         ║
+# ║    ../code/      → les fichiers Python de l'application (liste vérifiée     ║
+# ║                    plus bas, dont scanner.py, yara_worker.py, bastion_update.py)║
 # ║    ../database/  → (optionnel) .cvd/.yar pré-téléchargés                   ║
 # ║                                                                              ║
 # ║  Exécution :                                                                 ║
 # ║    chmod +x forgeIsoXfce.sh && sudo ./forgeIsoXfce.sh                      ║
+# ║                                                                              ║
+# ║  Option : clé abuse.ch pour la signature ClamAV URLhaus (sinon ignorée) :   ║
+# ║    sudo env ABUSECH_AUTH_KEY=VOTRE_CLE ./forgeIsoXfce.sh                    ║
+# ║    (depuis le 21/10/2026 le téléchargement sans clé répond 410 Gone)        ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
 set -euo pipefail
@@ -46,7 +51,7 @@ done
 for f in config.py log_handler.py admin_auth.py usb_manager.py \
           db_manager.py scanner.py sandbox.py userns_exec.py yara_worker.py \
           sandbox_selftest.py validated_supports.py reports.py export_manager.py \
-          landlock_exec.py \
+          landlock_exec.py bastion_update.py \
           gui.py main.py pdf_viewer.py utils.py; do
     [[ -f "$CODE_DIR/$f" ]] || err "Fichier manquant dans $CODE_DIR : $f"
 done
@@ -212,6 +217,8 @@ evince
 clamav
 clamav-daemon
 clamav-freshclam
+# Détection de rootkits sur le système hôte (lancement manuel : sudo chkrootkit)
+chkrootkit
 # Avast for Linux – installé depuis le dépôt officiel repo.avcdn.net
 # (le hook 0250 configure le dépôt et installe le paquet)
 # avast  ← ajouté dynamiquement par le hook 0250
@@ -528,19 +535,24 @@ fi
 # ── InterServer ───────────────────────────────────────────────────────────────
 echo ">>> [Hook TP] InterServer…" | tee -a "$LOG"
 install_and_validate "http://sigs.interserver.net/interserver256.hdb" "interserver256.hdb" 500 || true
-install_and_validate "http://sigs.interserver.net/topline.db"          "topline.db"          500 || true
+install_and_validate "http://sigs.interserver.net/interservertopline.db" "interservertopline.db" 500 || true
 
 # ── URLhaus (abuse.ch) ────────────────────────────────────────────────────────
+# Depuis le 21/10/2026 abuse.ch exige une clé d'authentification pour l'export
+# ClamAV (l'ancienne URL répond 410, le miroir malware-filter 404). La clé n'est
+# JAMAIS écrite dans ce hook : le fichier est pré-téléchargé sur la machine de
+# build quand ABUSECH_AUTH_KEY y est défini ; il est alors déjà dans $DB_DIR.
 echo ">>> [Hook TP] URLhaus…" | tee -a "$LOG"
-URLHAUS_OK=false
-for _url in \
-    "https://urlhaus.abuse.ch/downloads/urlhaus.ndb" \
-    "https://curbengh.github.io/malware-filter/urlhaus-filter-clam.ndb"; do
-    if install_and_validate "$_url" "urlhaus-filter.ndb" 1000; then
-        URLHAUS_OK=true; break
+if [[ -f "$DB_DIR/urlhaus-filter.ndb" ]]; then
+    if _db_ok; then
+        echo "  ✅ urlhaus-filter.ndb présent (pré-téléchargé avec la clé abuse.ch)" | tee -a "$LOG"
+    else
+        echo "  ⚠ urlhaus-filter.ndb incompatible avec la base — supprimé" | tee -a "$LOG"
+        rm -f "$DB_DIR/urlhaus-filter.ndb"
     fi
-done
-$URLHAUS_OK || echo "  ⚠ URLhaus inaccessible — ignoré." | tee -a "$LOG"
+else
+    echo "  ↷ URLhaus ignoré (clé abuse.ch requise — voir ABUSECH_AUTH_KEY)" | tee -a "$LOG"
+fi
 
 # ── Bilan final ───────────────────────────────────────────────────────────────
 TP_FINAL=$(find "$DB_DIR" \( \
@@ -1282,6 +1294,15 @@ systemctl disable clamav-daemon    2>/dev/null || true
 systemctl disable avast.target     2>/dev/null || true
 systemctl disable avast            2>/dev/null || true
 
+# chkrootkit : disponible en ligne de commande (sudo chkrootkit), mais jamais
+# lancé automatiquement (le paquet fournit un cron/timer quotidien).
+for _u in $(ls /usr/lib/systemd/system /lib/systemd/system 2>/dev/null \
+            | grep -E '^chkrootkit.*\.(timer|service)$' | sort -u); do
+    systemctl disable "$_u" 2>/dev/null || true
+done
+[ -f /etc/chkrootkit/chkrootkit.conf ] && \
+    sed -i 's/^RUN_DAILY=.*/RUN_DAILY="false"/' /etc/chkrootkit/chkrootkit.conf || true
+
 echo ">>> [Hook Système] OpenBox kiosque OK ✅"
 HOOK
 chmod +x config/hooks/normal/0300-system-config.hook.chroot
@@ -1774,23 +1795,39 @@ $_SANE_OK || warn "Aucune source Sanesecurity joignable. L'image fonctionnera av
 
 # ── InterServer (nouvelle URL — sigs.interserver.net) ─────────────────────────
 # L'ancienne URL interserver.net/virus-l/ retournait 403.
-# Fichiers disponibles : interserver256.hdb, shell.ldb, topline.db
-for _ifile in "interserver256.hdb" "topline.db"; do
+# Fichiers disponibles : interserver256.hdb, shell.ldb, interservertopline.db
+# (« topline.db » n'existe pas : 404 — le fichier s'appelle interservertopline.db)
+for _ifile in "interserver256.hdb" "interservertopline.db"; do
     _dl_tp "http://sigs.interserver.net/$_ifile" "$CLAMAV_CHROOT/$_ifile" 500 || true
 done
 
 # ── URLhaus (abuse.ch) ────────────────────────────────────────────────────────
-# L'accès direct abuse.ch nécessite désormais une auth-key.
-# On tente néanmoins l'URL publique historique puis le miroir GitHub.
-_URLHAUS_OK=false
-for _url in \
-    "https://urlhaus.abuse.ch/downloads/urlhaus.ndb" \
-    "https://curbengh.github.io/malware-filter/urlhaus-filter-clam.ndb"; do
-    if _dl_tp "$_url" "$CLAMAV_CHROOT/urlhaus-filter.ndb" 1000; then
-        _URLHAUS_OK=true; break
+# Depuis le 21/10/2026 abuse.ch n'offre plus de téléchargement sans clé (410 Gone) ;
+# l'export ClamAV exige une clé d'authentification (« Auth-Key », gratuite, inscription
+# sur auth.abuse.ch — vérifier les conditions d'abuse.ch pour votre usage). Sans clé,
+# URLhaus est simplement ignoré. La clé passe par stdin (curl -K -) : elle n'apparaît
+# ni dans la liste des processus, ni dans les messages, ni dans les journaux.
+if [[ -n "${ABUSECH_AUTH_KEY:-}" ]]; then
+    if [[ ! "$ABUSECH_AUTH_KEY" =~ ^[A-Za-z0-9._~-]+$ ]]; then
+        warn "ABUSECH_AUTH_KEY invalide (lettres, chiffres, . _ ~ - uniquement) — URLhaus ignoré"
+    else
+        _UH_TMP="$(mktemp /tmp/urlhaus_XXXXXX)"
+        if printf 'url = "%s"\n' \
+               "https://urlhaus-api.abuse.ch/v2/files/exports/${ABUSECH_AUTH_KEY}/urlhaus_clamav.ndb" \
+           | curl -fsSL --connect-timeout 15 --max-time 120 -K - -o "$_UH_TMP" 2>/dev/null \
+           && [[ "$(stat -c%s "$_UH_TMP" 2>/dev/null || echo 0)" -ge 1000 ]] \
+           && _is_valid_clamav_file "$_UH_TMP"; then
+            mv "$_UH_TMP" "$CLAMAV_CHROOT/urlhaus-filter.ndb"
+            chmod 644 "$CLAMAV_CHROOT/urlhaus-filter.ndb"
+            ok "urlhaus-filter.ndb inclus ($(du -h "$CLAMAV_CHROOT/urlhaus-filter.ndb" | cut -f1)) — clé abuse.ch"
+        else
+            rm -f "$_UH_TMP"
+            warn "URLhaus : téléchargement refusé (clé invalide, expirée ou service indisponible) — ignoré"
+        fi
     fi
-done
-$_URLHAUS_OK || warn "URLhaus inaccessible (auth-key requise ?) — signature ignorée"
+else
+    warn "URLhaus ignoré : abuse.ch exige une clé depuis le 21/10/2026 (sudo env ABUSECH_AUTH_KEY=… ./forgeIso64.sh)"
+fi
 
 # Comptage final — pas de validation clamscan ici.
 # Raison : clamscan --database="fichier_unique" retourne toujours une erreur
@@ -2064,6 +2101,8 @@ chmod 0755 /opt/usb-antivirus /usr/local/bin/usb-antivirus \
 chown -R scanner:scanner /home/scanner /opt/pdf /opt/img 2>/dev/null || true
 install -d -o scanner -g scanner -m 0755 /var/log/usb-antivirus
 python3 -m compileall -q /opt/usb-antivirus
+command -v chkrootkit >/dev/null 2>&1 \
+    || echo ">>> [Hook Permissions] ⚠ chkrootkit absent de l'image" >&2
 HOOK
 chmod 0755 config/hooks/normal/0400-permissions.hook.chroot
 ok "Hook de permissions finales créé"
@@ -2278,6 +2317,7 @@ echo "║  ClamAV      : $CV_COUNT fichier(s) de base officielle(s)"
 echo "║  Signatures  : $TP_COUNT fichier(s) tiers (Sanesecurity, InterServer, URLhaus)"
 echo "║  Avast       : installé (licence requise via panneau Admin)"
 echo "║  YARA        : $YR_COUNT règle(s) signature-base incluses"
+echo "║  chkrootkit  : installé (lancement manuel : sudo chkrootkit)"
 echo "║  Clavier     : AZERTY (fr)"
 echo "║  Autologin   : scanner  (sudo sans mot de passe)"
 echo "║  Code admin  : 0000  (À CHANGER au premier démarrage !)"
