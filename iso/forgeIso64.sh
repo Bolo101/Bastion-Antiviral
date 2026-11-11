@@ -57,6 +57,32 @@ for f in config.py log_handler.py admin_auth.py usb_manager.py \
 done
 ok "Pré-requis OK"
 
+# ── Vérification de l'horloge ─────────────────────────────────────────────────
+# apt refuse un dépôt dont la signature est datée « dans le futur » (« Not live
+# until … ») et TLS refuse un certificat « pas encore valide » : sur une machine
+# ou une VM à l'horloge en retard, le build échoue bien plus tard, en plein
+# lb build. On compare l'heure locale à l'en-tête HTTP « Date » d'un miroir Debian
+# (HTTP simple : fonctionne même quand l'horloge fait échouer HTTPS).
+step "Vérification de l'horloge système..."
+_srv_hdr="$(curl -fsSI --max-time 10 http://deb.debian.org/debian/ 2>/dev/null \
+            | tr -d '\r' | awk -F': ' 'tolower($1)=="date"{print $2; exit}' || true)"
+_srv_epoch=0
+[[ -n "$_srv_hdr" ]] && _srv_epoch="$(date -d "$_srv_hdr" +%s 2>/dev/null || echo 0)"
+if (( _srv_epoch > 0 )); then
+    _skew=$(( $(date +%s) - _srv_epoch ))
+    if (( _skew > 300 || _skew < -300 )); then
+        echo -e "${RED}   Heure locale : $(date -u '+%F %T') UTC — serveur Debian : $(date -u -d "@${_srv_epoch}" '+%F %T') UTC  (écart : ${_skew}s)${RESET}"
+        echo "   Corrigez l'horloge, puis relancez ce script :"
+        echo "     sudo timedatectl set-ntp true && sudo systemctl restart systemd-timesyncd"
+        echo "     VM : activez la synchronisation de l'heure avec l'hôte (ou « sudo date -s … »"
+        echo "          puis « sudo hwclock --systohc »)."
+        err "Horloge décalée : apt refuserait les dépôts (« Not live until… ») et les certificats TLS."
+    fi
+    ok "Horloge synchronisée (écart ${_skew}s)"
+else
+    warn "Heure du serveur Debian indisponible : horloge non vérifiée"
+fi
+
 # ── Installation des outils de build ─────────────────────────────────────────
 step "Installation des dépendances de build..."
 apt-get update -qq

@@ -13,6 +13,8 @@ Usage : yara_worker.py <répertoire_règles> <cible> [<cible> …]
 import json
 import os
 import sys
+import tempfile
+import time
 
 TIMEOUT = 15
 BATCH = 100          # taille des lots du repli (si la compilation groupée échoue)
@@ -21,6 +23,13 @@ BATCH = 100          # taille des lots du repli (si la compilation groupée éch
 # « owner » est requis par certaines règles de signature-base (THOR).
 EXTERNALS = {"filename": "", "filepath": "", "extension": "",
              "filetype": "", "owner": ""}
+
+
+# Règle témoin : compilée dans l'ensemble avec toutes les autres, puis testée sur un
+# tampon connu AVANT l'analyse. Elle PROUVE que l'ensemble chargé détecte réellement
+# (et pas seulement qu'il « compile »). Elle n'est jamais signalée comme détection.
+CANARY_RULE = "__bastion_selftest"
+CANARY_TEXT = "BASTION-YARA-SELFTEST-5c1e9b7a"
 
 
 def emit(**kw) -> None:
@@ -74,6 +83,18 @@ def main() -> int:
         except Exception as e:
             emit(type="warn", msg=f"Erreur compilation ({os.path.basename(rf)}) : {e}")
 
+    # Règle témoin (fichier temporaire : /tmp du sandbox, jamais sur le support)
+    canary_path = None
+    if valid:
+        try:
+            fd, canary_path = tempfile.mkstemp(prefix="bastion_selftest_", suffix=".yar")
+            with os.fdopen(fd, "w") as cf:
+                cf.write('rule %s { strings: $a = "%s" condition: $a }\n'
+                         % (CANARY_RULE, CANARY_TEXT))
+            valid["rcanary"] = canary_path
+        except OSError:
+            canary_path = None
+
     # 2) UN SEUL ensemble compilé (≈ 65 Mo pour signature-base complet) et une
     #    seule passe par fichier analysé.
     compiled = []
@@ -81,7 +102,7 @@ def main() -> int:
     if valid:
         try:
             compiled.append(yara.compile(filepaths=valid, externals=EXTERNALS))
-            n_files = len(valid)
+            n_files = len(valid) - (1 if canary_path else 0)
         except Exception as e:
             emit(type="warn", msg=f"Compilation groupée impossible ({e}) : repli par lots")
             items = list(valid.items())
@@ -89,20 +110,53 @@ def main() -> int:
                 chunk = dict(items[k:k + BATCH])
                 try:
                     compiled.append(yara.compile(filepaths=chunk, externals=EXTERNALS))
-                    n_files += len(chunk)
+                    n_files += len(chunk) - (1 if "rcanary" in chunk else 0)
                 except Exception as e2:
                     emit(type="warn", msg=f"Lot de règles ignoré : {e2}")
+    if canary_path:
+        try:
+            os.unlink(canary_path)
+        except OSError:
+            pass
 
     if not compiled:
         emit(type="error", msg="aucune règle valide après compilation")
         return 4
-    emit(type="compiled", count=n_files)
+
+    # Nombre de règles individuelles réellement chargées (hors règle témoin)
+    n_rules = 0
+    try:
+        for rs in compiled:
+            n_rules += sum(1 for r in rs if r.identifier != CANARY_RULE)
+    except Exception:
+        n_rules = 0
+    emit(type="compiled", count=n_files, rules=n_rules)
+
+    # Auto-test : la règle témoin doit être détectée sur un tampon connu
+    if canary_path:
+        selftest_ok = False
+        try:
+            for rs in compiled:
+                if any(m.rule == CANARY_RULE for m in
+                       rs.match(data=("x " + CANARY_TEXT + " x").encode(),
+                                externals=dict(EXTERNALS))):
+                    selftest_ok = True
+        except Exception:
+            selftest_ok = False
+        emit(type="selftest", ok=selftest_ok)
+        if not selftest_ok:
+            emit(type="error", msg="auto-test échoué : la règle témoin n'est pas "
+                                   "détectée, le moteur YARA est inutilisable")
+            return 5
 
     scanned = 0
     unreadable = 0
+    scanned_bytes = 0
+    hit_count = 0
+    t_scan = time.time()
 
     def scan_file(fp: str) -> None:
-        nonlocal scanned, unreadable
+        nonlocal scanned, unreadable, scanned_bytes, hit_count
         fd = None
         try:
             ext = os.path.splitext(fp)[1].lstrip(".").lower()
@@ -122,7 +176,14 @@ def main() -> int:
                 match_path = f"/proc/self/fd/{fd}"
             for rules in compiled:
                 for m in rules.match(match_path, externals=exts, timeout=TIMEOUT):
+                    if m.rule == CANARY_RULE:
+                        continue              # règle témoin : jamais une détection
+                    hit_count += 1
                     emit(type="hit", path=fp, rule=m.rule)
+            try:                              # octets réellement passés à YARA
+                scanned_bytes += os.path.getsize(fp)
+            except OSError:
+                pass
         except Exception:
             # Fichier non (entièrement) analysé — illisible, délai dépassé, erreur
             # du moteur… : le signaler, ne JAMAIS le laisser passer pour sain.
@@ -144,7 +205,9 @@ def main() -> int:
                     if os.path.isfile(fp) and not os.path.islink(fp):
                         scan_file(fp)
 
-    emit(type="done", scanned=scanned, unreadable=unreadable)
+    emit(type="done", scanned=scanned, unreadable=unreadable,
+         bytes=scanned_bytes, hits=hit_count,
+         secs=round(time.time() - t_scan, 2))
     return 0
 
 

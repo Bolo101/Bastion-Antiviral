@@ -71,6 +71,15 @@ _SYSTEM_PREFIXES = ("/usr/", "/bin/", "/sbin/", "/lib/", "/lib32/", "/lib64/",
 _CLAMAV_CERTS_DIR = "/etc/clamav/certs"
 
 
+def _fmt_size(n: int) -> str:
+    """Taille lisible : o, Ko ou Mo."""
+    if n < 1024:
+        return f"{n} o"
+    if n < 1048576:
+        return f"{n / 1024:.0f} Ko"
+    return f"{n / 1048576:.1f} Mo"
+
+
 def _clean(text, maxlen: int = _MAX_MSG) -> str:
     """Texte provenant d'un moteur : sans caractères de contrôle, longueur bornée."""
     if not isinstance(text, str):
@@ -111,9 +120,34 @@ class ScanResult:
     engines_ran: List[str] = field(default_factory=list)   # analyses terminées normalement
     sandboxed:   bool      = False                         # tout s'est exécuté dans le sandbox
 
+    # Moteurs demandés pour ce scan (pour afficher ceux qui n'ont PAS tourné)
+    engines_requested: List[str] = field(default_factory=list)
+
+    # Preuves d'exploitation de YARA (renseignées par le worker, non fiables → bornées)
+    yara_rule_files: int   = 0      # fichiers de règles compilés
+    yara_rules:      int   = 0      # règles individuelles chargées
+    yara_selftest:   Optional[bool] = None   # règle témoin détectée ? (None = non exécuté)
+    yara_bytes:      int   = 0      # octets réellement passés à YARA
+    yara_seconds:    float = 0.0    # durée de l'analyse (hors compilation)
+
     def mark_ran(self, engine: str) -> None:
         if engine not in self.engines_ran:
             self.engines_ran.append(engine)
+
+    def engines_line(self) -> str:
+        """Une ligne : état de chaque moteur demandé (✔ terminé / ✘ non terminé)."""
+        counts = {"ClamAV": self.scanned_clamav, "Avast": self.scanned_avast,
+                  "YARA": self.scanned_yara}
+        parts = []
+        for name in self.engines_requested:
+            if name in self.engines_ran:
+                extra = f"{counts.get(name, 0)} fichier(s)"
+                if name == "YARA" and self.yara_rules:
+                    extra += f", {self.yara_rules} règle(s)"
+                parts.append(f"✔ {name} ({extra})")
+            else:
+                parts.append(f"✘ {name} NON TERMINÉ")
+        return ("Moteurs : " + "  ·  ".join(parts)) if parts else ""
 
     def summary(self) -> str:
         lines = [
@@ -130,6 +164,11 @@ class ScanResult:
             if self.scanned_yara:
                 detail_parts.append(f"YARA:{self.scanned_yara}")
             lines.append(f"  ({' | '.join(detail_parts)})")
+        if self.yara_rules:
+            lines.append(f"YARA : {self.yara_rules} règle(s) de {self.yara_rule_files} "
+                         f"fichier(s), {_fmt_size(self.yara_bytes)} analysés"
+                         + ("" if self.yara_selftest is None else
+                            "  [auto-test OK]" if self.yara_selftest else "  [AUTO-TEST ÉCHOUÉ]"))
         if self.threats:
             lines.append("\nDétail des menaces :")
             for t in self.threats[:20]:
@@ -357,6 +396,8 @@ class ScanEngine:
         result = ScanResult()
         start  = time.time()
         cb     = progress_cb
+        result.engines_requested = [n for n, wanted in (
+            ("ClamAV", use_clamav), ("Avast", use_avast), ("YARA", use_yara)) if wanted]
 
         if remove_infected:
             log_warning("scan(remove_infected=True) ignoré : supports en lecture seule.")
@@ -392,6 +433,12 @@ class ScanEngine:
 
         result.sandboxed = bool(use_sb and not self._unsandboxed)
         result.duration = time.time() - start
+
+        # Synthèse : quels moteurs ont réellement terminé leur analyse ?
+        line = result.engines_line()
+        if cb and line and not result.stopped:
+            all_ran = all(n in result.engines_ran for n in result.engines_requested)
+            cb(line, "ok" if all_ran else "warning")
         log_info(
             f"Scan terminé : {result.scanned} fichiers, "
             f"{result.infected} menace(s), {result.duration:.1f}s  "
@@ -911,6 +958,10 @@ class ScanEngine:
         done: Optional[Tuple[int, int]] = None      # (analysés, illisibles)
         worker_error = False
         n_warn = 0
+        selftest: Optional[bool] = None             # règle témoin détectée ?
+        stats = {"rules": 0, "files": 0, "bytes": 0, "hits": 0, "secs": 0.0}
+        expected = self._count_files(targets)       # pour la progression (approximatif)
+        next_pct = 25
         stderr_f = tempfile.TemporaryFile()
         try:
             self._proc = self._launch(
@@ -947,10 +998,31 @@ class ScanEngine:
                         result.scanned_yara = n
                         if fcc:
                             fcc(max(result.scanned, n), result.infected)
+                        if cb and expected > 0:
+                            pct = min(100, n * 100 // expected)
+                            if pct >= next_pct and n < expected:
+                                cb(f"YARA : {n}/{expected} fichier(s) analysé(s) ({pct} %)…",
+                                   "info")
+                                next_pct = (pct // 25 + 1) * 25
                 elif kind == "compiled":
-                    n = msg.get("count")
+                    n, r = msg.get("count"), msg.get("rules")
+                    if isinstance(n, int) and 0 <= n < 10 ** 7:
+                        stats["files"] = n
+                    if isinstance(r, int) and 0 <= r < 10 ** 8:
+                        stats["rules"] = r
                     if cb and isinstance(n, int):
-                        cb(f"YARA : {n} fichier(s) de règles compilé(s).", "info")
+                        cb(f"YARA : {n} fichier(s) de règles compilé(s)"
+                           + (f" — {stats['rules']} règle(s) chargée(s)."
+                              if stats["rules"] else "."), "info")
+                elif kind == "selftest":
+                    selftest = msg.get("ok") is True
+                    if cb:
+                        if selftest:
+                            cb("YARA : auto-test OK — la règle témoin est détectée par "
+                               "l'ensemble chargé (le moteur détecte réellement).", "ok")
+                        else:
+                            cb("❌ YARA : auto-test ÉCHOUÉ — règle témoin non détectée.",
+                               "threat")
                 elif kind == "warn":
                     n_warn += 1
                     log_warning(f"YARA : {_clean(msg.get('msg'))}")
@@ -964,6 +1036,13 @@ class ScanEngine:
                     s, u = msg.get("scanned"), msg.get("unreadable")
                     if isinstance(s, int) and isinstance(u, int) and s >= 0 and u >= 0:
                         done = (s, u)
+                        b, h, t = msg.get("bytes"), msg.get("hits"), msg.get("secs")
+                        if isinstance(b, int) and 0 <= b < 10 ** 14:
+                            stats["bytes"] = b
+                        if isinstance(h, int) and 0 <= h < 10 ** 9:
+                            stats["hits"] = h
+                        if isinstance(t, (int, float)) and 0 <= t < 10 ** 7:
+                            stats["secs"] = float(t)
             self._proc.wait()
             rc = self._proc.returncode
             if self._stop:
@@ -1012,15 +1091,41 @@ class ScanEngine:
             return
 
         scanned, unreadable = done
+        analysed = scanned - unreadable
         result.scanned_yara = scanned
         result.scanned = max(result.scanned, scanned)
+        result.yara_rule_files = stats["files"]
+        result.yara_rules = stats["rules"]
+        result.yara_selftest = selftest
+        result.yara_bytes = stats["bytes"]
+        result.yara_seconds = stats["secs"]
         if fcc:
             fcc(result.scanned, result.infected)
         if unreadable:
             # Un fichier non lu ne doit jamais passer pour sain
-            msg = f"⚠ YARA : {unreadable} fichier(s) illisible(s) ou non analysé(s)."
+            msg = (f"⚠ YARA : {analysed} fichier(s) analysé(s), {unreadable} illisible(s) ou "
+                   "non analysé(s) — analyse incomplète.")
             result.errors.append(msg)
             if cb:
                 cb(msg, "warning")
             return
+        if expected > 0 and analysed == 0:
+            msg = "⚠ YARA : AUCUN fichier analysé alors que le support en contient."
+            result.errors.append(msg)
+            if cb:
+                cb(msg, "warning")
+            return
+        if cb:
+            hits = stats["hits"]
+            if analysed == 0:
+                cb("✅ YARA : analyse terminée — aucun fichier à analyser sur ce support "
+                   "(les règles sont chargées et l'auto-test est passé).", "ok")
+            else:
+                size = (f" ({_fmt_size(stats['bytes'])})" if stats["bytes"] else "")
+                rules = (f" avec {stats['rules']} règle(s)" if stats["rules"] else "")
+                cb(("⚠" if hits else "✅")
+                   + f" YARA : analyse TERMINÉE — {analysed} fichier(s) analysé(s){size}"
+                   f"{rules} en {stats['secs']:.1f}s — "
+                   + (f"{hits} détection(s)." if hits else "aucune détection."),
+                   "threat" if hits else "ok")
         result.mark_ran("YARA")
