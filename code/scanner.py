@@ -1,33 +1,96 @@
 #!/usr/bin/env python3
 """
-scanner.py – Moteur de scan combiné ClamAV + Avast + YARA.
+scanner.py – Moteur de scan combiné ClamAV + Avast + YARA, chaque moteur étant
+exécuté dans un sandbox éphémère (voir sandbox.py).
 
-Moteurs disponibles :
-  • ClamAV  – clamscan (toujours disponible si installé)
-  • Avast   – binaire scan/avast (requiert licence dans /etc/avast/)
-  • YARA    – python-yara (prioritaire) ou binaire yara (secours)
+Moteurs :
+  • ClamAV  – clamscan, dans le sandbox
+  • Avast   – CLI `scan` / `avast scan` (licence requise), dans le sandbox
+              (AVAST_SANDBOX_MODE = "strict") ou via le démon (mode "daemon",
+              analyse faite hors sandbox : le support n'est alors PAS validé)
+  • YARA    – yara_worker.py dans le sandbox : le GUI ne charge ni ne compile
+              jamais de règles et n'ouvre aucun fichier du support
 
-Le scan est séquentiel : ClamAV → Avast → YARA.
-Les résultats des trois moteurs sont agrégés dans un ScanResult unique.
+Le scan est séquentiel : ClamAV → Avast → YARA. Les résultats sont agrégés dans
+un ScanResult unique.
+
+Politique sandbox (config.py) :
+  • sandbox actif                     → les moteurs y sont lancés
+  • sandbox absent + SANDBOX_REQUIRED → échec fermé : AUCUNE analyse
+  • sandbox absent + non requis       → analyse dégradée, support non validé
+
+Tout ce que renvoient les moteurs (lignes de sortie, JSON du worker) est traité
+comme NON FIABLE : texte nettoyé, taille limitée, et empreinte SHA-256 calculée
+uniquement pour un fichier ordinaire situé DANS les cibles analysées.
+
+ScanResult.engines_ran ne contient un moteur que si son analyse s'est terminée
+normalement ; ScanResult.sandboxed n'est vrai que si TOUS les moteurs lancés
+l'ont été dans le sandbox. Ce sont les deux conditions de validation d'un support.
 """
 
+import importlib.util
+import json
 import os
 import shutil
 import subprocess
+import sys
+import tempfile
+import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from config import (
     CLAMAV_DB_DIR,
     YARA_RULES_DIR,
+    AVAST_LICENSE_DIR,
     AVAST_LICENSE_PATH,
     AVAST_BIN_PATHS,
     AVAST_SCAN_BIN_PATHS,
+    AVAST_SANDBOX_MODE,
+    AVAST_DAEMON_SOCKET_DIRS,
 )
 from log_handler import log_error, log_info, log_warning
+from sandbox import Sandbox, SandboxUnavailable, sandbox_active, sandbox_policy_ok
 
 ProgressCB = Optional[Callable[[str, str], None]]   # (message, tag)
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_WORKER_HOST = os.path.join(_HERE, "yara_worker.py")
+_WORKER_IN_SANDBOX = "/opt/bastion/yara_worker.py"
+
+_MAX_LINE = 65536          # longueur max d'une ligne acceptée d'un moteur
+_MAX_THREATS = 20000       # menaces conservées en mémoire (le compteur continue)
+_MAX_MSG = 300             # longueur max d'un texte provenant d'un moteur
+_SYSTEM_PREFIXES = ("/usr/", "/bin/", "/sbin/", "/lib/", "/lib32/", "/lib64/",
+                    "/libx32/")
+# ClamAV ≥ 1.2 vérifie la signature des bases avec le certificat racine de ce
+# dossier ; sans lui, clamscan échoue dans le sandbox (qui ne monte que /usr et
+# quelques fichiers de /etc). Seul ce dossier (certificat PUBLIC) est monté.
+_CLAMAV_CERTS_DIR = "/etc/clamav/certs"
+
+
+def _fmt_size(n: int) -> str:
+    """Taille lisible : o, Ko ou Mo."""
+    if n < 1024:
+        return f"{n} o"
+    if n < 1048576:
+        return f"{n / 1024:.0f} Ko"
+    return f"{n / 1048576:.1f} Mo"
+
+
+def _clean(text, maxlen: int = _MAX_MSG) -> str:
+    """Texte provenant d'un moteur : sans caractères de contrôle, longueur bornée."""
+    if not isinstance(text, str):
+        return ""
+    out = []
+    for c in text:
+        if c == " " or c.isprintable():
+            out.append(c)
+        elif 0xDC80 <= ord(c) <= 0xDCFF:        # octet non UTF-8 d'un nom de fichier
+            out.append("\ufffd")
+    return "".join(out).strip()[:maxlen]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -53,6 +116,39 @@ class ScanResult:
     scanned_avast:   int = 0
     scanned_yara:    int = 0
 
+    # Conditions de validation d'un support (voir gui._eligible_for_validation)
+    engines_ran: List[str] = field(default_factory=list)   # analyses terminées normalement
+    sandboxed:   bool      = False                         # tout s'est exécuté dans le sandbox
+
+    # Moteurs demandés pour ce scan (pour afficher ceux qui n'ont PAS tourné)
+    engines_requested: List[str] = field(default_factory=list)
+
+    # Preuves d'exploitation de YARA (renseignées par le worker, non fiables → bornées)
+    yara_rule_files: int   = 0      # fichiers de règles compilés
+    yara_rules:      int   = 0      # règles individuelles chargées
+    yara_selftest:   Optional[bool] = None   # règle témoin détectée ? (None = non exécuté)
+    yara_bytes:      int   = 0      # octets réellement passés à YARA
+    yara_seconds:    float = 0.0    # durée de l'analyse (hors compilation)
+
+    def mark_ran(self, engine: str) -> None:
+        if engine not in self.engines_ran:
+            self.engines_ran.append(engine)
+
+    def engines_line(self) -> str:
+        """Une ligne : état de chaque moteur demandé (✔ terminé / ✘ non terminé)."""
+        counts = {"ClamAV": self.scanned_clamav, "Avast": self.scanned_avast,
+                  "YARA": self.scanned_yara}
+        parts = []
+        for name in self.engines_requested:
+            if name in self.engines_ran:
+                extra = f"{counts.get(name, 0)} fichier(s)"
+                if name == "YARA" and self.yara_rules:
+                    extra += f", {self.yara_rules} règle(s)"
+                parts.append(f"✔ {name} ({extra})")
+            else:
+                parts.append(f"✘ {name} NON TERMINÉ")
+        return ("Moteurs : " + "  ·  ".join(parts)) if parts else ""
+
     def summary(self) -> str:
         lines = [
             f"Fichiers analysés : {self.scanned}",
@@ -68,6 +164,11 @@ class ScanResult:
             if self.scanned_yara:
                 detail_parts.append(f"YARA:{self.scanned_yara}")
             lines.append(f"  ({' | '.join(detail_parts)})")
+        if self.yara_rules:
+            lines.append(f"YARA : {self.yara_rules} règle(s) de {self.yara_rule_files} "
+                         f"fichier(s), {_fmt_size(self.yara_bytes)} analysés"
+                         + ("" if self.yara_selftest is None else
+                            "  [auto-test OK]" if self.yara_selftest else "  [AUTO-TEST ÉCHOUÉ]"))
         if self.threats:
             lines.append("\nDétail des menaces :")
             for t in self.threats[:20]:
@@ -82,22 +183,39 @@ class ScanEngine:
 
     def __init__(self) -> None:
         self._stop   = False
-        self._proc   = None    # subprocess en cours (ClamAV ou Avast)
-        self._yara_method: Optional[str] = None   # "python" | "binary" | None
+        self._proc   = None          # subprocess en cours (ClamAV, Avast ou worker YARA)
+        self._unsandboxed = False    # un moteur a tourné hors sandbox pendant ce scan
 
     # ── Contrôle ──────────────────────────────────────────────────────────────
 
     def request_stop(self) -> None:
         self._stop = True
-        if self._proc:
+        self._kill_proc()
+
+    def _kill_proc(self) -> None:
+        """terminate(), puis kill() si le processus ne s'arrête pas sous 5 s."""
+        proc = self._proc
+        if not proc:
+            return
+        try:
+            proc.terminate()
+        except Exception:                                         # noqa: BLE001
+            pass
+
+        def _reaper() -> None:
             try:
-                self._proc.terminate()
-            except Exception:
-                pass
+                proc.wait(timeout=5)
+            except Exception:                                     # noqa: BLE001
+                try:
+                    proc.kill()
+                except Exception:                                 # noqa: BLE001
+                    pass
+        threading.Thread(target=_reaper, daemon=True).start()
 
     def _reset(self) -> None:
         self._stop = False
         self._proc = None
+        self._unsandboxed = False
 
     # ── Hash SHA-256 ───────────────────────────────────────────────────────────
 
@@ -111,8 +229,34 @@ class ScanEngine:
                 for chunk in iter(lambda: f.read(65536), b""):
                     h.update(chunk)
             return h.hexdigest()
-        except Exception:
+        except Exception:                                         # noqa: BLE001
             return ""
+
+    @staticmethod
+    def _hash_if_in_targets(path: str, targets: List[str]) -> str:
+        """SHA-256 d'un fichier signalé par un moteur NON FIABLE : uniquement si
+        c'est un fichier ordinaire (pas un lien) situé dans une cible analysée."""
+        try:
+            if not isinstance(path, str) or "\0" in path or not os.path.isabs(path):
+                return ""
+            p = os.path.abspath(path)
+            roots = {os.path.abspath(t) for t in targets}
+            roots |= {os.path.realpath(t) for t in targets}
+            if not any(p == r or p.startswith(r.rstrip("/") + "/") for r in roots):
+                return ""
+            if os.path.islink(p) or not os.path.isfile(p):
+                return ""
+            return ScanEngine._compute_hash(p)
+        except Exception:                                         # noqa: BLE001
+            return ""
+
+    def _add_threat(self, result: ScanResult, targets: List[str],
+                    path: str, threat: str, engine: str) -> None:
+        result.infected += 1
+        if len(result.threats) < _MAX_THREATS:
+            result.threats.append(ThreatInfo(
+                path=_clean(path, 1024), threat=_clean(threat),
+                engine=engine, hash=self._hash_if_in_targets(path, targets)))
 
     # ── Détection : ClamAV ────────────────────────────────────────────────────
 
@@ -181,35 +325,49 @@ class ScanEngine:
     # ── Détection : YARA ──────────────────────────────────────────────────────
 
     def detect_yara(self) -> Tuple[bool, str]:
-        """Retourne (dispo, méthode) : méthode = 'python' | 'binary' | ''."""
+        """(dispo, méthode). Test SANS importer yara : le GUI ne charge pas YARA,
+        l'analyse est faite par yara_worker.py dans le sandbox."""
         try:
-            import yara   # noqa: F401
-            self._yara_method = "python"
-            return True, "python"
-        except ImportError:
-            pass
-        if shutil.which("yara"):
-            self._yara_method = "binary"
-            return True, "binary"
-        self._yara_method = None
-        return False, ""
+            found = importlib.util.find_spec("yara") is not None
+        except (ImportError, ValueError):
+            found = False
+        return (True, "python") if found else (False, "")
 
     def yara_rules_count(self) -> int:
-        if not os.path.isdir(YARA_RULES_DIR):
-            return 0
-        return sum(
-            1 for _, _, files in os.walk(YARA_RULES_DIR)
-            for f in files
-            if f.endswith((".yar", ".yara")) and not f.startswith(".")
-        )
+        return len(self._collect_rules())
 
     def _collect_rules(self) -> List[str]:
         rules: List[str] = []
-        for root, _, files in os.walk(YARA_RULES_DIR):
+        for root, dirs, files in os.walk(YARA_RULES_DIR):
+            # dossiers cachés ignorés (ex. reliquat d'une mise à jour interrompue)
+            dirs[:] = sorted(d for d in dirs if not d.startswith("."))
             for f in sorted(files):
                 if f.endswith((".yar", ".yara")) and not f.startswith("."):
                     rules.append(os.path.join(root, f))
         return rules
+
+    @staticmethod
+    def _clamav_ro_binds() -> List[str]:
+        """Chemins hôte montés en lecture seule dans le sandbox de ClamAV."""
+        binds = [CLAMAV_DB_DIR]
+        if os.path.isdir(_CLAMAV_CERTS_DIR):
+            binds.append(_CLAMAV_CERTS_DIR)
+        return binds
+
+    # ── Lancement d'un moteur ─────────────────────────────────────────────────
+
+    def _launch(self, label: str, cmd: List[str], *, targets: List[str],
+                sandboxed: bool, ro_binds=(), exec_paths=(), extra_ro=None,
+                **popen_kw):
+        """Popen d'un moteur : dans le sandbox si `sandboxed`, sinon (mode dégradé
+        autorisé par la configuration) en direct. Pas de repli silencieux : si le
+        sandbox échoue, SandboxUnavailable remonte et le moteur n'est pas lancé."""
+        if sandboxed:
+            return Sandbox(label).popen(
+                cmd, ro_binds=ro_binds, targets=targets, extra_ro=extra_ro,
+                exec_paths=exec_paths, **popen_kw)
+        self._unsandboxed = True
+        return subprocess.Popen(cmd, **popen_kw)
 
     # ══════════════════════════════════════════════════════════════════════════
     # Scan principal
@@ -220,36 +378,75 @@ class ScanEngine:
              use_clamav:       bool,
              use_avast:        bool,
              use_yara:         bool,
-             remove_infected:  bool,
-             progress_cb:      ProgressCB,
-             file_count_cb:    Optional[Callable[[int, int], None]] = None) -> ScanResult:
+             progress_cb:      ProgressCB = None,
+             file_count_cb:    Optional[Callable[[int, int], None]] = None,
+             *,
+             remove_infected:  bool = False) -> ScanResult:
         """
         Lance le scan complet et retourne le résultat agrégé.
         Ordre : ClamAV → Avast → YARA.
 
         file_count_cb(scanned, infected) est appelé après chaque fichier traité
         pour permettre une mise à jour temps réel du compteur dans l'UI.
+
+        remove_infected est conservé pour compatibilité mais IGNORÉ : les supports
+        sont toujours analysés en lecture seule, rien n'y est jamais écrit.
         """
         self._reset()
         result = ScanResult()
         start  = time.time()
+        cb     = progress_cb
+        result.engines_requested = [n for n, wanted in (
+            ("ClamAV", use_clamav), ("Avast", use_avast), ("YARA", use_yara)) if wanted]
+
+        if remove_infected:
+            log_warning("scan(remove_infected=True) ignoré : supports en lecture seule.")
+
+        # ── Politique sandbox : échec fermé si requis et indisponible ─────────
+        if not sandbox_policy_ok():
+            reason = Sandbox.unavailable_reason() or "désactivé par la configuration"
+            msg = (f"❌ Sandbox indisponible ({reason}) — analyse refusée "
+                   "(les moteurs ne tournent jamais hors sandbox si il est requis).")
+            result.errors.append(msg)
+            if cb:
+                cb(msg, "threat")
+            log_error(msg)
+            result.duration = time.time() - start
+            return result
+
+        use_sb = sandbox_active()
+        if cb:
+            if use_sb:
+                cb(f"Sandbox actif : {Sandbox.describe()}", "info")
+            else:
+                cb("⚠ Sandbox non actif : analyse SANS isolation "
+                   "(support non validable).", "warning")
 
         if use_clamav:
-            self._scan_clamav(targets, remove_infected, result, progress_cb, file_count_cb)
+            self._scan_clamav(targets, result, cb, file_count_cb, use_sb)
 
         if use_avast and not result.stopped:
-            self._scan_avast(targets, remove_infected, result, progress_cb, file_count_cb)
+            self._scan_avast(targets, result, cb, file_count_cb, use_sb)
 
         if use_yara and not result.stopped:
-            self._scan_yara(targets, result, progress_cb, file_count_cb)
+            self._scan_yara(targets, result, cb, file_count_cb, use_sb)
 
+        result.sandboxed = bool(use_sb and not self._unsandboxed)
         result.duration = time.time() - start
+
+        # Synthèse : quels moteurs ont réellement terminé leur analyse ?
+        line = result.engines_line()
+        if cb and line and not result.stopped:
+            all_ran = all(n in result.engines_ran for n in result.engines_requested)
+            cb(line, "ok" if all_ran else "warning")
         log_info(
             f"Scan terminé : {result.scanned} fichiers, "
             f"{result.infected} menace(s), {result.duration:.1f}s  "
             f"[ClamAV:{result.scanned_clamav} | "
             f"Avast:{result.scanned_avast} | "
-            f"YARA:{result.scanned_yara}]"
+            f"YARA:{result.scanned_yara}]  "
+            f"sandbox={'oui' if result.sandboxed else 'NON'} "
+            f"moteurs={','.join(result.engines_ran) or '—'}"
         )
         return result
 
@@ -257,35 +454,36 @@ class ScanEngine:
     # Moteur ClamAV
     # ══════════════════════════════════════════════════════════════════════════
 
-    # ── Pré-validation de la base ClamAV ──────────────────────────────────────
-
-    def _check_clamav_db(self, cb: ProgressCB) -> bool:
+    def _check_clamav_db(self, cb: ProgressCB, use_sb: bool) -> Tuple[bool, str]:
         """
-        Vérifie que la base ClamAV se charge correctement en scannant un fichier
-        vide temporaire.
+        Vérifie que la base ClamAV se charge correctement en scannant un petit
+        fichier ordinaire (jamais /dev/null : clamscan le rejette toujours avec le
+        code 2, ce qui donnerait un faux « base invalide »).
 
-        Note : /dev/null NE doit PAS être utilisé — c'est un fichier spécial que
-        clamscan rejette systématiquement avec le code 2 ("Not supported file type"),
-        déclenchant un faux positif d'erreur de base.
-
-        Code 0 = OK, code 1 = OK, code 2 + messages d'erreur DB = base invalide.
+        Retourne (ok, message_d_erreur).
+        Code 0/1 = OK ; code 2 + messages d'erreur de base = base invalide.
         """
-        import tempfile
-
         tmp_path: Optional[str] = None
         try:
-            fd, tmp_path = tempfile.mkstemp(prefix="clamav_check_", suffix=".tmp")
-            os.close(fd)
-
-            r = subprocess.run(
-                ["clamscan", "--no-summary",
-                 f"--database={CLAMAV_DB_DIR}", tmp_path],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, timeout=60
-            )
-        except Exception as e:
+            if use_sb:
+                # Dans le sandbox, /tmp est un tmpfs vide : on scanne un fichier
+                # système lisible qui y est monté (voir Sandbox._ETC_FILES).
+                r = Sandbox("clamav-db").run(
+                    ["clamscan", "--no-summary", f"--database={CLAMAV_DB_DIR}",
+                     "/etc/group"],
+                    ro_binds=self._clamav_ro_binds(), timeout=120)
+            else:
+                fd, tmp_path = tempfile.mkstemp(prefix="clamav_check_", suffix=".tmp")
+                os.close(fd)
+                r = subprocess.run(
+                    ["clamscan", "--no-summary", f"--database={CLAMAV_DB_DIR}", tmp_path],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, timeout=120)
+        except SandboxUnavailable as e:
+            return False, f"ClamAV : sandbox indisponible — {_clean(str(e))}"
+        except Exception as e:                                    # noqa: BLE001
             log_warning(f"ClamAV pré-validation impossible : {e}")
-            return True
+            return True, ""
         finally:
             if tmp_path and os.path.exists(tmp_path):
                 try:
@@ -294,7 +492,21 @@ class ScanEngine:
                     pass
 
         if r.returncode in (0, 1):
-            return True
+            return True, ""
+
+        # Tué par le système (SIGKILL = 137) pendant le chargement : presque toujours
+        # le manque de mémoire. Inutile de réessayer dans le scan (même chargement,
+        # même mort, et ~1 à 2 min perdues) : on s'arrête avec la vraie cause.
+        if r.returncode in (137, -9):
+            msg = (f"❌ ClamAV : chargement de la base tué par le système "
+                   f"(code {r.returncode}) — mémoire insuffisante ?\n"
+                   "   clamscan charge toute la base en RAM : libérez de la mémoire, "
+                   "réduisez les signatures tierces ou ajoutez de la RAM.")
+            if cb:
+                cb(msg, "threat")
+            log_error(msg)
+            return False, (f"ClamAV : base trop lourde pour la mémoire disponible "
+                           f"(code {r.returncode}) — scan annulé.")
 
         combined = (r.stdout + r.stderr).strip()
         bad_lines = [l for l in combined.splitlines()
@@ -304,10 +516,10 @@ class ScanEngine:
 
         if not bad_lines:
             log_warning(f"ClamAV pré-validation : code 2 sans erreur DB "
-                        f"({combined[:120]}). Scan autorisé.")
-            return True
+                        f"({_clean(combined, 120)}). Scan autorisé.")
+            return True, ""
 
-        detail = "\n   ".join(bad_lines[:5])
+        detail = "\n   ".join(_clean(l) for l in bad_lines[:5])
         msg = ("❌ ClamAV : échec de chargement de la base (code 2).\n"
                "   Cause : une signature tierce est probablement corrompue.\n"
                f"   {detail}\n"
@@ -315,7 +527,8 @@ class ScanEngine:
         if cb:
             cb(msg, "threat")
         log_error(msg)
-        return False
+        return False, ("ClamAV : base invalide (code 2) — scan annulé. "
+                       "Lancez une mise à jour depuis le panneau Admin.")
 
     @staticmethod
     def _count_files(targets: List[str]) -> int:
@@ -329,41 +542,37 @@ class ScanEngine:
                     total += len(files)
         return total
 
-    def _scan_clamav(self, targets: List[str], remove: bool,
-                     result: ScanResult, cb: ProgressCB,
-                     fcc: Optional[Callable[[int, int], None]] = None) -> None:
+    def _scan_clamav(self, targets: List[str], result: ScanResult,
+                     cb: ProgressCB, fcc: Optional[Callable[[int, int], None]],
+                     use_sb: bool) -> None:
+
+        if not self.is_clamav_installed():
+            msg = "⚠ ClamAV : non installé — moteur ignoré."
+            result.errors.append(msg)
+            if cb:
+                cb(msg, "warning")
+            return
 
         # ── 1. Pré-validation : base chargeable ? ─────────────────────────────
-        if not self._check_clamav_db(cb):
-            result.errors.append(
-                "ClamAV : base invalide (code 2) — scan annulé. "
-                "Lancez une mise à jour depuis le panneau Admin."
-            )
+        ok, err = self._check_clamav_db(cb, use_sb)
+        if not ok:
+            result.errors.append(err)
             return
 
         # ── 2. Scan ───────────────────────────────────────────────────────────
-        # Notes sur les options :
-        #   --max-filesize=0 / --max-scansize=0 / --max-files=0
-        #     Lève les limites silencieuses par défaut (25 Mo/fichier, 100 Mo/total,
-        #     10 000 fichiers). Sans ces options, les samples volumineux sont
-        #     simplement ignorés sans avertissement → faux "aucune menace".
-        #   --scan-archive=yes
-        #     Force le scan des archives (tar, zip non chiffrés, etc.).
-        #     Note : les ZIP protégés par mot de passe ne peuvent PAS être scannés
-        #     par ClamAV (ni par aucun autre moteur AV sans le mot de passe).
-        #   --alert-broken
-        #     Signale les PE/archives corrompus ou tronqués comme suspects.
-        #   --detect-pua=yes
-        #     Détecte les logiciels potentiellement indésirables (adware,
-        #     downloaders, packers, outils d'administration, etc.).
+        # --max-filesize=0 / --max-scansize=0 / --max-files=0 : lèvent les limites
+        #   silencieuses (25 Mo/fichier, 100 Mo/total, 10 000 fichiers), sinon les
+        #   gros échantillons sont ignorés sans avertissement (faux « sain »).
+        # --scan-archive=yes : analyse des archives (hors ZIP chiffrés).
+        # --alert-broken : PE/archives corrompus ou tronqués signalés.
+        # --detect-pua=yes : logiciels potentiellement indésirables.
+        # Pas de --remove : le support est en lecture seule.
         cmd = [
             "clamscan",
             "--recursive",
             "--stdout",
-            "--verbose",                     # émet "/path: OK" pour chaque fichier sain
-                                             # → permet le comptage en temps réel
-            f"--database={CLAMAV_DB_DIR}",  # charge TOUTES les sigs du répertoire,
-                                             # officielles ET tierces (.ndb/.hdb/.ldb…)
+            "--verbose",                     # « /path: OK » par fichier sain → comptage temps réel
+            f"--database={CLAMAV_DB_DIR}",   # TOUTES les signatures du répertoire (tierces incluses)
             "--max-filesize=0",
             "--max-scansize=0",
             "--max-files=0",
@@ -371,7 +580,6 @@ class ScanEngine:
             "--alert-broken",
             "--detect-pua=yes",
         ]
-        # Note : la suppression est gérée en post-scan par l'interface (pas de --remove ici)
         cmd.extend(targets)
 
         if cb:
@@ -379,20 +587,28 @@ class ScanEngine:
 
         rc = -99
         try:
-            self._proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=1
-            )
+            self._proc = self._launch(
+                "clamav", cmd, targets=targets, sandboxed=use_sb,
+                ro_binds=self._clamav_ro_binds(),
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, errors="surrogateescape", bufsize=1)
             assert self._proc.stdout
             for line in self._proc.stdout:
                 if self._stop:
                     result.stopped = True
                     break
-                self._parse_clamav(line.rstrip(), result, cb, fcc)
+                if len(line) > _MAX_LINE:
+                    continue
+                self._parse_clamav(line.rstrip(), targets, result, cb, fcc)
             self._proc.wait()
             rc = self._proc.returncode
-        except Exception as e:
-            result.errors.append(f"ClamAV : {e}")
+            if self._stop:                  # arrêt demandé : le processus a été tué
+                result.stopped = True
+        except SandboxUnavailable as e:
+            result.errors.append(f"ClamAV : sandbox indisponible — {_clean(str(e))}")
+            log_error(f"ClamAV sandbox : {e}")
+        except Exception as e:                                    # noqa: BLE001
+            result.errors.append(f"ClamAV : {_clean(str(e))}")
             log_error(f"ClamAV scan : {e}")
         finally:
             self._proc = None
@@ -407,11 +623,14 @@ class ScanEngine:
                 cb(msg, "warning")
             log_error(msg)
         elif rc not in (0, 1, -99) and not result.stopped:
+            hint = (" (mémoire insuffisante ?)" if rc in (137, -9) else "")
+            msg = f"⚠ ClamAV : arrêt anormal (code {rc}){hint} — analyse incomplète."
+            result.errors.append(msg)
+            if cb:
+                cb(msg, "warning")
             log_warning(f"ClamAV : code de retour inattendu {rc}")
 
         # ── 4. Filet de sécurité : compteur nul alors que le scan a tourné ────
-        # Arrive si clamscan n'émet pas la ligne "Scanned files:" (version
-        # ancienne, scan vide, stderr non capturé, etc.)
         if result.scanned_clamav == 0 and not result.stopped and rc in (0, 1):
             estimated = self._count_files(targets)
             if estimated > 0:
@@ -421,7 +640,12 @@ class ScanEngine:
                     cb(f"[ClamAV] {estimated} fichier(s) parcourus (comptage direct).",
                        "info")
 
-    def _parse_clamav(self, line: str, result: ScanResult, cb: ProgressCB,
+        # ── 5. Analyse terminée normalement ? ─────────────────────────────────
+        if rc in (0, 1) and not result.stopped:
+            result.mark_ran("ClamAV")
+
+    def _parse_clamav(self, line: str, targets: List[str], result: ScanResult,
+                      cb: ProgressCB,
                       fcc: Optional[Callable[[int, int], None]] = None) -> None:
         if not line:
             return
@@ -433,19 +657,16 @@ class ScanEngine:
             parts  = line.rsplit(":", 1)
             path   = parts[0].strip()
             threat = parts[1].replace(" FOUND", "").strip() if len(parts) == 2 else line
-            sha    = ScanEngine._compute_hash(path)
-            result.infected       += 1
             result.scanned_clamav += 1
             result.scanned        += 1
-            result.threats.append(ThreatInfo(path=path, threat=threat, engine="ClamAV", hash=sha))
+            self._add_threat(result, targets, path, threat, "ClamAV")
             if cb:
-                cb(f"🚨 ClamAV : {threat}  →  {path}", "threat")
+                cb(f"🚨 ClamAV : {_clean(threat)}  →  {_clean(path, 300)}", "threat")
             if fcc:
                 fcc(result.scanned, result.infected)
             return
 
         # ── Résumé final : "Scanned files: N" ────────────────────────────────
-        # Source principale du compteur ; prioritaire sur le comptage ligne à ligne
         if line.startswith("Scanned files:"):
             try:
                 n = int(line.split(":")[1].strip())
@@ -459,12 +680,9 @@ class ScanEngine:
             return
 
         # ── Fichier sain (activé par --verbose) ───────────────────────────────
-        # Avec --verbose, ClamAV émet "/chemin/fichier: OK" pour chaque fichier propre.
-        # On compte sans loguer (évite de saturer le journal).
         if line.endswith(": OK") or line.endswith(": Empty file"):
             result.scanned_clamav += 1
             result.scanned        += 1
-            # Mise à jour UI toutes les 20 lignes pour limiter les appels callback
             if fcc and result.scanned_clamav % 20 == 0:
                 fcc(result.scanned, result.infected)
             return
@@ -472,8 +690,8 @@ class ScanEngine:
         # ── Erreurs de chargement DB (à logger sans bloquer) ─────────────────
         if "LibClamAV Error" in line or "LibClamAV Warning" in line:
             if cb:
-                cb(f"[ClamAV] {line}", "warning")
-            log_warning(f"ClamAV DB : {line}")
+                cb(f"[ClamAV] {_clean(line)}", "warning")
+            log_warning(f"ClamAV DB : {_clean(line)}")
             return
 
         # ── Lignes d'info du résumé ───────────────────────────────────────────
@@ -481,26 +699,48 @@ class ScanEngine:
                                     "Scan time:", "Scanned directories:",
                                     "Data scanned:", "Start Date:")):
             if cb:
-                cb(f"[ClamAV] {line}", "info")
+                cb(f"[ClamAV] {_clean(line)}", "info")
 
     # ══════════════════════════════════════════════════════════════════════════
     # Moteur Avast
     # ══════════════════════════════════════════════════════════════════════════
 
-    def _scan_avast(self, targets: List[str], remove: bool,
-                    result: ScanResult, cb: ProgressCB,
-                    fcc: Optional[Callable[[int, int], None]] = None) -> None:
+    def _avast_sandbox_args(self, avast_bin: str) -> Tuple[List[str], List[str]]:
+        """(ro_binds, exec_paths) pour lancer Avast dans le sandbox : répertoire
+        d'installation s'il est hors des répertoires système (exécution permise
+        par Landlock), licence, base VPS et, en mode « daemon », sockets du démon."""
+        ro: List[str] = []
+        exec_paths: List[str] = []
+        real_bin = os.path.realpath(avast_bin)
+        if not real_bin.startswith(_SYSTEM_PREFIXES):
+            root = "/opt/avast" if real_bin.startswith("/opt/avast/") \
+                else os.path.dirname(real_bin)
+            ro.append(root)
+            exec_paths.append(root)
+        for p in (AVAST_LICENSE_DIR, "/var/lib/avast", "/opt/avast"):
+            if os.path.isdir(p) and p not in ro:
+                ro.append(p)
+        if AVAST_SANDBOX_MODE == "daemon":
+            ro.extend(d for d in AVAST_DAEMON_SOCKET_DIRS if os.path.isdir(d))
+        return ro, exec_paths
+
+    def _scan_avast(self, targets: List[str], result: ScanResult,
+                    cb: ProgressCB, fcc: Optional[Callable[[int, int], None]],
+                    use_sb: bool) -> None:
         """
         Lance le scan Avast Business via la commande `scan` (CLI Avast Linux).
 
-        Avast Business for Linux est la seule version disponible sur Linux.
-        Une licence Business active est requise pour scanner — sans licence
-        le binaire démarre mais refuse le scan (code 126 ou message d'erreur).
-        On tente dans tous les cas et on remonte l'erreur précisément.
+        Une licence Business active est requise : sans licence le binaire démarre
+        mais refuse le scan (code 126 ou message d'erreur). On tente dans tous les
+        cas et on remonte l'erreur précisément.
 
         Format de sortie Avast :
           Fichier sain    :  /chemin/fichier [+]
-          Fichier infecté :  /chemin/fichier\tNom-Menace [L]\t0
+          Fichier infecté :  /chemin/fichier\\tNom-Menace [L]\\t0
+
+        Mode « strict » (défaut) : tout le scan tourne dans le sandbox.
+        Mode « daemon »          : le démon Avast fait l'analyse, hors sandbox →
+                                   le support ne peut pas être validé.
         """
         if not self.is_avast_installed():
             msg = "⚠ Avast : non installé — moteur ignoré."
@@ -517,70 +757,111 @@ class ScanEngine:
                 cb(msg, "warning")
             return
 
-        # Licence requise pour Avast Business for Linux.
-        # On avertit mais on tente quand même le scan — certaines versions
-        # tolèrent un scan partiel ; d'autres retournent code 126.
-        licensed = self.is_avast_licensed()
-        if not licensed and cb:
+        if not self.is_avast_licensed() and cb:
             cb("⚠ Avast : licence Business manquante — le scan risque d'être refusé."
                "  Activez une licence depuis le panneau Administration.", "warning")
 
-        # Construction de la commande
-        # `scan` est le CLI dédié ; s'il n'est pas disponible, on utilise
-        # `avast scan` (interface daemon)
-        # Note : la suppression est gérée en post-scan — pas de flag -a / --action remove
-        scan_binary_name = os.path.basename(avast_bin)
-        if scan_binary_name == "scan":
+        # `scan` est le CLI dédié ; sinon `avast scan -r` (interface daemon)
+        if os.path.basename(avast_bin) == "scan":
             cmd = [avast_bin, "-p"]           # -p : afficher chemin + statut
-            cmd.extend(targets)
         else:
-            cmd = [avast_bin, "scan", "-r"]   # avast scan --recursive
-            cmd.extend(targets)
+            cmd = [avast_bin, "scan", "-r"]
+        cmd.extend(targets)
+
+        ro_binds, exec_paths = self._avast_sandbox_args(avast_bin)
+        daemon_mode = (AVAST_SANDBOX_MODE == "daemon")
+        if daemon_mode:
+            # L'analyse est faite par le démon, hors sandbox : support non validable.
+            self._unsandboxed = True
+            if cb:
+                cb("⚠ Avast en mode « daemon » : analyse faite par le démon, "
+                   "hors sandbox (support non validable).", "warning")
 
         if cb:
             cb("Avast : démarrage de l'analyse…", "info")
 
         rc = -99
+        tail: deque = deque(maxlen=4)       # dernières lignes (diagnostic)
+        n_before = len([t for t in result.threats if t.engine == "Avast"])
         try:
-            self._proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=1
-            )
+            self._proc = self._launch(
+                "avast", cmd, targets=targets, sandboxed=use_sb,
+                ro_binds=ro_binds, exec_paths=exec_paths,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, errors="surrogateescape", bufsize=1)
             assert self._proc.stdout
             for line in self._proc.stdout:
                 if self._stop:
                     result.stopped = True
                     break
-                self._parse_avast(line.rstrip(), result, cb, fcc)
+                if len(line) > _MAX_LINE:
+                    continue
+                clean = _clean(line.rstrip(), 200)
+                if clean:
+                    tail.append(clean)
+                self._parse_avast(line.rstrip(), targets, result, cb, fcc)
             self._proc.wait()
             rc = self._proc.returncode
-
-            # Code 126 = scan refusé par Avast Business (licence manquante)
-            if rc == 126:
-                msg = ("⚠ Avast Business : scan refusé (code 126) — licence requise.\n"
-                       "  Obtenez une licence sur https://www.avast.com/business/linux\n"
-                       "  et activez-la depuis le panneau Administration.")
-                result.errors.append(msg)
-                if cb:
-                    cb(msg, "warning")
-                return
-
-            if cb:
-                cb(f"Avast : analyse terminée ({result.scanned_avast} fichier(s)).",
-                   "info")
-        except Exception as e:
-            result.errors.append(f"Avast : {e}")
+            if self._stop:
+                result.stopped = True
+        except SandboxUnavailable as e:
+            result.errors.append(f"Avast : sandbox indisponible — {_clean(str(e))}")
+            log_error(f"Avast sandbox : {e}")
+            return
+        except Exception as e:                                    # noqa: BLE001
+            result.errors.append(f"Avast : {_clean(str(e))}")
             log_error(f"Avast scan : {e}")
+            return
         finally:
             self._proc = None
 
-    def _parse_avast(self, line: str, result: ScanResult, cb: ProgressCB,
+        # Code 126 = scan refusé par Avast Business (licence manquante)
+        if rc == 126:
+            msg = ("⚠ Avast Business : scan refusé (code 126) — licence requise.\n"
+                   "  Obtenez une licence sur https://www.avast.com/business/linux\n"
+                   "  et activez-la depuis le panneau Administration.")
+            result.errors.append(msg)
+            if cb:
+                cb(msg, "warning")
+            return
+
+        if result.stopped:
+            return
+
+        found = len([t for t in result.threats if t.engine == "Avast"]) - n_before
+        expected = self._count_files(targets)
+        if rc != 0 and found == 0:
+            # Conservateur : un code de retour non nul sans menace n'est pas une
+            # analyse saine (en mode strict, c'est ici que l'erreur sandbox s'affiche).
+            detail = (" | ".join(tail))[:300]
+            msg = (f"⚠ Avast : arrêt anormal (code {rc}) — analyse incomplète."
+                   + (f"\n  {detail}" if detail else ""))
+            if use_sb and AVAST_SANDBOX_MODE == "strict":
+                msg += ("\n  (mode sandbox « strict » : si Avast ne fonctionne pas "
+                        "ainsi, voir AVAST_SANDBOX_MODE dans config.py)")
+            result.errors.append(msg)
+            if cb:
+                cb(msg, "warning")
+            return
+        if expected > 0 and result.scanned_avast == 0:
+            msg = "⚠ Avast : aucun fichier analysé — sortie non reconnue."
+            result.errors.append(msg)
+            if cb:
+                cb(msg, "warning")
+            return
+
+        if cb:
+            cb(f"Avast : analyse terminée ({result.scanned_avast} fichier(s)).", "info")
+        result.mark_ran("Avast")
+
+    def _parse_avast(self, line: str, targets: List[str], result: ScanResult,
+                     cb: ProgressCB,
                      fcc: Optional[Callable[[int, int], None]] = None) -> None:
         """
         Parse une ligne de sortie du CLI Avast for Linux.
 
           Sain     : "/chemin/fichier [+]"
-          Infecté  : "/chemin/fichier\tNom-Menace [L]\t0"
+          Infecté  : "/chemin/fichier\\tNom-Menace [L]\\t0"
                    ou "/chemin/fichier: Nom-Menace"
         """
         if not line:
@@ -597,15 +878,11 @@ class ScanEngine:
                     threat = threat.replace(suffix, "")
                 threat = threat.strip()
                 if threat and threat != "[+]":
-                    sha = ScanEngine._compute_hash(path)
-                    result.infected += 1
                     result.scanned_avast += 1
                     result.scanned       += 1
-                    result.threats.append(
-                        ThreatInfo(path=path, threat=threat, engine="Avast", hash=sha)
-                    )
+                    self._add_threat(result, targets, path, threat, "Avast")
                     if cb:
-                        cb(f"🚨 Avast : {threat}  →  {path}", "threat")
+                        cb(f"🚨 Avast : {_clean(threat)}  →  {_clean(path, 300)}", "threat")
                     if fcc:
                         fcc(result.scanned, result.infected)
                     return
@@ -631,15 +908,11 @@ class ScanEngine:
             path, _, threat = stripped.partition(": ")
             threat = threat.strip()
             if threat and threat.upper() not in ("OK", "CLEAN", ""):
-                sha = ScanEngine._compute_hash(path.strip())
-                result.infected      += 1
                 result.scanned_avast += 1
                 result.scanned       += 1
-                result.threats.append(
-                    ThreatInfo(path=path.strip(), threat=threat, engine="Avast", hash=sha)
-                )
+                self._add_threat(result, targets, path.strip(), threat, "Avast")
                 if cb:
-                    cb(f"🚨 Avast : {threat}  →  {path.strip()}", "threat")
+                    cb(f"🚨 Avast : {_clean(threat)}  →  {_clean(path.strip(), 300)}", "threat")
                 if fcc:
                     fcc(result.scanned, result.infected)
             return
@@ -647,20 +920,17 @@ class ScanEngine:
         # Lignes d'info (version, statistiques)
         if any(k in stripped for k in ("Avast", "VPS", "Scan", "Files")):
             if cb:
-                cb(f"[Avast] {stripped}", "info")
+                cb(f"[Avast] {_clean(stripped)}", "info")
 
     # ══════════════════════════════════════════════════════════════════════════
-    # Moteur YARA
+    # Moteur YARA (yara_worker.py dans le sandbox)
     # ══════════════════════════════════════════════════════════════════════════
 
-    def _scan_yara(self, targets: List[str],
-                   result: ScanResult, cb: ProgressCB,
-                   fcc: Optional[Callable[[int, int], None]] = None) -> None:
-        ok, method = self.detect_yara()
-        if not ok:
-            msg = ("⚠ YARA non disponible.\n"
-                   "Installez : sudo apt install python3-yara  "
-                   "ou  sudo pip3 install yara-python")
+    def _scan_yara(self, targets: List[str], result: ScanResult,
+                   cb: ProgressCB, fcc: Optional[Callable[[int, int], None]],
+                   use_sb: bool) -> None:
+        if not os.path.isfile(_WORKER_HOST):
+            msg = "⚠ YARA : yara_worker.py introuvable — moteur ignoré."
             result.errors.append(msg)
             if cb:
                 cb(msg, "warning")
@@ -676,151 +946,186 @@ class ScanEngine:
             return
 
         if cb:
-            cb(f"YARA : démarrage ({count} règle(s), méthode : {method})…", "info")
+            cb(f"YARA : démarrage ({count} fichier(s) de règles, "
+               f"worker {'sandboxé' if use_sb else 'SANS sandbox'})…", "info")
 
-        if method == "python":
-            self._yara_python(targets, result, cb, fcc)
-        else:
-            self._yara_binary(targets, result, cb, fcc)
+        py = sys.executable or "/usr/bin/python3"
+        worker = _WORKER_IN_SANDBOX if use_sb else _WORKER_HOST
+        # -I : mode isolé (ni variables d'environnement, ni site utilisateur) ; -B : pas de .pyc
+        cmd = [py, "-I", "-B", worker, YARA_RULES_DIR] + list(targets)
 
-    # ── YARA / python-yara ────────────────────────────────────────────────────
-
-    def _yara_python(self, targets: List[str],
-                     result: ScanResult, cb: ProgressCB,
-                     fcc: Optional[Callable[[int, int], None]] = None) -> None:
-        import yara   # type: ignore
-
-        rule_files    = self._collect_rules()
-        compiled_sets: List = []
-
-        if cb:
-            cb(f"YARA : compilation de {len(rule_files)} fichier(s) de règles…", "info")
-
-        for rf in rule_files:
-            if self._stop:
-                return
-            try:
-                compiled_sets.append(
-                    yara.compile(
-                        filepath=rf,
-                        externals={
-                            "filename": "", "filepath": "",
-                            "extension": "", "filetype": "",
-                        }
-                    )
-                )
-            except yara.SyntaxError as e:
-                log_warning(f"Règle ignorée ({os.path.basename(rf)}) : {e}")
-            except Exception as e:
-                log_warning(f"Erreur compilation ({os.path.basename(rf)}) : {e}")
-
-        if not compiled_sets:
-            if cb:
-                cb("⚠ YARA : aucune règle valide après compilation.", "warning")
-            return
-
-        if cb:
-            cb(f"YARA : {len(compiled_sets)} ensemble(s) compilé(s).", "info")
-
-        scanned_yara = [0]
-
-        def _scan_file(fpath: str) -> None:
-            try:
-                ext  = os.path.splitext(fpath)[1].lstrip(".").lower()
-                exts = {
-                    "filename":  os.path.basename(fpath),
-                    "filepath":  fpath,
-                    "extension": ext,
-                    "filetype":  ext.upper(),
-                }
-                for rules in compiled_sets:
-                    matches = rules.match(fpath, externals=exts, timeout=15)
-                    for m in matches:
-                        sha = ScanEngine._compute_hash(fpath)
-                        result.infected      += 1
-                        result.scanned_yara  += 1
-                        result.threats.append(
-                            ThreatInfo(path=fpath, threat=m.rule, engine="YARA", hash=sha)
-                        )
-                        if cb:
-                            cb(f"🚨 YARA : {m.rule}  →  {fpath}", "threat")
-            except Exception:
-                pass
-            finally:
-                scanned_yara[0] += 1
-                result.scanned_yara = scanned_yara[0]
-                # Notification UI toutes les 20 lignes
-                if fcc and scanned_yara[0] % 20 == 0:
-                    fcc(result.scanned, result.infected)
-                if scanned_yara[0] % 200 == 0 and cb:
-                    cb(f"YARA : {scanned_yara[0]} fichiers analysés…", "info")
-
-        for target in targets:
-            if self._stop:
-                result.stopped = True
-                return
-            if os.path.isfile(target):
-                _scan_file(target)
-            elif os.path.isdir(target):
-                for dirpath, _, files in os.walk(target):
-                    if self._stop:
-                        result.stopped = True
-                        return
-                    for fname in files:
-                        if self._stop:
-                            result.stopped = True
-                            return
-                        fp = os.path.join(dirpath, fname)
-                        if os.path.isfile(fp) and not os.path.islink(fp):
-                            _scan_file(fp)
-
-    # ── YARA / binaire ────────────────────────────────────────────────────────
-
-    def _yara_binary(self, targets: List[str],
-                     result: ScanResult, cb: ProgressCB,
-                     fcc: Optional[Callable[[int, int], None]] = None) -> None:
-        rule_files = self._collect_rules()
-        for rf in rule_files:
-            if self._stop:
-                result.stopped = True
-                return
-            for target in targets:
+        rc = -99
+        done: Optional[Tuple[int, int]] = None      # (analysés, illisibles)
+        worker_error = False
+        n_warn = 0
+        selftest: Optional[bool] = None             # règle témoin détectée ?
+        stats = {"rules": 0, "files": 0, "bytes": 0, "hits": 0, "secs": 0.0}
+        expected = self._count_files(targets)       # pour la progression (approximatif)
+        next_pct = 25
+        stderr_f = tempfile.TemporaryFile()
+        try:
+            self._proc = self._launch(
+                "yara", cmd, targets=targets, sandboxed=use_sb,
+                ro_binds=[YARA_RULES_DIR],
+                extra_ro={_WORKER_HOST: _WORKER_IN_SANDBOX},
+                stdout=subprocess.PIPE, stderr=stderr_f,
+                text=True, errors="surrogateescape", bufsize=1)
+            assert self._proc.stdout
+            for raw in self._proc.stdout:
                 if self._stop:
                     result.stopped = True
-                    return
+                    break
+                if len(raw) > _MAX_LINE:
+                    continue
                 try:
-                    self._proc = subprocess.Popen(
-                        ["yara", "-r", rf, target],
-                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                        text=True, bufsize=1
-                    )
-                    assert self._proc.stdout
-                    for line in self._proc.stdout:
-                        if self._stop:
-                            self._proc.terminate()
-                            result.stopped = True
-                            return
-                        line = line.strip()
-                        if line and not line.startswith("#"):
-                            parts = line.split(None, 1)
-                            if len(parts) == 2:
-                                rule_name, fpath = parts
-                                sha = ScanEngine._compute_hash(fpath)
-                                result.infected      += 1
-                                result.scanned_yara  += 1
-                                result.scanned       += 1
-                                result.threats.append(
-                                    ThreatInfo(path=fpath,
-                                               threat=rule_name,
-                                               engine="YARA",
-                                               hash=sha)
-                                )
-                                if cb:
-                                    cb(f"🚨 YARA : {rule_name}  →  {fpath}", "threat")
-                                if fcc:
-                                    fcc(result.scanned, result.infected)
-                    self._proc.wait()
-                except Exception as e:
-                    log_warning(f"YARA binaire ({os.path.basename(rf)}) : {e}")
-                finally:
-                    self._proc = None
+                    msg = json.loads(raw)
+                except ValueError:
+                    continue
+                if not isinstance(msg, dict):
+                    continue                              # le worker n'est pas fiable
+                kind = msg.get("type")
+
+                if kind == "hit":
+                    rule = _clean(msg.get("rule"))
+                    path = msg.get("path")
+                    if rule and isinstance(path, str):
+                        self._add_threat(result, targets, path, rule, "YARA")
+                        if cb:
+                            cb(f"🚨 YARA : {rule}  →  {_clean(path, 300)}", "threat")
+                elif kind == "progress":
+                    n = msg.get("scanned")
+                    if isinstance(n, int) and 0 <= n < 10 ** 9:
+                        result.scanned_yara = n
+                        if fcc:
+                            fcc(max(result.scanned, n), result.infected)
+                        if cb and expected > 0:
+                            pct = min(100, n * 100 // expected)
+                            if pct >= next_pct and n < expected:
+                                cb(f"YARA : {n}/{expected} fichier(s) analysé(s) ({pct} %)…",
+                                   "info")
+                                next_pct = (pct // 25 + 1) * 25
+                elif kind == "compiled":
+                    n, r = msg.get("count"), msg.get("rules")
+                    if isinstance(n, int) and 0 <= n < 10 ** 7:
+                        stats["files"] = n
+                    if isinstance(r, int) and 0 <= r < 10 ** 8:
+                        stats["rules"] = r
+                    if cb and isinstance(n, int):
+                        cb(f"YARA : {n} fichier(s) de règles compilé(s)"
+                           + (f" — {stats['rules']} règle(s) chargée(s)."
+                              if stats["rules"] else "."), "info")
+                elif kind == "selftest":
+                    selftest = msg.get("ok") is True
+                    if cb:
+                        if selftest:
+                            cb("YARA : auto-test OK — la règle témoin est détectée par "
+                               "l'ensemble chargé (le moteur détecte réellement).", "ok")
+                        else:
+                            cb("❌ YARA : auto-test ÉCHOUÉ — règle témoin non détectée.",
+                               "threat")
+                elif kind == "warn":
+                    n_warn += 1
+                    log_warning(f"YARA : {_clean(msg.get('msg'))}")
+                elif kind == "error":
+                    worker_error = True
+                    text = _clean(msg.get("msg")) or "erreur du worker"
+                    result.errors.append(f"YARA : {text}")
+                    if cb:
+                        cb(f"⚠ YARA : {text}", "warning")
+                elif kind == "done":
+                    s, u = msg.get("scanned"), msg.get("unreadable")
+                    if isinstance(s, int) and isinstance(u, int) and s >= 0 and u >= 0:
+                        done = (s, u)
+                        b, h, t = msg.get("bytes"), msg.get("hits"), msg.get("secs")
+                        if isinstance(b, int) and 0 <= b < 10 ** 14:
+                            stats["bytes"] = b
+                        if isinstance(h, int) and 0 <= h < 10 ** 9:
+                            stats["hits"] = h
+                        if isinstance(t, (int, float)) and 0 <= t < 10 ** 7:
+                            stats["secs"] = float(t)
+            self._proc.wait()
+            rc = self._proc.returncode
+            if self._stop:
+                result.stopped = True
+        except SandboxUnavailable as e:
+            result.errors.append(f"YARA : sandbox indisponible — {_clean(str(e))}")
+            log_error(f"YARA sandbox : {e}")
+            return
+        except Exception as e:                                    # noqa: BLE001
+            result.errors.append(f"YARA : {_clean(str(e))}")
+            log_error(f"YARA scan : {e}")
+            return
+        finally:
+            self._proc = None
+
+        tail = ""
+        try:
+            stderr_f.seek(0)
+            tail = _clean(stderr_f.read(2000).decode("utf-8", "replace"), 200)
+        except Exception:                                         # noqa: BLE001
+            pass
+        finally:
+            stderr_f.close()
+
+        if n_warn and cb:
+            cb(f"YARA : {n_warn} règle(s) ignorée(s) à la compilation (voir le journal).",
+               "warning")
+
+        if result.stopped:
+            return
+
+        if rc != 0 or done is None:
+            if not worker_error:
+                if rc == 3:
+                    msg = ("⚠ YARA non disponible dans le sandbox.\n"
+                           "Installez : sudo apt install python3-yara")
+                else:
+                    hint = (" (mémoire insuffisante ?)" if rc in (137, -9) else "")
+                    msg = (f"❌ YARA : le worker s'est terminé avec le code {rc}{hint} "
+                           "— analyse incomplète."
+                           + (f"\n  {tail}" if tail else ""))
+                result.errors.append(msg)
+                if cb:
+                    cb(msg, "threat")
+                log_error(f"YARA worker : code {rc} {tail}")
+            return
+
+        scanned, unreadable = done
+        analysed = scanned - unreadable
+        result.scanned_yara = scanned
+        result.scanned = max(result.scanned, scanned)
+        result.yara_rule_files = stats["files"]
+        result.yara_rules = stats["rules"]
+        result.yara_selftest = selftest
+        result.yara_bytes = stats["bytes"]
+        result.yara_seconds = stats["secs"]
+        if fcc:
+            fcc(result.scanned, result.infected)
+        if unreadable:
+            # Un fichier non lu ne doit jamais passer pour sain
+            msg = (f"⚠ YARA : {analysed} fichier(s) analysé(s), {unreadable} illisible(s) ou "
+                   "non analysé(s) — analyse incomplète.")
+            result.errors.append(msg)
+            if cb:
+                cb(msg, "warning")
+            return
+        if expected > 0 and analysed == 0:
+            msg = "⚠ YARA : AUCUN fichier analysé alors que le support en contient."
+            result.errors.append(msg)
+            if cb:
+                cb(msg, "warning")
+            return
+        if cb:
+            hits = stats["hits"]
+            if analysed == 0:
+                cb("✅ YARA : analyse terminée — aucun fichier à analyser sur ce support "
+                   "(les règles sont chargées et l'auto-test est passé).", "ok")
+            else:
+                size = (f" ({_fmt_size(stats['bytes'])})" if stats["bytes"] else "")
+                rules = (f" avec {stats['rules']} règle(s)" if stats["rules"] else "")
+                cb(("⚠" if hits else "✅")
+                   + f" YARA : analyse TERMINÉE — {analysed} fichier(s) analysé(s){size}"
+                   f"{rules} en {stats['secs']:.1f}s — "
+                   + (f"{hits} détection(s)." if hits else "aucune détection."),
+                   "threat" if hits else "ok")
+        result.mark_ran("YARA")

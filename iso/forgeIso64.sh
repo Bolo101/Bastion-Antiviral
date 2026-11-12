@@ -11,19 +11,24 @@
 # ║    sudo apt install live-build xorriso syslinux wget curl python3 unzip     ║
 # ║                                                                              ║
 # ║  Structure du projet :                                                       ║
-# ║    ../code/      → les 8 fichiers Python du scanner                         ║
+# ║    ../code/      → les fichiers Python de l'application (liste vérifiée     ║
+# ║                    plus bas, dont scanner.py, yara_worker.py, bastion_update.py)║
 # ║    ../database/  → (optionnel) .cvd/.yar pré-téléchargés                   ║
 # ║                                                                              ║
 # ║  Exécution :                                                                 ║
 # ║    chmod +x forgeIsoXfce.sh && sudo ./forgeIsoXfce.sh                      ║
+# ║                                                                              ║
+# ║  Option : clé abuse.ch pour la signature ClamAV URLhaus (sinon ignorée) :   ║
+# ║    sudo env ABUSECH_AUTH_KEY=VOTRE_CLE ./forgeIsoXfce.sh                    ║
+# ║    (depuis le 21/10/2026 le téléchargement sans clé répond 410 Gone)        ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
 set -euo pipefail
 
 # ── Variables ─────────────────────────────────────────────────────────────────
-ISO_NAME="$(pwd)/bastion-antiviral-v1.0.iso"
+ISO_NAME="$(pwd)/bastion-antiviral-v2.0.iso"
 WORK_DIR="$(pwd)/debian-live-build"
-CODE_DIR="$(pwd)/../../code"
+CODE_DIR="$(pwd)/../code"
 SIGBASE_URL="https://github.com/Neo23x0/signature-base/archive/refs/heads/master.zip"
 
 # Paramètres de boot communs (réutilisés dans syslinux + GRUB)
@@ -38,21 +43,50 @@ step() { echo -e "\n${YELLOW}▶▶  $*${RESET}"; }
 
 # ── Vérification des pré-requis ───────────────────────────────────────────────
 step "Vérification des pré-requis..."
-for cmd in lb wget curl python3 unzip rsync xorriso; do
+for cmd in lb wget curl python3 unzip xorriso; do
     command -v "$cmd" &>/dev/null \
         || err "Commande manquante : $cmd  →  apt install live-build wget curl python3 unzip"
 done
 [[ -d "$CODE_DIR" ]] || err "Répertoire code introuvable : $CODE_DIR"
 for f in config.py log_handler.py admin_auth.py usb_manager.py \
-          db_manager.py scanner.py gui.py main.py pdf_viewer.py utils.py; do
+          db_manager.py scanner.py sandbox.py userns_exec.py yara_worker.py \
+          sandbox_selftest.py validated_supports.py reports.py export_manager.py \
+          landlock_exec.py bastion_update.py \
+          gui.py main.py pdf_viewer.py utils.py; do
     [[ -f "$CODE_DIR/$f" ]] || err "Fichier manquant dans $CODE_DIR : $f"
 done
 ok "Pré-requis OK"
 
+# ── Vérification de l'horloge ─────────────────────────────────────────────────
+# apt refuse un dépôt dont la signature est datée « dans le futur » (« Not live
+# until … ») et TLS refuse un certificat « pas encore valide » : sur une machine
+# ou une VM à l'horloge en retard, le build échoue bien plus tard, en plein
+# lb build. On compare l'heure locale à l'en-tête HTTP « Date » d'un miroir Debian
+# (HTTP simple : fonctionne même quand l'horloge fait échouer HTTPS).
+step "Vérification de l'horloge système..."
+_srv_hdr="$(curl -fsSI --max-time 10 http://deb.debian.org/debian/ 2>/dev/null \
+            | tr -d '\r' | awk -F': ' 'tolower($1)=="date"{print $2; exit}' || true)"
+_srv_epoch=0
+[[ -n "$_srv_hdr" ]] && _srv_epoch="$(date -d "$_srv_hdr" +%s 2>/dev/null || echo 0)"
+if (( _srv_epoch > 0 )); then
+    _skew=$(( $(date +%s) - _srv_epoch ))
+    if (( _skew > 300 || _skew < -300 )); then
+        echo -e "${RED}   Heure locale : $(date -u '+%F %T') UTC — serveur Debian : $(date -u -d "@${_srv_epoch}" '+%F %T') UTC  (écart : ${_skew}s)${RESET}"
+        echo "   Corrigez l'horloge, puis relancez ce script :"
+        echo "     sudo timedatectl set-ntp true && sudo systemctl restart systemd-timesyncd"
+        echo "     VM : activez la synchronisation de l'heure avec l'hôte (ou « sudo date -s … »"
+        echo "          puis « sudo hwclock --systohc »)."
+        err "Horloge décalée : apt refuserait les dépôts (« Not live until… ») et les certificats TLS."
+    fi
+    ok "Horloge synchronisée (écart ${_skew}s)"
+else
+    warn "Heure du serveur Debian indisponible : horloge non vérifiée"
+fi
+
 # ── Installation des outils de build ─────────────────────────────────────────
 step "Installation des dépendances de build..."
 apt-get update -qq
-apt-get install -y live-build xorriso syslinux isolinux syslinux-utils wget curl python3 unzip rsync
+apt-get install -y live-build xorriso syslinux isolinux syslinux-utils wget curl python3 unzip
 ok "Outils de build installés"
 
 # ── Préparation du répertoire de travail ──────────────────────────────────────
@@ -200,10 +234,17 @@ python3-fitz
 # YARA
 yara
 python3-yara
+# Sandbox d'analyse (isolation de chaque moteur – voir code/sandbox.py)
+bubblewrap
+python3-seccomp
+# Visionneuse des rapports de support compromis (panneau d'administration)
+evince
 # ClamAV
 clamav
 clamav-daemon
 clamav-freshclam
+# Détection de rootkits sur le système hôte (lancement manuel : sudo chkrootkit)
+chkrootkit
 # Avast for Linux – installé depuis le dépôt officiel repo.avcdn.net
 # (le hook 0250 configure le dépôt et installe le paquet)
 # avast  ← ajouté dynamiquement par le hook 0250
@@ -464,43 +505,9 @@ SANE_FILES=(
 
 SANE_BASE_URL=""
 
-# Méthode 1 : rsync (méthode officielle Sanesecurity — copie d'abord dans un dossier temp,
-# puis validation individuelle de chaque fichier avant installation définitive)
-if command -v rsync &>/dev/null; then
-    echo "  rsync://rsync.sanesecurity.net/sanesecurity …" | tee -a "$LOG"
-    RSYNC_TMP="$(mktemp -d /tmp/sanesec_rsync_XXXXXX)"
-    if rsync --timeout=30 --contimeout=15 --no-recursive -q \
-        rsync://rsync.sanesecurity.net/sanesecurity/ "$RSYNC_TMP/" 2>>"$LOG" \
-       && [[ $(ls "$RSYNC_TMP" 2>/dev/null | wc -l) -gt 0 ]]; then
-        echo "  rsync OK — validation individuelle de chaque fichier…" | tee -a "$LOG"
-        for fname in "${SANE_FILES[@]}"; do
-            if [[ -f "$RSYNC_TMP/$fname" ]]; then
-                SZ=$(stat -c%s "$RSYNC_TMP/$fname" 2>/dev/null || echo 0)
-                if [[ "$SZ" -ge 64 ]] && _is_valid_content "$RSYNC_TMP/$fname"; then
-                    DEST="$DB_DIR/$fname"
-                    cp "$RSYNC_TMP/$fname" "$DEST"
-                    chmod 644 "$DEST"; chown clamav:clamav "$DEST" 2>/dev/null || true
-                    if _db_ok; then
-                        echo "  ✅ $fname (rsync, ${SZ}o)" | tee -a "$LOG"
-                        TP_OK=$((TP_OK + 1))
-                    else
-                        echo "  ⚠ $fname incompatible — supprimé" | tee -a "$LOG"
-                        rm -f "$DEST"
-                        TP_SKIP=$((TP_SKIP + 1))
-                    fi
-                fi
-            fi
-        done
-        SANE_BASE_URL="rsync"
-    else
-        echo "  ⚠ rsync Sanesecurity inaccessible — fallback HTTP" | tee -a "$LOG"
-    fi
-    rm -rf "$RSYNC_TMP"
-fi
-
-# Méthode 2 : HTTP fallback
+# Récupération via HTTP(S) uniquement
 if [[ -z "$SANE_BASE_URL" ]]; then
-    echo "  Fallback HTTP Sanesecurity…" | tee -a "$LOG"
+    echo "  Sanesecurity via HTTP(S)…" | tee -a "$LOG"
     for SANE_HTTP in \
         "https://mirror.ihost.md/clamav/sanesecurity" \
         "https://ftp.swin.edu.au/sanesecurity"; do
@@ -519,20 +526,25 @@ fi
 
 # ── InterServer ───────────────────────────────────────────────────────────────
 echo ">>> [Hook TP] InterServer…" | tee -a "$LOG"
-install_and_validate "http://sigs.interserver.net/interserver256.hdb" "interserver256.hdb" 500 || true
-install_and_validate "http://sigs.interserver.net/topline.db"          "topline.db"          500 || true
+install_and_validate "https://sigs.interserver.net/interserver256.hdb" "interserver256.hdb" 500 || true
+install_and_validate "https://sigs.interserver.net/interservertopline.db" "interservertopline.db" 500 || true
 
 # ── URLhaus (abuse.ch) ────────────────────────────────────────────────────────
+# Depuis le 21/10/2026 abuse.ch exige une clé d'authentification pour l'export
+# ClamAV (l'ancienne URL répond 410, le miroir malware-filter 404). La clé n'est
+# JAMAIS écrite dans ce hook : le fichier est pré-téléchargé sur la machine de
+# build quand ABUSECH_AUTH_KEY y est défini ; il est alors déjà dans $DB_DIR.
 echo ">>> [Hook TP] URLhaus…" | tee -a "$LOG"
-URLHAUS_OK=false
-for _url in \
-    "https://urlhaus.abuse.ch/downloads/urlhaus.ndb" \
-    "https://curbengh.github.io/malware-filter/urlhaus-filter-clam.ndb"; do
-    if install_and_validate "$_url" "urlhaus-filter.ndb" 1000; then
-        URLHAUS_OK=true; break
+if [[ -f "$DB_DIR/urlhaus-filter.ndb" ]]; then
+    if _db_ok; then
+        echo "  ✅ urlhaus-filter.ndb présent (pré-téléchargé avec la clé abuse.ch)" | tee -a "$LOG"
+    else
+        echo "  ⚠ urlhaus-filter.ndb incompatible avec la base — supprimé" | tee -a "$LOG"
+        rm -f "$DB_DIR/urlhaus-filter.ndb"
     fi
-done
-$URLHAUS_OK || echo "  ⚠ URLhaus inaccessible — ignoré." | tee -a "$LOG"
+else
+    echo "  ↷ URLhaus ignoré (clé abuse.ch requise — voir ABUSECH_AUTH_KEY)" | tee -a "$LOG"
+fi
 
 # ── Bilan final ───────────────────────────────────────────────────────────────
 TP_FINAL=$(find "$DB_DIR" \( \
@@ -1274,99 +1286,26 @@ systemctl disable clamav-daemon    2>/dev/null || true
 systemctl disable avast.target     2>/dev/null || true
 systemctl disable avast            2>/dev/null || true
 
+# chkrootkit : disponible en ligne de commande (sudo chkrootkit), mais jamais
+# lancé automatiquement (le paquet fournit un cron/timer quotidien).
+for _u in $(ls /usr/lib/systemd/system /lib/systemd/system 2>/dev/null \
+            | grep -E '^chkrootkit.*\.(timer|service)$' | sort -u); do
+    systemctl disable "$_u" 2>/dev/null || true
+done
+[ -f /etc/chkrootkit/chkrootkit.conf ] && \
+    sed -i 's/^RUN_DAILY=.*/RUN_DAILY="false"/' /etc/chkrootkit/chkrootkit.conf || true
+
 echo ">>> [Hook Système] OpenBox kiosque OK ✅"
 HOOK
 chmod +x config/hooks/normal/0300-system-config.hook.chroot
 ok "Hook système OpenBox kiosque créé"
 
-cat > config/hooks/normal/0400-permissions.hook.chroot << 'HOOK'
-#!/bin/bash
-set -euo pipefail
-echo ">>> [Hook Permissions] Finalisation..."
-
-# Application Python
-chmod 644 /opt/usb-antivirus/*.py
-chmod 755 /opt/usb-antivirus
-
-# ClamAV – bases officielles + signatures tierces
-mkdir -p /var/lib/clamav /var/log/clamav /var/run/clamav
-chown -R clamav:clamav /var/lib/clamav /var/log/clamav /var/run/clamav 2>/dev/null || true
-chmod 755 /var/lib/clamav /var/log/clamav /var/run/clamav
-# Bases officielles
-find /var/lib/clamav \( -name "*.cvd" -o -name "*.cld" \) 2>/dev/null \
-    | xargs chmod 644 2>/dev/null || true
-# Signatures tierces (toutes extensions ClamAV tierces)
-find /var/lib/clamav \( -name "*.ndb" -o -name "*.hdb" -o -name "*.hsb" \
-    -o -name "*.db" -o -name "*.ftm" -o -name "*.ldb" \
-    -o -name "*.cdb" -o -name "*.fp" \) 2>/dev/null \
-    | xargs chown clamav:clamav 2>/dev/null || true
-find /var/lib/clamav \( -name "*.ndb" -o -name "*.hdb" -o -name "*.hsb" \
-    -o -name "*.db" -o -name "*.ftm" -o -name "*.ldb" \
-    -o -name "*.cdb" -o -name "*.fp" \) 2>/dev/null \
-    | xargs chmod 644 2>/dev/null || true
-# Validation au moment du hook permissions — même algorithme que le hook 0150.
-# Boucle while : recommence depuis zéro après chaque suppression pour éviter
-# de faussement supprimer des fichiers innocents.
-# Important : on utilise un fichier temporaire vide, PAS /dev/null.
-# /dev/null est un fichier spécial rejeté par clamscan avec code 2 + "Not
-# supported file type", ce qui déclencherait un faux positif d'erreur de base.
-if command -v clamscan &>/dev/null; then
-    _CVAL_TMP="$(mktemp /tmp/clamval_XXXXXX)"
-    if ! clamscan --no-summary --database=/var/lib/clamav "$_CVAL_TMP" &>/dev/null; then
-        echo ">>> [Hook Perms] ⚠ Base invalide — isolation en cours…"
-        CULPRITS_P=0
-        while ! clamscan --no-summary --database=/var/lib/clamav "$_CVAL_TMP" &>/dev/null; do
-            QDIR="$(mktemp -d /tmp/clamav_perms_quar_XXXXXX)"
-            FOUND_P=false
-            for f in /var/lib/clamav/*.ndb /var/lib/clamav/*.hdb /var/lib/clamav/*.hsb \
-                     /var/lib/clamav/*.db  /var/lib/clamav/*.ftm /var/lib/clamav/*.ldb \
-                     /var/lib/clamav/*.cdb /var/lib/clamav/*.fp; do
-                [ -f "$f" ] || continue
-                BNAME=$(basename "$f")
-                mv "$f" "$QDIR/"
-                if clamscan --no-summary --database=/var/lib/clamav "$_CVAL_TMP" &>/dev/null; then
-                    echo "    Suppression : $BNAME (coupable)"
-                    rm -f "$QDIR/$BNAME"
-                    CULPRITS_P=$((CULPRITS_P + 1))
-                    FOUND_P=true
-                    break
-                else
-                    mv "$QDIR/$BNAME" /var/lib/clamav/
-                fi
-            done
-            rm -rf "$QDIR"
-            if ! $FOUND_P; then
-                echo ">>> [Hook Perms] ⚠ Conflit non isolable — purge des fichiers tiers."
-                find /var/lib/clamav \( -name "*.ndb" -o -name "*.hdb" -o -name "*.hsb" \
-                    -o -name "*.db" -o -name "*.ftm" -o -name "*.ldb" \
-                    -o -name "*.cdb" -o -name "*.fp" \) -delete 2>/dev/null || true
-                break
-            fi
-        done
-        [ "$CULPRITS_P" -gt 0 ] && echo ">>> [Hook Perms] ✅ Base assainie ($CULPRITS_P fichier(s) retiré(s))."
-    fi
-    rm -f "$_CVAL_TMP"
-fi
-
-# YARA
-chmod -R 755 /var/lib/yara-rules
-
-# Avast (si installé)
-if [ -d /etc/avast ]; then
-    chmod 755 /etc/avast
-    # Le fichier de licence sera déposé par l'administrateur
-    [ -f /etc/avast/license.avastlic ] && chmod 644 /etc/avast/license.avastlic || true
-fi
-if [ -d /var/lib/avast ]; then
-    chmod -R 755 /var/lib/avast 2>/dev/null || true
-fi
-
-chown -R scanner:scanner /home/scanner/ 2>/dev/null || true
-
-echo ">>> [Hook Permissions] OK ✅"
-HOOK
-chmod +x config/hooks/normal/0400-permissions.hook.chroot
-ok "Hook permissions créé"
+# (Hook 0400 : voir « Hook final » plus bas. Une première version, plus longue —
+#  validation ClamAV avec purge des signatures tierces, chmod -R sur /var/lib/avast —
+#  était définie ici puis écrasée par celle de « Hook final » (même nom de fichier) :
+#  elle n'a jamais été exécutée. Supprimée : permissions déjà posées à la copie des
+#  fichiers, validation déjà faite par le hook 0150, et sa purge se déclenchait au
+#  moindre code de retour non nul de clamscan, y compris un manque de mémoire.)
 
 # ── Hook 4.5 : script post-installation exécuté après Calamares ───────────────
 # Ce script est lancé par un service systemd oneshot sur le SYSTÈME INSTALLÉ
@@ -1482,6 +1421,32 @@ ok "Script post-installation créé"
 # =============================================================================
 step "Copie des fichiers dans le chroot..."
 
+# ── Durcissement noyau/montage pour supports non fiables ─────────────────────
+# Le noyau analyse lui-même la structure d'un système de fichiers au montage :
+# on empêche le chargement des pilotes inutiles (le code applicatif n'autorise
+# de toute façon que vfat/exfat/ntfs/ext2-4/iso9660/udf — voir config.py).
+mkdir -p config/includes.chroot/etc/modprobe.d
+{
+    echo "# Bastion Antiviral – réduction de la surface d'attaque (FS inutiles)"
+    for fs in adfs affs befs bfs btrfs cramfs efs f2fs freevxfs gfs2 hfs hfsplus \
+              hpfs jffs2 jfs minix nilfs2 ocfs2 omfs qnx4 qnx6 reiserfs sysv \
+              ufs vxfs xfs; do
+        echo "install $fs /bin/false"
+        echo "blacklist $fs"
+    done
+} > config/includes.chroot/etc/modprobe.d/bastion-fs-hardening.conf
+
+# Montage automatique éventuel (udisks2/Thunar) : toujours en lecture seule et
+# sans exécution/setuid/périphériques, y compris pendant l'instant précédant la
+# prise en charge par l'application.
+mkdir -p config/includes.chroot/etc/udisks2
+cat > config/includes.chroot/etc/udisks2/mount_options.conf << 'UDISKS'
+[defaults]
+defaults=ro,nosuid,nodev,noexec,nosymfollow
+allow=ro,nosuid,nodev,noexec,nosymfollow,sync,flush,utf8,shortname,umask,dmask,fmask,uid,gid,showexec,iocharset,codepage
+UDISKS
+ok "Durcissement FS (modprobe + udisks2) → includes.chroot"
+
 # ── Application Python ────────────────────────────────────────────────────────
 APP_CHROOT="config/includes.chroot/opt/usb-antivirus"
 mkdir -p "$APP_CHROOT"
@@ -1503,7 +1468,7 @@ fi
 PDF_CHROOT="config/includes.chroot/opt/pdf"
 mkdir -p "$PDF_CHROOT"
 # Copier les PDFs présents dans ../pdf/ sur la machine de build, si disponibles
-PDF_SRC="$(dirname "$WORK_DIR")/../../pdf"
+PDF_SRC="$(dirname "$WORK_DIR")/../pdf"
 if [[ -d "$PDF_SRC" ]]; then
     PDF_COUNT=$(find "$PDF_SRC" -maxdepth 1 -name "*.pdf" | wc -l)
     if [[ "$PDF_COUNT" -gt 0 ]]; then
@@ -1520,7 +1485,7 @@ fi
 # ── Logo (../img/logo.png relatif au code = /opt/img/logo.png) ────────────────
 IMG_CHROOT="config/includes.chroot/opt/img"
 mkdir -p "$IMG_CHROOT"
-LOGO_SRC="$(pwd)/../../img/logo.png"
+LOGO_SRC="$(pwd)/../img/logo.png"
 if [[ -f "$LOGO_SRC" ]]; then
     cp -v "$LOGO_SRC" "$IMG_CHROOT/logo.png"
     ok "Logo copié → $IMG_CHROOT/logo.png"
@@ -1682,44 +1647,10 @@ _SANE_FILES=(
     malware.expert.fp
 )
 
-# ── Méthode 1 : rsync (méthode officielle — sanesecurity.com) ─────────────────
+# ── Sanesecurity : récupération via HTTPS uniquement ────────────────────────
 _SANE_OK=false
-if command -v rsync &>/dev/null; then
-    step "Sanesecurity via rsync://rsync.sanesecurity.net ..."
-    RSYNC_TMP="$(mktemp -d /tmp/sanesec_rsync_XXXXXX)"
-    # --include="*/" requis pour que rsync descende dans les sous-répertoires
-    # éventuels, même si la source est plate. Sans lui, certains rsync ignorent
-    # silencieusement les filtres d'extension et transfèrent 0 fichier (exit 0).
-    if rsync --timeout=30 --contimeout=15 --no-recursive -q \
-        rsync://rsync.sanesecurity.net/sanesecurity/ "$RSYNC_TMP/" \
-        2>/tmp/rsync-sane.log; then
-        # Vérification que des fichiers ont bien été transférés
-        RSYNC_COUNT=$(ls "$RSYNC_TMP" 2>/dev/null | wc -l)
-        if [[ "$RSYNC_COUNT" -gt 0 ]]; then
-            for _fname in "${_SANE_FILES[@]}"; do
-                if [[ -f "$RSYNC_TMP/$_fname" ]]; then
-                    SZ=$(stat -c%s "$RSYNC_TMP/$_fname" 2>/dev/null || echo 0)
-                    if [[ "$SZ" -ge 64 ]]; then
-                        cp "$RSYNC_TMP/$_fname" "$CLAMAV_CHROOT/$_fname"
-                        chmod 644 "$CLAMAV_CHROOT/$_fname"
-                        ok "$_fname (rsync, $(du -h "$CLAMAV_CHROOT/$_fname" | cut -f1))"
-                    fi
-                fi
-            done
-            _SANE_OK=true
-            ok "Sanesecurity : rsync OK ($RSYNC_COUNT fichier(s) reçus)"
-        else
-            warn "rsync a réussi mais a transféré 0 fichier — fallback HTTP"
-        fi
-    else
-        warn "rsync Sanesecurity inaccessible — $(head -2 /tmp/rsync-sane.log)"
-    fi
-    rm -rf "$RSYNC_TMP"
-fi
-
-# ── Méthode 2 : HTTP (mirror.ihost.md — miroir vérifié le 2026-03-14) ────────
+# Miroirs HTTPS : mirror.ihost.md (vérifié le 2026-03-14), ftp.swin.edu.au
 if ! $_SANE_OK; then
-    warn "rsync indisponible ou sans résultat — tentative HTTP..."
     for SANE_HTTP in \
         "https://mirror.ihost.md/clamav/sanesecurity" \
         "https://ftp.swin.edu.au/sanesecurity"; do
@@ -1740,23 +1671,39 @@ $_SANE_OK || warn "Aucune source Sanesecurity joignable. L'image fonctionnera av
 
 # ── InterServer (nouvelle URL — sigs.interserver.net) ─────────────────────────
 # L'ancienne URL interserver.net/virus-l/ retournait 403.
-# Fichiers disponibles : interserver256.hdb, shell.ldb, topline.db
-for _ifile in "interserver256.hdb" "topline.db"; do
-    _dl_tp "http://sigs.interserver.net/$_ifile" "$CLAMAV_CHROOT/$_ifile" 500 || true
+# Fichiers disponibles : interserver256.hdb, shell.ldb, interservertopline.db
+# (« topline.db » n'existe pas : 404 — le fichier s'appelle interservertopline.db)
+for _ifile in "interserver256.hdb" "interservertopline.db"; do
+    _dl_tp "https://sigs.interserver.net/$_ifile" "$CLAMAV_CHROOT/$_ifile" 500 || true
 done
 
 # ── URLhaus (abuse.ch) ────────────────────────────────────────────────────────
-# L'accès direct abuse.ch nécessite désormais une auth-key.
-# On tente néanmoins l'URL publique historique puis le miroir GitHub.
-_URLHAUS_OK=false
-for _url in \
-    "https://urlhaus.abuse.ch/downloads/urlhaus.ndb" \
-    "https://curbengh.github.io/malware-filter/urlhaus-filter-clam.ndb"; do
-    if _dl_tp "$_url" "$CLAMAV_CHROOT/urlhaus-filter.ndb" 1000; then
-        _URLHAUS_OK=true; break
+# Depuis le 21/10/2026 abuse.ch n'offre plus de téléchargement sans clé (410 Gone) ;
+# l'export ClamAV exige une clé d'authentification (« Auth-Key », gratuite, inscription
+# sur auth.abuse.ch — vérifier les conditions d'abuse.ch pour votre usage). Sans clé,
+# URLhaus est simplement ignoré. La clé passe par stdin (curl -K -) : elle n'apparaît
+# ni dans la liste des processus, ni dans les messages, ni dans les journaux.
+if [[ -n "${ABUSECH_AUTH_KEY:-}" ]]; then
+    if [[ ! "$ABUSECH_AUTH_KEY" =~ ^[A-Za-z0-9._~-]+$ ]]; then
+        warn "ABUSECH_AUTH_KEY invalide (lettres, chiffres, . _ ~ - uniquement) — URLhaus ignoré"
+    else
+        _UH_TMP="$(mktemp /tmp/urlhaus_XXXXXX)"
+        if printf 'url = "%s"\n' \
+               "https://urlhaus-api.abuse.ch/v2/files/exports/${ABUSECH_AUTH_KEY}/urlhaus_clamav.ndb" \
+           | curl -fsSL --connect-timeout 15 --max-time 120 -K - -o "$_UH_TMP" 2>/dev/null \
+           && [[ "$(stat -c%s "$_UH_TMP" 2>/dev/null || echo 0)" -ge 1000 ]] \
+           && _is_valid_clamav_file "$_UH_TMP"; then
+            mv "$_UH_TMP" "$CLAMAV_CHROOT/urlhaus-filter.ndb"
+            chmod 644 "$CLAMAV_CHROOT/urlhaus-filter.ndb"
+            ok "urlhaus-filter.ndb inclus ($(du -h "$CLAMAV_CHROOT/urlhaus-filter.ndb" | cut -f1)) — clé abuse.ch"
+        else
+            rm -f "$_UH_TMP"
+            warn "URLhaus : téléchargement refusé (clé invalide, expirée ou service indisponible) — ignoré"
+        fi
     fi
-done
-$_URLHAUS_OK || warn "URLhaus inaccessible (auth-key requise ?) — signature ignorée"
+else
+    warn "URLhaus ignoré : abuse.ch exige une clé depuis le 21/10/2026 (sudo env ABUSECH_AUTH_KEY=… ./forgeIso64.sh)"
+fi
 
 # Comptage final — pas de validation clamscan ici.
 # Raison : clamscan --database="fichier_unique" retourne toujours une erreur
@@ -2030,6 +1977,8 @@ chmod 0755 /opt/usb-antivirus /usr/local/bin/usb-antivirus \
 chown -R scanner:scanner /home/scanner /opt/pdf /opt/img 2>/dev/null || true
 install -d -o scanner -g scanner -m 0755 /var/log/usb-antivirus
 python3 -m compileall -q /opt/usb-antivirus
+command -v chkrootkit >/dev/null 2>&1 \
+    || echo ">>> [Hook Permissions] ⚠ chkrootkit absent de l'image" >&2
 HOOK
 chmod 0755 config/hooks/normal/0400-permissions.hook.chroot
 ok "Hook de permissions finales créé"
@@ -2054,7 +2003,7 @@ DEFAULT live
 TIMEOUT 150
 PROMPT 0
 
-MENU TITLE USB Antivirus Scanner v1.0 - Menu de demarrage
+MENU TITLE USB Antivirus Scanner v2.0 - Menu de demarrage
 
 LABEL live
   MENU LABEL > Demarrer en mode Live (scanner antiviral)
@@ -2132,7 +2081,7 @@ DEFAULT live
 TIMEOUT 150
 PROMPT 0
 
-MENU TITLE USB Antivirus Scanner v1.0 - Menu de demarrage
+MENU TITLE USB Antivirus Scanner v2.0 - Menu de demarrage
 
 LABEL live
   MENU LABEL > Demarrer en mode Live (scanner antiviral)
@@ -2244,6 +2193,7 @@ echo "║  ClamAV      : $CV_COUNT fichier(s) de base officielle(s)"
 echo "║  Signatures  : $TP_COUNT fichier(s) tiers (Sanesecurity, InterServer, URLhaus)"
 echo "║  Avast       : installé (licence requise via panneau Admin)"
 echo "║  YARA        : $YR_COUNT règle(s) signature-base incluses"
+echo "║  chkrootkit  : installé (lancement manuel : sudo chkrootkit)"
 echo "║  Clavier     : AZERTY (fr)"
 echo "║  Autologin   : scanner  (sudo sans mot de passe)"
 echo "║  Code admin  : 0000  (À CHANGER au premier démarrage !)"

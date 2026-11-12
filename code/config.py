@@ -53,3 +53,47 @@ ADMIN_CRED_PATH = "/etc/virusscanner/admin.cred"
 
 DEFAULT_CODE = "0000"
 MIN_CODE_LENGTH = 4
+
+# ── Sandbox d'analyse (voir sandbox.py) ────────────────────────────────────────
+SANDBOX_ENABLED = True          # Lancer chaque moteur dans un sandbox éphémère
+SANDBOX_REQUIRED = True         # Échec fermé : pas de sandbox → pas d'analyse
+SANDBOX_BWRAP_BIN = "bwrap"     # Binaire bubblewrap
+SANDBOX_TMPFS_SIZE_MB = 512     # Taille du /tmp éphémère du sandbox (0 = illimité)
+SANDBOX_MODE = "auto"           # "auto" | "idmap" | "root"  (voir sandbox.py)
+SANDBOX_USE_SECCOMP = True      # Filtre seccomp généré (python3-seccomp)
+SANDBOX_USE_LANDLOCK = True     # Interdit execve hors /usr, /bin… dans le sandbox (Landlock)
+
+# Avast : "strict"  = le scan tourne entièrement dans le sandbox (si Avast ne
+#                     fonctionne pas ainsi, l'erreur est affichée)
+#         "daemon"  = autorise l'accès au démon Avast ; l'analyse est alors
+#                     faite PAR LE DÉMON, hors sandbox (à n'utiliser qu'en
+#                     connaissance de cause)
+AVAST_SANDBOX_MODE = "strict"
+AVAST_DAEMON_SOCKET_DIRS = ["/var/run/avast", "/run/avast"]
+
+# ── Montage des supports USB (voir usb_manager.py) ─────────────────────────────
+# Seuls ces systèmes de fichiers sont montés : chaque pilote noyau supplémentaire
+# est une surface d'attaque (le noyau analyse le contenu du support à l'hôte).
+USB_ALLOWED_FSTYPES = ("vfat", "exfat", "ntfs", "ntfs3", "ext2", "ext3", "ext4",
+                       "iso9660", "udf")
+USB_MOUNT_HARDEN_OPTS = "nosuid,nodev,noexec"
+
+# ── État persistant de la borne : rapports et supports validés ─────────────────
+# Les supports analysés sont TOUJOURS montés en lecture seule : rien n'est jamais
+# écrit dessus. Les rapports ne sont produits que pour les supports compromis et
+# ne sont conservés QUE sur la borne (ils disparaissent à l'extinction en mode
+# live « nopersistent » : les exporter vers un support validé pour les garder).
+STATE_DIR = "/var/lib/virusscanner"
+REPORTS_DIR = "/var/lib/virusscanner/reports"
+REPORTS_MAX_COUNT = 1000                 # au-delà, on supprime (exportés d'abord, puis les plus anciens)
+REPORTS_MAX_TOTAL_MB = 200               # plafond de taille cumulée du répertoire
+REPORT_MAX_THREATS_LISTED = 500          # menaces détaillées par rapport
+VALIDATED_SUPPORTS_PATH = "/var/lib/virusscanner/validated_supports.json"
+
+# Export depuis le panneau admin, vers un support déjà validé uniquement
+EXPORT_REPORTS_SUBDIR = "Rapports_Bastion"
+EXPORT_LOGS_SUBDIR = "Journaux_Bastion"
+
+# Visionneuse de rapports : lancée SANS les droits root, sous ce compte
+VIEWER_BIN = "evince"
+VIEWER_USER = "scanner"

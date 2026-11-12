@@ -9,7 +9,7 @@ Interface utilisateur :
   • Bouton lancer / annuler
 
 Administration (protégée par code) :
-  • Moteurs actifs (ClamAV / Avast / YARA) + mode scan + suppression
+  • Moteurs actifs (ClamAV / Avast / YARA) + mode scan
   • Affichage exhaustif des supports USB
   • Mise à jour ClamAV, Avast, YARA
   • Planification crontab
@@ -76,10 +76,13 @@ class VirusScannerGUI:
         self.use_avast_var  = tk.BooleanVar(value=False)
         self.use_yara_var   = tk.BooleanVar(value=True)
         self.scan_mode_var  = tk.StringVar(value="quick")
-        self.remove_var     = tk.BooleanVar(value=False)
 
         # ── Suivi des scans parallèles ─────────────────────────────────────────
         self._scan_engines:  Dict[str, ScanEngine] = {}   # dev → engine
+        # Analyses refusées / incomplètes du lot en cours (ne jamais afficher « sain »)
+        self._scan_issues:   List[str] = []
+        # Identité matérielle de chaque support au début de son analyse
+        self._scan_identity: Dict[str, dict] = {}
         self._targets_map:   Dict[str, str]         = {}   # dev → mountpoint
         self._scan_lock      = threading.Lock()
         self._active_scans   = 0
@@ -128,6 +131,11 @@ class VirusScannerGUI:
         self._start_auto_refresh()
         self._init_pdf_viewer()
         self.root.protocol("WM_DELETE_WINDOW", self._request_admin)
+        try:                                   # copies orphelines d'un plantage précédent
+            from reports import purge_stale_viewer_copies
+            purge_stale_viewer_copies()
+        except Exception:                      # noqa: BLE001
+            pass
 
     # ══════════════════════════════════════════════════════════════════════════
     # Persistance des statistiques
@@ -231,7 +239,9 @@ class VirusScannerGUI:
         sbar.pack(fill=tk.X)
         self.clamav_status_var = tk.StringVar(value="ClamAV…")
         self.avast_status_var  = tk.StringVar(value="Avast…")
-        for var in (self.clamav_status_var, self.avast_status_var):
+        self.sandbox_status_var = tk.StringVar(value="Sandbox…")
+        for var in (self.clamav_status_var, self.avast_status_var,
+                    self.sandbox_status_var):
             tk.Label(sbar, textvariable=var,
                      bg="#0a2240", fg=self.GREEN,
                      font=("Courier", 8), padx=8).pack(side=tk.LEFT)
@@ -603,9 +613,16 @@ class VirusScannerGUI:
                 pass
             avast_text = f"✅ Avast · {avast_date}"
 
+        try:
+            from sandbox import Sandbox
+            sandbox_text = Sandbox.short_status()
+        except Exception:
+            sandbox_text = "❌ Sandbox"
+
         def _apply():
             self.clamav_status_var.set(clamav_text)
             self.avast_status_var.set(avast_text)
+            self.sandbox_status_var.set(sandbox_text)
             # Synchronise les vars d'options avec la réalité du système
             if avast_installed and avast_licensed:
                 self.use_avast_var.set(True)
@@ -836,17 +853,8 @@ class VirusScannerGUI:
             ):
                 return
 
-        if self.remove_var.get():
-            if not messagebox.askyesno(
-                "⚠ Suppression activée",
-                "Les fichiers infectés seront DÉFINITIVEMENT supprimés.\n"
-                "Confirmez-vous ?",
-                parent=self.root
-            ):
-                return
-
-        # Prépare les cibles — toujours en lecture seule pendant le scan
-        # (la suppression éventuelle est effectuée après, en remontant en RW)
+        # Prépare les cibles — TOUJOURS en lecture seule : aucun support analysé
+        # n'est jamais monté en écriture (ni suppression, ni export dessus).
         targets_map: Dict[str, str] = {}
         for dev in devs_to_scan:
             mp = self.usb.get_mountpoint(dev)
@@ -867,6 +875,15 @@ class VirusScannerGUI:
         if not targets_map:
             return
 
+        # Identité de chaque support (UUID, n° de série…) relevée AVANT l'analyse :
+        # sert à valider un support sain ou à retirer la validation d'un compromis.
+        from validated_supports import identity_of
+        self._scan_identity = {}
+        for dev in targets_map:
+            part = (self.usb.partition_for(dev)
+                    or next((p for p in self._usb_partitions if p.device == dev), None))
+            self._scan_identity[dev] = identity_of(part) if part else {}
+
         self._targets_map.update(targets_map)
 
         with self._scan_lock:
@@ -879,6 +896,7 @@ class VirusScannerGUI:
             self._session_seen_hashes = set()
 
         self.stop_btn.configure(state=tk.NORMAL, bg=self.ACCENT)
+        self._scan_issues = []
         self._anim_state = "scanning"
         self.status_var.set("Analyse en cours…")
         self.scanned_var.set("Analysés : 0")
@@ -939,7 +957,6 @@ class VirusScannerGUI:
                 use_clamav       = self.use_clamav_var.get(),
                 use_avast        = self.use_avast_var.get(),
                 use_yara         = self.use_yara_var.get(),
-                remove_infected  = self.remove_var.get(),
                 progress_cb      = _progress,
                 file_count_cb    = _file_count_cb,
             )
@@ -971,11 +988,17 @@ class VirusScannerGUI:
         self._total_keys_scanned += 1
 
         if result:
-            tag  = "threat" if result.infected > 0 else "ok"
-            icon = "⚠" if result.infected > 0 else "✅"
+            incomplete = bool(result.errors) and not result.stopped
+            if incomplete:
+                for err in result.errors:
+                    self._scan_issues.append(f"{dev} : {err.splitlines()[0][:160]}")
+            tag  = ("threat" if result.infected > 0
+                    else "warning" if incomplete else "ok")
+            icon = ("⚠" if (result.infected > 0 or incomplete) else "✅")
             self._log(
                 f"{icon} {dev} : {result.scanned} fichier(s), "
-                f"{result.infected} menace(s)  ({result.duration:.1f}s)",
+                f"{result.infected} menace(s)  ({result.duration:.1f}s)"
+                + ("  — ANALYSE INCOMPLÈTE" if incomplete else ""),
                 tag
             )
             # ── Enregistrement des détails de menaces avec hash SHA-256 ───────
@@ -1021,6 +1044,7 @@ class VirusScannerGUI:
             # (écrase la somme brute des moteurs qui peut compter en double)
             self._total_infected = len(self._session_threats)
         else:
+            self._scan_issues.append(f"{dev} : erreur durant le scan")
             self._log(f"❌ {dev} : erreur durant le scan.", "threat")
 
         # Restaurer le tag visuel de la ligne USB
@@ -1044,8 +1068,8 @@ class VirusScannerGUI:
         # Sauvegarde persistante des compteurs et du tableau des menaces
         self._save_persistent_stats()
 
-        # Export PDF automatique sur le support analysé
-        self._auto_export_to_device(dev, result)
+        # Rapport LOCAL si compromis, validation si sain, puis démontage
+        self._finalize_device(dev, result)
 
         # Si plus aucun scan actif, bilan global
         if self._active_scans == 0:
@@ -1064,19 +1088,25 @@ class VirusScannerGUI:
                 "Menaces détectées",
                 f"{self._total_infected} menace(s) trouvée(s) "
                 f"sur {self._total_scanned} fichier(s) analysé(s).\n"
-                "Consultez le journal pour les détails.",
+                "Les fichiers n'ont PAS été modifiés (support en lecture seule).\n"
+                "Un rapport est conservé sur la borne (Administration → Rapports).",
                 parent=self.root
             )
-            # Gestion post-scan : suppression automatique ou proposition à l'utilisateur
-            if self.remove_var.get():
-                # L'admin a coché "Supprimer les virus détectés" → suppression immédiate
-                self._log(
-                    f"🗑 Suppression automatique de {len(all_threats)} fichier(s) "
-                    "infecté(s) (option admin activée)…", "warning")
-                self._delete_threat_files(all_threats)
-            else:
-                # Proposer la suppression à l'utilisateur
-                self._offer_delete_threats(all_threats)
+            self._show_compromise_window(all_threats)
+        elif self._scan_issues:
+            # Jamais de « support sain » quand l'analyse a été refusée ou est incomplète
+            self._anim_state = "idle"
+            self.status_var.set("⚠  Analyse incomplète — support NON validé")
+            shown = "\n".join(f"  • {i}" for i in self._scan_issues[:6])
+            more  = (f"\n  … et {len(self._scan_issues) - 6} autre(s)"
+                     if len(self._scan_issues) > 6 else "")
+            messagebox.showwarning(
+                "Analyse incomplète",
+                "Aucune menace n'a été trouvée, MAIS l'analyse n'a pas pu être "
+                "menée à bien :\n\n" + shown + more +
+                "\n\nNe considérez pas ce support comme sain.",
+                parent=self.root
+            )
         else:
             self._anim_state = "ok"
             self.status_var.set("✅  Aucune menace détectée")
@@ -1088,270 +1118,68 @@ class VirusScannerGUI:
 
         self.root.after(5000, self._reset_anim_idle)
 
-    # ── Proposition de suppression ─────────────────────────────────────────────
+    @staticmethod
+    def _storage_note() -> str:
+        """Ligne d'information sur la permanence réelle du stockage des rapports."""
+        try:
+            from reports import storage_status
+            persistent, detail = storage_status()
+        except Exception:                                 # noqa: BLE001
+            return ""
+        if persistent:
+            return "• Le rapport est conservé durablement (disque, survit au redémarrage)."
+        return ("• ⚠ Stockage NON permanent (mode live, " + detail + ") : le rapport sera\n"
+                "  perdu à l'extinction s'il n'est pas exporté.")
 
-    def _offer_delete_threats(self, threats: list) -> None:
-        """Demande à l'utilisateur s'il souhaite supprimer les fichiers infectés."""
-        names = "\n".join(
-            f"  • {os.path.basename(t.path)}  [{t.threat}]"
-            for t in threats[:12]
-        )
-        if len(threats) > 12:
-            names += f"\n  … et {len(threats) - 12} autre(s)"
+    # ── Support compromis : information (rien n'est supprimé) ────────────────
 
-        answer = messagebox.askyesno(
-            "⚠ Supprimer les fichiers infectés ?",
-            f"{len(threats)} fichier(s) infecté(s) ont été détectés :\n\n"
-            f"{names}\n\n"
-            "Voulez-vous supprimer DÉFINITIVEMENT ces fichiers ?",
-            icon="warning",
-            parent=self.root
-        )
-        if answer:
-            self._delete_threat_files(threats)
-        else:
-            self._show_risks_window(threats)
-
-    # ── Suppression des fichiers infectés ─────────────────────────────────────
-
-    def _delete_threat_files(self, threats: list) -> None:
-        """
-        Supprime les fichiers infectés en remontant les supports en RW.
-
-        Problème clé : après l'export PDF, le support est démonté.
-        Quand on le remonte, le point de montage peut différer de celui utilisé
-        pendant le scan (ex. /media/user/SANDISK → /mnt/avscan_usb/sdb1).
-        On traduit donc chaque chemin : ancien_mp/rel → nouveau_mp/rel.
-        """
-        import threading as _th
-
-        # Index : chemin_fichier → (device, mountpoint_au_scan)
-        file_info = {
-            d["file"]: (d.get("dev", ""), d.get("mp", ""))
-            for d in self._threat_details
-        }
-
-        def _worker():
-            deleted, failed = [], []
-
-            # Regrouper les menaces par (device, mountpoint_scan)
-            by_dev: dict = {}   # dev → {"scan_mp": str, "threats": [...]}
-            for t in threats:
-                dev, scan_mp = file_info.get(t.path, ("", ""))
-                if dev not in by_dev:
-                    by_dev[dev] = {"scan_mp": scan_mp, "threats": []}
-                by_dev[dev]["threats"].append(t)
-
-            for dev, data in by_dev.items():
-                scan_mp    = data["scan_mp"]
-                dev_threats = data["threats"]
-                action     = None
-                new_mp     = None
-
-                if dev:
-                    cur_mp = self.usb.get_mountpoint(dev)
-                    if not cur_mp:
-                        # Périphérique démonté → remonter en RW
-                        ok_mnt, msg_mnt, new_mp, action = self.usb.mount_rw(dev)
-                        if not ok_mnt:
-                            self.root.after(0, self._log,
-                                            f"❌ Impossible de monter {dev} en RW : {msg_mnt}",
-                                            "threat")
-                            failed.extend(t.path for t in dev_threats)
-                            continue
-                    elif self.usb._is_ro(dev, cur_mp):
-                        # Monté RO → remonter en RW
-                        ok_mnt, msg_mnt, new_mp, action = self.usb.mount_rw(dev)
-                        if not ok_mnt:
-                            self.root.after(0, self._log,
-                                            f"❌ Impossible de remonter {dev} en RW : {msg_mnt}",
-                                            "threat")
-                            failed.extend(t.path for t in dev_threats)
-                            continue
-                    else:
-                        # Déjà monté RW
-                        new_mp = cur_mp
-
-                for t in dev_threats:
-                    # ── Translation du chemin si le mountpoint a changé ───────
-                    # Cas typique : scan sur /media/user/SANDISK,
-                    # remontage sur /mnt/avscan_usb/sdb1
-                    actual_path = t.path
-                    if new_mp and scan_mp and scan_mp != new_mp:
-                        try:
-                            rel = os.path.relpath(t.path, scan_mp)
-                            actual_path = os.path.join(new_mp, rel)
-                        except ValueError:
-                            pass  # relpath impossible (Windows-style paths, etc.)
-
-                    try:
-                        if os.path.exists(actual_path):
-                            os.remove(actual_path)
-                            deleted.append(actual_path)
-                            self.root.after(0, self._log,
-                                            f"🗑 Supprimé : {os.path.basename(actual_path)}",
-                                            "warning")
-                        else:
-                            # Dernière tentative avec le chemin brut original
-                            if actual_path != t.path and os.path.exists(t.path):
-                                os.remove(t.path)
-                                deleted.append(t.path)
-                                self.root.after(0, self._log,
-                                                f"🗑 Supprimé : {os.path.basename(t.path)}",
-                                                "warning")
-                            else:
-                                failed.append(actual_path)
-                                self.root.after(0, self._log,
-                                                f"❌ Introuvable : {os.path.basename(t.path)}"
-                                                f"  (cherché dans {new_mp or scan_mp})",
-                                                "threat")
-                    except Exception as exc:
-                        failed.append(actual_path)
-                        self.root.after(0, self._log,
-                                        f"❌ Impossible de supprimer "
-                                        f"{os.path.basename(t.path)} : {exc}",
-                                        "threat")
-
-                # Restaurer le montage RO après suppression
-                if dev and action:
-                    self.usb.restore_after_export(dev, action)
-
-            # ── Bilan ─────────────────────────────────────────────────────────
-            summary = f"✅ {len(deleted)} fichier(s) infecté(s) supprimé(s)."
-            if failed:
-                summary += (f"\n❌ {len(failed)} fichier(s) non supprimé(s) "
-                            "(voir journal).")
-            self.root.after(0, messagebox.showinfo, "Suppression terminée", summary)
-            self.root.after(0, self._refresh_usb)
-
-        _th.Thread(target=_worker, daemon=True).start()
-
-    # ── Page des risques ───────────────────────────────────────────────────────
-
-    def _show_risks_window(self, threats: list) -> None:
-        """Affiche une fenêtre d'avertissement sur les risques liés aux fichiers conservés."""
+    def _show_compromise_window(self, threats: list) -> None:
+        """Avertit que le support est compromis. Aucune suppression n'est proposée :
+        le support est en lecture seule et reste tel quel."""
         win = tk.Toplevel(self.root)
-        win.title("⚠ Risques — Fichiers infectés conservés")
+        win.title("⚠ Support compromis")
         win.configure(bg="#1a0808")
         win.grab_set()
         win.transient(self.root)
-        win.resizable(True, True)
         win.attributes("-fullscreen", True)
 
-        # ── Bandeau rouge ────────────────────────────────────────────────────
         banner = tk.Frame(win, bg="#8b0000", pady=14)
         banner.pack(fill=tk.X)
-        tk.Label(
-            banner,
-            text="⚠  ATTENTION — FICHIERS MALVEILLANTS CONSERVÉS",
-            bg="#8b0000", fg="white",
-            font=("Arial", 14, "bold")
-        ).pack()
-        tk.Label(
-            banner,
-            text=f"{len(threats)} fichier(s) infecté(s) n'ont PAS été supprimés.",
-            bg="#8b0000", fg="#ffcccc",
-            font=("Arial", 10)
-        ).pack(pady=(2, 0))
+        tk.Label(banner, text="⚠  SUPPORT COMPROMIS — NE PAS L'UTILISER",
+                 bg="#8b0000", fg="white", font=("Arial", 14, "bold")).pack()
+        tk.Label(banner,
+                 text=f"{len(threats)} fichier(s) malveillant(s) détecté(s). Ils n'ont "
+                      "PAS été modifiés : le support est resté en lecture seule.",
+                 bg="#8b0000", fg="#ffcccc", font=("Arial", 10)).pack(pady=(2, 0))
 
-        # ── Contenu scrollable ────────────────────────────────────────────────
-        body_frame = tk.Frame(win, bg="#1a0808")
-        body_frame.pack(fill=tk.BOTH, expand=True, padx=16, pady=10)
+        tk.Label(win, justify=tk.LEFT, anchor="w", bg="#1a0808", fg="#e0e0e0",
+                 font=("Arial", 10), padx=16, pady=8,
+                 text="• N'ouvrez aucun fichier de ce support sur un autre ordinateur.\n"
+                      "• Un rapport de cette analyse est conservé sur la borne uniquement ;\n"
+                      "  l'administrateur peut le consulter, l'exporter ou le purger\n"
+                      "  (Administration → Rapports).\n" + self._storage_note()
+                 ).pack(fill=tk.X)
 
-        # Liste des fichiers infectés
-        list_lbl = tk.Label(
-            body_frame,
-            text="Fichiers infectés présents sur vos supports :",
-            bg="#1a0808", fg="#ffaaaa",
-            font=("Arial", 10, "bold"), anchor=tk.W
-        )
-        list_lbl.pack(anchor=tk.W, pady=(0, 4))
+        wrap = tk.Frame(win, bg="#1a0808")
+        wrap.pack(fill=tk.BOTH, expand=True, padx=16, pady=4)
+        box = tk.Text(wrap, bg="#220c0c", fg="#ffb3b3", font=("Courier", 9),
+                      wrap=tk.NONE, relief=tk.FLAT)
+        sb = ttk.Scrollbar(wrap, orient=tk.VERTICAL, command=box.yview)
+        box.configure(yscrollcommand=sb.set)
+        for t in threats[:200]:
+            box.insert(tk.END, f"[{t.engine}] {t.threat}\n    {t.path}\n")
+        if len(threats) > 200:
+            box.insert(tk.END, f"\n… et {len(threats) - 200} autre(s) (voir le rapport).\n")
+        box.configure(state=tk.DISABLED)
+        box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
 
-        list_wrap = tk.Frame(body_frame, bg="#300808")
-        list_wrap.pack(fill=tk.X, pady=(0, 10))
-
-        cols = ("fichier", "menace", "hash")
-        tree = ttk.Treeview(list_wrap, columns=cols, show="headings", height=6)
-        tree.heading("fichier", text="Fichier")
-        tree.heading("menace",  text="Menace détectée")
-        tree.heading("hash",    text="SHA-256")
-        tree.column("fichier", width=200, anchor=tk.W)
-        tree.column("menace",  width=160, anchor=tk.W)
-        tree.column("hash",    width=340, anchor=tk.W)
-        t_sb = ttk.Scrollbar(list_wrap, orient=tk.VERTICAL, command=tree.yview)
-        tree.configure(yscrollcommand=t_sb.set)
-        tree.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        t_sb.pack(side=tk.RIGHT, fill=tk.Y)
-
-        for t in threats:
-            tree.insert("", tk.END, values=(
-                os.path.basename(t.path),
-                t.threat,
-                t.hash if t.hash else "N/A",
-            ))
-
-        # Texte des risques
-        risks_text = (
-            "RISQUES LIÉS À LA CONSERVATION DE FICHIERS INFECTÉS\n\n"
-            "1.  PROPAGATION  —  Les fichiers malveillants peuvent se copier\n"
-            "    automatiquement vers d'autres supports ou machines dès leur connexion.\n\n"
-            "2.  VOL DE DONNÉES  —  Certains malwares (chevaux de Troie, spywares)\n"
-            "    collectent silencieusement vos fichiers personnels, mots de passe\n"
-            "    et coordonnées bancaires.\n\n"
-            "3.  CHIFFREMENT RANSOMWARE  —  Si le fichier est un ransomware, il peut\n"
-            "    chiffrer l'intégralité de vos données et réclamer une rançon.\n\n"
-            "4.  PERSISTANCE  —  Certains rootkits s'installent dans le secteur de\n"
-            "    démarrage et survivent à un formatage simple du support.\n\n"
-            "5.  COMPROMISSION DU RÉSEAU  —  En insérant ce support sur un autre\n"
-            "    ordinateur connecté au réseau, vous exposez l'ensemble du réseau.\n\n"
-            "RECOMMANDATIONS\n\n"
-            "  ✦  Supprimez immédiatement les fichiers listés ci-dessus.\n"
-            "  ✦  Formatez le support USB si la suppression n'est pas possible.\n"
-            "  ✦  N'insérez pas ce support sur d'autres ordinateurs.\n"
-            "  ✦  Contactez votre responsable informatique si vous avez un doute."
-        )
-
-        txt_wrap = tk.Frame(body_frame, bg="#1a0808")
-        txt_wrap.pack(fill=tk.BOTH, expand=True)
-        risks_box = tk.Text(
-            txt_wrap,
-            bg="#200a0a", fg="#ffdddd",
-            font=("Courier", 9), wrap=tk.WORD,
-            state=tk.DISABLED, relief=tk.FLAT,
-            padx=10, pady=8
-        )
-        r_sb = ttk.Scrollbar(txt_wrap, orient=tk.VERTICAL, command=risks_box.yview)
-        risks_box.configure(yscrollcommand=r_sb.set)
-        risks_box.configure(state=tk.NORMAL)
-        risks_box.insert(tk.END, risks_text)
-        risks_box.configure(state=tk.DISABLED)
-        risks_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        r_sb.pack(side=tk.RIGHT, fill=tk.Y)
-
-        # ── Boutons ───────────────────────────────────────────────────────────
-        btn_bar = tk.Frame(win, bg="#1a0808", pady=10)
-        btn_bar.pack(fill=tk.X)
-
-        def _delete_now():
-            win.destroy()
-            self._delete_threat_files(threats)
-
-        tk.Button(
-            btn_bar,
-            text="🗑  Supprimer maintenant",
-            command=_delete_now,
-            bg="#8b0000", fg="white", relief=tk.FLAT,
-            font=("Arial", 11, "bold"), padx=18, pady=8,
-            cursor="hand2"
-        ).pack(side=tk.LEFT, padx=(16, 8))
-
-        tk.Button(
-            btn_bar,
-            text="✕  Fermer (conserver les fichiers)",
-            command=win.destroy,
-            bg="#444", fg="white", relief=tk.FLAT,
-            font=("Arial", 10), padx=14, pady=8
-        ).pack(side=tk.LEFT)
+        bar = tk.Frame(win, bg="#1a0808", pady=10)
+        bar.pack(fill=tk.X)
+        tk.Button(bar, text="✔  J'ai compris", command=win.destroy,
+                  bg="#0f3460", fg="white", relief=tk.FLAT,
+                  font=("Arial", 11, "bold"), padx=18, pady=8,
+                  cursor="hand2").pack(side=tk.RIGHT, padx=16)
 
     def _reset_anim_idle(self) -> None:
         if self._active_scans == 0:
@@ -1366,93 +1194,72 @@ class VirusScannerGUI:
             self.stop_btn.configure(state=tk.DISABLED)
             self._log("Arrêt demandé par l'utilisateur.", "warning")
 
-    def _auto_export_to_device(self, dev: str,
-                                result: Optional[ScanResult]) -> None:
-        """
-        Génère un PDF de rapport sur le support analysé.
-        Séquence : remontage RW → écriture PDF → remontage RO → démontage.
-        """
-        if result is None:
-            return
+    @staticmethod
+    def _eligible_for_validation(result: Optional[ScanResult]) -> bool:
+        """Un support n'est « validé » que si l'analyse est COMPLÈTE et saine : aucune
+        menace, aucune erreur, non interrompue, faite dans le sandbox avec au moins
+        un moteur antivirus (ClamAV ou Avast)."""
+        return bool(
+            result is not None
+            and result.infected == 0
+            and not result.errors
+            and not result.stopped
+            and result.sandboxed
+            and ("ClamAV" in result.engines_ran or "Avast" in result.engines_ran)
+        )
 
-        part  = next((p for p in self._usb_partitions if p.device == dev), None)
-        label = (part.label if part and part.label else "") or dev.replace("/dev/", "")
-        uuid  = (part.uuid  if part and part.uuid  else "") or ""
-
-        # Snapshot des options UI (thread-safe car BooleanVar)
+    def _finalize_device(self, dev: str, result: Optional[ScanResult]) -> None:
+        """
+        Fin d'analyse d'un support (il n'est JAMAIS écrit) :
+          • compromis → rapport conservé sur la borne uniquement + validation retirée ;
+          • sain et complet → support enregistré comme « validé » (aucun rapport) ;
+          • sinon → ni rapport ni validation.
+        Puis démontage.
+        """
+        identity = self._scan_identity.pop(dev, None) or {}
         engines_used = {
             "clamav": self.use_clamav_var.get(),
             "avast":  self.use_avast_var.get(),
             "yara":   self.use_yara_var.get(),
         }
-        avast_installed = self.engine.is_avast_installed()
-        avast_licensed  = self.engine.is_avast_licensed()
-
-        # Référence aux managers (thread-safe en lecture)
-        db     = self.db
-        engine = self.engine
+        avast_info = {"installed": self.engine.is_avast_installed(),
+                      "licensed":  self.engine.is_avast_licensed()}
+        db = self.db
 
         def _worker() -> None:
-            # Collecte des infos bases dans le thread worker (évite de bloquer l'UI)
-            clamav_info = db.get_clamav_status()
-            yara_info   = db.get_yara_status()
-            avast_info  = {
-                "installed": avast_installed,
-                "licensed":  avast_licensed,
-            }
-
-            # ── Obtenir un point de montage RW ────────────────────────────────
-            current_mp = self.usb.get_mountpoint(dev)
-
-            if current_mp and not self.usb._is_ro(dev, current_mp):
-                # Déjà monté en RW (scan avec suppression activée)
-                # → utiliser directement, sans démonter/remonter
-                mp_rw  = current_mp
-                action = "existing_rw"
-            else:
-                # Monté RO ou non monté → démonter proprement, puis remonter RW
-                if current_mp:
-                    ok_u, msg_u = self.usb.umount(dev)
-                    if not ok_u:
-                        self.root.after(
-                            0, self._log,
-                            f"⚠ Démontage RO impossible ({msg_u}) — "
-                            f"tentative de remontage RW forcé…", "warning"
-                        )
-                ok_mnt, msg_mnt, mp_rw, action = self.usb.mount_for_export(
-                    dev,
-                    progress_cb=lambda m: self.root.after(0, self._log, m, "info")
-                )
-                if not ok_mnt:
-                    self.root.after(0, self._log,
-                                    f"⚠ PDF non écrit sur {dev} : {msg_mnt}",
-                                    "warning")
-                    return
+            from reports import save_compromise_report, storage_status
+            from sandbox import Sandbox, sandbox_active
+            from validated_supports import mark_validated, revoke
             try:
-                from log_handler import write_device_scan_report_pdf
-                report_path = write_device_scan_report_pdf(
-                    mountpoint   = mp_rw,
-                    device       = dev,
-                    label        = label,
-                    uuid         = uuid,
-                    result       = result,
-                    clamav_info  = clamav_info,
-                    yara_info    = yara_info,
-                    avast_info   = avast_info,
-                    engines_used = engines_used,
-                )
+                if result is not None and result.infected > 0:
+                    revoke(identity)
+                    path = save_compromise_report(
+                        device=dev, identity=identity, result=result,
+                        clamav_info=db.get_clamav_status(),
+                        yara_info=db.get_yara_status(),
+                        avast_info=avast_info, engines_used=engines_used,
+                        sandbox_info=Sandbox.describe() if sandbox_active() else "AUCUNE")
+                    if path:
+                        persistent = storage_status()[0]
+                        self.root.after(0, self._log,
+                            f"📑 Rapport conservé sur la borne ({'permanent' if persistent else '⚠ NON permanent'}) : "
+                            f"{os.path.basename(path)} (Administration → Rapports)", "warning")
+                elif self._eligible_for_validation(result):
+                    if mark_validated(identity, list(result.engines_ran), result.scanned):
+                        self.root.after(0, self._log,
+                            f"✅ {dev} : support sain, enregistré comme validé "
+                            "(utilisable comme destination d'export depuis l'administration).",
+                            "ok")
+                else:
+                    self.root.after(0, self._log,
+                        f"ℹ {dev} : support non validé (analyse incomplète ou sans "
+                        "moteur antivirus).", "info")
+            except Exception as exc:                          # noqa: BLE001
+                log_error(f"Finalisation {dev} : {exc}")
                 self.root.after(0, self._log,
-                                f"📄 Rapport PDF écrit : {report_path}",
-                                "ok")
-                # Inscrire dans les logs de session le chemin complet du PDF
-                log_info(f"PDF DE RAPPORT EXPORTÉ SUR CLÉ | chemin={report_path} | device={dev}")
-            except Exception as exc:
-                self.root.after(0, self._log,
-                                f"⚠ Erreur PDF sur {dev} : {exc}",
+                                f"⚠ Rapport/validation impossible pour {dev} : {exc}",
                                 "warning")
             finally:
-                # Remontage RO puis démontage propre
-                self.usb.restore_after_export(dev, action)
                 self.usb.umount(dev)
                 self.root.after(0, self._refresh_usb)
 
@@ -1471,7 +1278,22 @@ class VirusScannerGUI:
                 parent=self.root,
             )
             return
-        if not messagebox.askyesno("Redémarrer", "Redémarrer la machine maintenant ?", parent=self.root):
+        # Le redémarrage est ouvert à TOUS les utilisateurs. Les rapports étant dans un
+        # répertoire permanent, il n'y a rien à protéger — sauf en mode live (RAM),
+        # où l'on se contente d'INFORMER (sans jamais bloquer).
+        note = ""
+        try:
+            from reports import storage_status, unexported_reports
+            if not storage_status()[0]:
+                n = len(unexported_reports())
+                if n:
+                    note = (f"\n\n⚠ Stockage non permanent (mode live) : {n} rapport(s) de "
+                            "support compromis seront perdus au redémarrage.")
+        except Exception:                                 # noqa: BLE001
+            pass
+        if not messagebox.askyesno("Redémarrer",
+                                   "Redémarrer la machine maintenant ?" + note,
+                                   parent=self.root):
             return
         subprocess.run(["systemctl", "reboot"], check=False)
 
@@ -1484,7 +1306,7 @@ class VirusScannerGUI:
             use_avast_var             = self.use_avast_var,
             use_yara_var              = self.use_yara_var,
             scan_mode_var             = self.scan_mode_var,
-            remove_var                = self.remove_var,
+            usb_manager               = self.usb,
             # ClamAV
             on_update_clamav_online      = self._admin_clamav_online,
             on_import_clamav_usb         = self._admin_clamav_usb,
@@ -1733,51 +1555,50 @@ class VirusScannerGUI:
         )
 
     def _admin_export_logs_usb(self) -> None:
-        from tkinter import filedialog
-        partitions = self.usb.list_partitions()
-        if not partitions:
+        """Exporte les journaux vers un support VALIDÉ uniquement (jamais vers une
+        clé quelconque : aucun montage en écriture d'un support non validé)."""
+        from config import EXPORT_LOGS_SUBDIR, LOG_FILE
+        from export_manager import export_to_validated_support
+        from log_handler import get_log_files
+        from validated_supports import identity_of, lookup
+
+        files = [(p, os.path.basename(p)) for p in get_log_files()]
+        if not files:
+            messagebox.showinfo("Journaux", "Aucun journal à exporter.", parent=self.root)
+            return
+        valid = [p for p in self.usb.list_partitions()
+                 if lookup(identity_of(p))[0] is not None]
+        if not valid:
             messagebox.showwarning(
-                "Aucune clé USB",
-                "Insérez une clé USB de destination et réessayez.",
+                "Aucun support validé",
+                "Aucun support VALIDÉ n'est connecté.\n\n"
+                "Seul un support déjà analysé et reconnu sain peut recevoir un export. "
+                "Analysez d'abord la clé de destination.",
                 parent=self.root)
             return
-
-        target = partitions[0] if len(partitions) == 1 else self._pick_usb(partitions)
+        target = valid[0] if len(valid) == 1 else self._pick_usb(valid)
         if target is None:
             return
-
-        self._log(f"Montage RW de {target.device} pour export…", "info")
-        ok, msg, mp, action = self.usb.mount_for_export(
-            target.device,
-            progress_cb=lambda m: self._log(m, "info")
-        )
-        if not ok:
-            self._log(f"❌ {msg}", "threat")
-            messagebox.showerror("Erreur de montage", msg, parent=self.root)
+        if not messagebox.askyesno(
+                "Export des journaux",
+                f"Exporter {len(files)} journal(aux) vers {target.display_name} ?",
+                parent=self.root):
             return
 
-        self._log(f"✅ {msg}", "ok")
-        self._refresh_usb()
+        self._log(f"Export des journaux vers {target.device} (support validé)…", "info")
 
-        try:
-            dest_dir = filedialog.askdirectory(
-                parent=self.root,
-                title="Dossier de destination sur USB",
-                initialdir=mp
-            )
-            if not dest_dir:
-                return
-            os.makedirs(dest_dir, exist_ok=True)
-            ok_exp, msg_exp = export_logs_to_path(dest_dir)
-            tag = "ok" if ok_exp else "threat"
-            self._log(f"{'✅' if ok_exp else '❌'} {msg_exp}", tag)
-            if ok_exp:
-                messagebox.showinfo("Export terminé", msg_exp, parent=self.root)
-            else:
-                messagebox.showerror("Erreur export", msg_exp, parent=self.root)
-        finally:
-            self.usb.restore_after_export(target.device, action)
-            self._refresh_usb()
+        def _worker() -> None:
+            res = export_to_validated_support(
+                self.usb, target.device, files, EXPORT_LOGS_SUBDIR,
+                [os.path.dirname(LOG_FILE)])
+            def _done() -> None:
+                self._log(f"{'✅' if res.ok else '❌'} {res.message}",
+                          "ok" if res.ok else "threat")
+                (messagebox.showinfo if res.ok else messagebox.showerror)(
+                    "Export des journaux", res.message, parent=self.root)
+                self._refresh_usb()
+            self.root.after(0, _done)
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _admin_purge_logs(self) -> None:
         ok, msg = purge_logs()

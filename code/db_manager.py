@@ -19,6 +19,7 @@ import zipfile
 from typing import Callable, Dict, List, Optional, Tuple
 
 from config import (
+    ADMIN_CFG_DIR,
     CLAMAV_DB_DIR,
     YARA_RULES_DIR,
     YARA_SIGBASE_SUBDIR,
@@ -35,6 +36,14 @@ from log_handler import log_error, log_info, log_warning
 
 ProgressCB = Optional[Callable[[str], None]]
 
+# Clé d'authentification abuse.ch (URLhaus), FACULTATIVE. Depuis le 21/10/2026
+# abuse.ch n'offre plus de téléchargement sans clé (410 Gone) : l'export ClamAV
+# exige une clé gratuite (inscription sur auth.abuse.ch ; vérifier les conditions
+# d'abuse.ch pour votre usage). Lue dans la variable d'environnement
+# ABUSECH_AUTH_KEY, sinon dans ce fichier (une ligne, droits 600). Sans clé,
+# URLhaus est simplement ignoré. La clé n'est jamais journalisée ni affichée.
+_ABUSECH_KEY_FILE = os.path.join(ADMIN_CFG_DIR, "abusech.key")
+
 # ── Sources de signatures tierces téléchargeables gratuitement ────────────────
 # Noms de fichiers IDENTIQUES à ceux installés par le hook 0150 de l'ISO build.
 # Miroir HTTP Sanesecurity : mirror.ihost.md (vérifié opérationnel)
@@ -44,18 +53,19 @@ _SANE2 = "https://ftp.swin.edu.au/sanesecurity"
 
 THIRD_PARTY_SIGNATURES: List[Dict] = [
     # ── URLhaus (abuse.ch) ────────────────────────────────────────────────────
+    # Plus de téléchargement sans clé depuis le 21/10/2026 (l'ancienne URL répond
+    # 410, le miroir malware-filter 404) : export ClamAV via la clé abuse.ch.
     {"name": "URLhaus",                 "file": "urlhaus-filter.ndb",
-     "url":  "https://urlhaus.abuse.ch/downloads/urlhaus.ndb",
-     "url2": "https://curbengh.github.io/malware-filter/urlhaus-filter-clam.ndb",
-     "desc": "URLs malveillantes actives (abuse.ch)", "min_bytes": 1000},
+     "requires_key": "abusech",
+     "desc": "URLs malveillantes actives (abuse.ch, clé requise)", "min_bytes": 1000},
 
     # ── InterServer ──────────────────────────────────────────────────────────
     {"name": "InterServer hashes",      "file": "interserver256.hdb",
      "url":  "http://sigs.interserver.net/interserver256.hdb",
      "desc": "Hashes SHA-256 (InterServer)", "min_bytes": 500},
-    {"name": "InterServer topline",     "file": "topline.db",
-     "url":  "http://sigs.interserver.net/topline.db",
-     "desc": "Signatures topline (InterServer)", "min_bytes": 500},
+    {"name": "InterServer interservertopline",     "file": "interservertopline.db",
+     "url":  "http://sigs.interserver.net/interservertopline.db",
+     "desc": "Signatures interservertopline (InterServer)", "min_bytes": 500},
 
     # ── Sanesecurity – fichiers requis ────────────────────────────────────────
     {"name": "Sanesecurity FTM",        "file": "sanesecurity.ftm",
@@ -443,7 +453,9 @@ class DBManager:
         et les installe dans CLAMAV_DB_DIR, en validant chaque fichier individuellement.
 
         Pour chaque signature :
-          1. Téléchargement via urllib (avec fallback sur url2 si présent)
+          1. Téléchargement via urllib (avec fallback sur url2 si présent ;
+             les sources « requires_key » n'utilisent que la clé abuse.ch et
+             sont ignorées sans elle)
           2. Vérification contenu (taille minimum + non-HTML)
           3. Copie atomique dans CLAMAV_DB_DIR
           4. Validation immédiate : clamscan --database=$DB_DIR sur le répertoire
@@ -459,6 +471,19 @@ class DBManager:
         installed: List[str] = []
         rejected:  List[str] = []
         failed:    List[str] = []
+        skipped:   List[str] = []   # sources ignorées faute de clé
+
+        def _abusech_key() -> str:
+            """Clé abuse.ch (variable d'environnement, sinon fichier) ou ''."""
+            import re as _re
+            key = os.environ.get("ABUSECH_AUTH_KEY", "").strip()
+            if not key:
+                try:
+                    with open(_ABUSECH_KEY_FILE, encoding="utf-8") as kf:
+                        key = kf.readline().strip()
+                except OSError:
+                    key = ""
+            return key if _re.fullmatch(r"[A-Za-z0-9._~-]+", key) else ""
 
         def _is_valid_content(path: str) -> bool:
             try:
@@ -547,15 +572,32 @@ class DBManager:
             if progress_cb:
                 progress_cb(f"⬇  {name} …")
 
+            # ── URL : source avec clé (URLhaus) ou URL de la liste ─────────────
+            url = sig.get("url")
+            if sig.get("requires_key") == "abusech":
+                key = _abusech_key()
+                if not key:
+                    msg = (f"   ↷ {name} : ignoré — clé abuse.ch requise "
+                           f"(ABUSECH_AUTH_KEY ou {_ABUSECH_KEY_FILE})")
+                    log_info(msg)
+                    skipped.append(name)
+                    if progress_cb:
+                        progress_cb(msg)
+                    continue
+                url = (f"https://urlhaus-api.abuse.ch/v2/files/exports/"
+                       f"{key}/urlhaus_clamav.ndb")
+
             # ── Téléchargement (URL principale + fallback) ────────────────────
-            tmp_path = _fetch(sig["url"], suffix)
+            tmp_path = _fetch(url, suffix)
             if tmp_path is None and "url2" in sig:
                 if progress_cb:
                     progress_cb(f"   ↩ fallback URL pour {name}…")
                 tmp_path = _fetch(sig["url2"], suffix)
 
             if tmp_path is None:
-                msg = f"   ⚠ {name} : inaccessible ou timeout — base ignorée, poursuite…"
+                why = ("clé refusée/expirée ou service indisponible"
+                       if sig.get("requires_key") else "inaccessible ou timeout")
+                msg = f"   ⚠ {name} : {why} — base ignorée, poursuite…"
                 log_warning(msg)
                 failed.append(name)
                 if progress_cb:
@@ -617,12 +659,15 @@ class DBManager:
         if failed:
             lines.append(f"⚠ {len(failed)} source(s) inaccessible(s) :")
             lines.extend(f"   • {f}" for f in failed)
+        if skipped:
+            lines.append(f"↷ {len(skipped)} source(s) ignorée(s) (clé abuse.ch requise) :")
+            lines.extend(f"   • {f}" for f in skipped)
 
         summary = "\n".join(lines) if lines else "Aucune signature traitée."
         success = len(installed) > 0
         (log_info if success else log_error)(
             f"Signatures tierces : {len(installed)} OK, "
-            f"{len(rejected)} rejetés, {len(failed)} échoués"
+            f"{len(rejected)} rejetés, {len(failed)} échoués, {len(skipped)} ignorés"
         )
         return success, summary
 
