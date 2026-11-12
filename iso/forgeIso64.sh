@@ -26,7 +26,7 @@
 set -euo pipefail
 
 # ── Variables ─────────────────────────────────────────────────────────────────
-ISO_NAME="$(pwd)/bastion-antiviral-v1.0.iso"
+ISO_NAME="$(pwd)/bastion-antiviral-v2.0.iso"
 WORK_DIR="$(pwd)/debian-live-build"
 CODE_DIR="$(pwd)/../code"
 SIGBASE_URL="https://github.com/Neo23x0/signature-base/archive/refs/heads/master.zip"
@@ -2003,7 +2003,7 @@ DEFAULT live
 TIMEOUT 150
 PROMPT 0
 
-MENU TITLE USB Antivirus Scanner v1.0 - Menu de demarrage
+MENU TITLE USB Antivirus Scanner v2.0 - Menu de demarrage
 
 LABEL live
   MENU LABEL > Demarrer en mode Live (scanner antiviral)
@@ -2081,7 +2081,7 @@ DEFAULT live
 TIMEOUT 150
 PROMPT 0
 
-MENU TITLE USB Antivirus Scanner v1.0 - Menu de demarrage
+MENU TITLE USB Antivirus Scanner v2.0 - Menu de demarrage
 
 LABEL live
   MENU LABEL > Demarrer en mode Live (scanner antiviral)
