@@ -6,12 +6,15 @@ DIR_ISO_64     := iso
 
 BUILD_DIR_ISO_64    := ./iso/debian-live-build
 
+# Use sudo automatically when not already running as root
+SUDO := $(if $(filter 0,$(shell id -u)),,sudo)
+
 .PHONY: all kde all-iso clean help
 
 # Default target: run the script
 
 all:
-	cd $(DIR_ISO_64) && chmod +x $(SCRIPT_ISO) && bash $(SCRIPT_ISO)
+	cd $(DIR_ISO_64) && chmod +x $(SCRIPT_ISO) && $(SUDO) bash $(SCRIPT_ISO)
 
 # Build all ISOs
 
@@ -23,7 +26,7 @@ all-iso:
 # Clean target: remove the debian-live-build directory in all folders
 
 clean:
-	rm -rf $(BUILD_DIR_ISO_64)
+	$(SUDO) rm -rf $(BUILD_DIR_ISO_64)
 
 # Help target
 
