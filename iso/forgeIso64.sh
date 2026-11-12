@@ -43,7 +43,7 @@ step() { echo -e "\n${YELLOW}▶▶  $*${RESET}"; }
 
 # ── Vérification des pré-requis ───────────────────────────────────────────────
 step "Vérification des pré-requis..."
-for cmd in lb wget curl python3 unzip rsync xorriso; do
+for cmd in lb wget curl python3 unzip xorriso; do
     command -v "$cmd" &>/dev/null \
         || err "Commande manquante : $cmd  →  apt install live-build wget curl python3 unzip"
 done
@@ -86,7 +86,7 @@ fi
 # ── Installation des outils de build ─────────────────────────────────────────
 step "Installation des dépendances de build..."
 apt-get update -qq
-apt-get install -y live-build xorriso syslinux isolinux syslinux-utils wget curl python3 unzip rsync
+apt-get install -y live-build xorriso syslinux isolinux syslinux-utils wget curl python3 unzip
 ok "Outils de build installés"
 
 # ── Préparation du répertoire de travail ──────────────────────────────────────
@@ -505,43 +505,9 @@ SANE_FILES=(
 
 SANE_BASE_URL=""
 
-# Méthode 1 : rsync (méthode officielle Sanesecurity — copie d'abord dans un dossier temp,
-# puis validation individuelle de chaque fichier avant installation définitive)
-if command -v rsync &>/dev/null; then
-    echo "  rsync://rsync.sanesecurity.net/sanesecurity …" | tee -a "$LOG"
-    RSYNC_TMP="$(mktemp -d /tmp/sanesec_rsync_XXXXXX)"
-    if rsync --timeout=30 --contimeout=15 --no-recursive -q \
-        rsync://rsync.sanesecurity.net/sanesecurity/ "$RSYNC_TMP/" 2>>"$LOG" \
-       && [[ $(ls "$RSYNC_TMP" 2>/dev/null | wc -l) -gt 0 ]]; then
-        echo "  rsync OK — validation individuelle de chaque fichier…" | tee -a "$LOG"
-        for fname in "${SANE_FILES[@]}"; do
-            if [[ -f "$RSYNC_TMP/$fname" ]]; then
-                SZ=$(stat -c%s "$RSYNC_TMP/$fname" 2>/dev/null || echo 0)
-                if [[ "$SZ" -ge 64 ]] && _is_valid_content "$RSYNC_TMP/$fname"; then
-                    DEST="$DB_DIR/$fname"
-                    cp "$RSYNC_TMP/$fname" "$DEST"
-                    chmod 644 "$DEST"; chown clamav:clamav "$DEST" 2>/dev/null || true
-                    if _db_ok; then
-                        echo "  ✅ $fname (rsync, ${SZ}o)" | tee -a "$LOG"
-                        TP_OK=$((TP_OK + 1))
-                    else
-                        echo "  ⚠ $fname incompatible — supprimé" | tee -a "$LOG"
-                        rm -f "$DEST"
-                        TP_SKIP=$((TP_SKIP + 1))
-                    fi
-                fi
-            fi
-        done
-        SANE_BASE_URL="rsync"
-    else
-        echo "  ⚠ rsync Sanesecurity inaccessible — fallback HTTP" | tee -a "$LOG"
-    fi
-    rm -rf "$RSYNC_TMP"
-fi
-
-# Méthode 2 : HTTP fallback
+# Récupération via HTTP(S) uniquement
 if [[ -z "$SANE_BASE_URL" ]]; then
-    echo "  Fallback HTTP Sanesecurity…" | tee -a "$LOG"
+    echo "  Sanesecurity via HTTP(S)…" | tee -a "$LOG"
     for SANE_HTTP in \
         "https://mirror.ihost.md/clamav/sanesecurity" \
         "https://ftp.swin.edu.au/sanesecurity"; do
@@ -560,8 +526,8 @@ fi
 
 # ── InterServer ───────────────────────────────────────────────────────────────
 echo ">>> [Hook TP] InterServer…" | tee -a "$LOG"
-install_and_validate "http://sigs.interserver.net/interserver256.hdb" "interserver256.hdb" 500 || true
-install_and_validate "http://sigs.interserver.net/interservertopline.db" "interservertopline.db" 500 || true
+install_and_validate "https://sigs.interserver.net/interserver256.hdb" "interserver256.hdb" 500 || true
+install_and_validate "https://sigs.interserver.net/interservertopline.db" "interservertopline.db" 500 || true
 
 # ── URLhaus (abuse.ch) ────────────────────────────────────────────────────────
 # Depuis le 21/10/2026 abuse.ch exige une clé d'authentification pour l'export
@@ -1681,44 +1647,10 @@ _SANE_FILES=(
     malware.expert.fp
 )
 
-# ── Méthode 1 : rsync (méthode officielle — sanesecurity.com) ─────────────────
+# ── Sanesecurity : récupération via HTTPS uniquement ────────────────────────
 _SANE_OK=false
-if command -v rsync &>/dev/null; then
-    step "Sanesecurity via rsync://rsync.sanesecurity.net ..."
-    RSYNC_TMP="$(mktemp -d /tmp/sanesec_rsync_XXXXXX)"
-    # --include="*/" requis pour que rsync descende dans les sous-répertoires
-    # éventuels, même si la source est plate. Sans lui, certains rsync ignorent
-    # silencieusement les filtres d'extension et transfèrent 0 fichier (exit 0).
-    if rsync --timeout=30 --contimeout=15 --no-recursive -q \
-        rsync://rsync.sanesecurity.net/sanesecurity/ "$RSYNC_TMP/" \
-        2>/tmp/rsync-sane.log; then
-        # Vérification que des fichiers ont bien été transférés
-        RSYNC_COUNT=$(ls "$RSYNC_TMP" 2>/dev/null | wc -l)
-        if [[ "$RSYNC_COUNT" -gt 0 ]]; then
-            for _fname in "${_SANE_FILES[@]}"; do
-                if [[ -f "$RSYNC_TMP/$_fname" ]]; then
-                    SZ=$(stat -c%s "$RSYNC_TMP/$_fname" 2>/dev/null || echo 0)
-                    if [[ "$SZ" -ge 64 ]]; then
-                        cp "$RSYNC_TMP/$_fname" "$CLAMAV_CHROOT/$_fname"
-                        chmod 644 "$CLAMAV_CHROOT/$_fname"
-                        ok "$_fname (rsync, $(du -h "$CLAMAV_CHROOT/$_fname" | cut -f1))"
-                    fi
-                fi
-            done
-            _SANE_OK=true
-            ok "Sanesecurity : rsync OK ($RSYNC_COUNT fichier(s) reçus)"
-        else
-            warn "rsync a réussi mais a transféré 0 fichier — fallback HTTP"
-        fi
-    else
-        warn "rsync Sanesecurity inaccessible — $(head -2 /tmp/rsync-sane.log)"
-    fi
-    rm -rf "$RSYNC_TMP"
-fi
-
-# ── Méthode 2 : HTTP (mirror.ihost.md — miroir vérifié le 2026-03-14) ────────
+# Miroirs HTTPS : mirror.ihost.md (vérifié le 2026-03-14), ftp.swin.edu.au
 if ! $_SANE_OK; then
-    warn "rsync indisponible ou sans résultat — tentative HTTP..."
     for SANE_HTTP in \
         "https://mirror.ihost.md/clamav/sanesecurity" \
         "https://ftp.swin.edu.au/sanesecurity"; do
@@ -1742,7 +1674,7 @@ $_SANE_OK || warn "Aucune source Sanesecurity joignable. L'image fonctionnera av
 # Fichiers disponibles : interserver256.hdb, shell.ldb, interservertopline.db
 # (« topline.db » n'existe pas : 404 — le fichier s'appelle interservertopline.db)
 for _ifile in "interserver256.hdb" "interservertopline.db"; do
-    _dl_tp "http://sigs.interserver.net/$_ifile" "$CLAMAV_CHROOT/$_ifile" 500 || true
+    _dl_tp "https://sigs.interserver.net/$_ifile" "$CLAMAV_CHROOT/$_ifile" 500 || true
 done
 
 # ── URLhaus (abuse.ch) ────────────────────────────────────────────────────────
